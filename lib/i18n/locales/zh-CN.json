@@ -1432,5 +1432,13 @@
   "terminal.resize": "调整终端大小",
   "terminal.starting": "正在启动…",
   "terminal.disconnected": "已断开",
-  "terminal.exited": "已退出（{code}）"
+  "terminal.exited": "已退出（{code}）",
+  "fileViewer.edit": "编辑文件",
+  "fileViewer.save": "保存",
+  "fileViewer.saving": "正在保存…",
+  "fileViewer.cancelEdit": "取消",
+  "fileViewer.editing": "正在编辑 {name}",
+  "fileViewer.saveConflict": "打开后该文件已在磁盘上发生更改。",
+  "fileViewer.reloadFile": "重新加载",
+  "fileViewer.overwrite": "覆盖"
 }

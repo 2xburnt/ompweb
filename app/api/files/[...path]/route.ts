@@ -657,7 +657,9 @@ export const GET = withHostRoute(async (
       }
       const content = (await host.fs.readFile(filePath, { maxBytes: TEXT_PREVIEW_MAX_BYTES })).toString("utf-8");
       const language = getLanguage(filePath);
-      return NextResponse.json({ content, language, size: stat.size });
+      // mtimeMs travels with the content so an editor can prove, on save, that
+      // it is replacing the revision it actually loaded.
+      return NextResponse.json({ content, language, size: stat.size, mtimeMs: stat.mtimeMs });
     }
 
     if (type === "download") {
@@ -746,6 +748,85 @@ export const GET = withHostRoute(async (
 
     return NextResponse.json({ entries, path: filePath, host: host.id });
   } catch (error) {
+    return apiErrorResponse(error);
+  }
+});
+
+// PUT /api/files/<path>[?host=<id>]  body: { content, baseMtimeMs?, baseSize? }
+//
+// Replaces a text file's contents from the preview pane's editor. The write is
+// atomic (temp file + rename) so a failure mid-save cannot truncate the file.
+//
+// omp agents write to these same files constantly, so a save carries the
+// revision the editor loaded: if the file changed underneath, this refuses
+// instead of silently discarding the agent's work, and the editor offers to
+// reload. Omitting the base values is an explicit "overwrite regardless".
+export const PUT = withHostRoute(async (
+  request: NextRequest,
+  { params }: { params: Promise<{ path: string[] }> },
+) => {
+  try {
+    const host = currentHost();
+    const { path: segments } = await params;
+    const filePath = filePathFromSegments(segments);
+
+    const allowedRoots = await getAllowedFileRoots(host);
+    if (!isFilePathAllowed(filePath, allowedRoots)) {
+      return NextResponse.json({ error: "Access denied", code: "access_denied" }, { status: 403 });
+    }
+
+    let stat;
+    try {
+      stat = await host.fs.stat(filePath);
+    } catch {
+      return NextResponse.json({ error: "File not found", code: "file_not_found" }, { status: 404 });
+    }
+    if (!stat.isFile()) {
+      return NextResponse.json({ error: "Not a file", code: "not_a_file" }, { status: 400 });
+    }
+    // Resolve symlinks before writing so a link inside an allowed root cannot
+    // redirect the write outside it. Editing is never authorized by a session
+    // file reference, unlike reading: those are transcript attachments.
+    if (!(await isExistingFilePathAllowed(filePath, allowedRoots, host))) {
+      return NextResponse.json({ error: "Access denied", code: "access_denied" }, { status: 403 });
+    }
+
+    const body = await parseJsonWithinLimit<{ content?: unknown; baseMtimeMs?: unknown; baseSize?: unknown }>(
+      request,
+      TEXT_PREVIEW_MAX_BYTES + 64 * 1024,
+    );
+    if (typeof body.content !== "string") {
+      return NextResponse.json({ error: "content must be a string", code: "invalid_content" }, { status: 400 });
+    }
+    if (Buffer.byteLength(body.content, "utf8") > TEXT_PREVIEW_MAX_BYTES) {
+      return NextResponse.json({ error: "File is too large to save (>256KB)", code: "file_too_large_save" }, { status: 413 });
+    }
+
+    const baseMtimeMs = typeof body.baseMtimeMs === "number" ? body.baseMtimeMs : null;
+    const baseSize = typeof body.baseSize === "number" ? body.baseSize : null;
+    if (baseMtimeMs !== null || baseSize !== null) {
+      // Remote hosts report whole-second mtimes, so compare at that resolution.
+      const changed = (baseMtimeMs !== null && Math.floor(stat.mtimeMs / 1000) !== Math.floor(baseMtimeMs / 1000))
+        || (baseSize !== null && stat.size !== baseSize);
+      if (changed) {
+        return NextResponse.json(
+          { error: "This file changed on disk since it was opened", code: "file_changed", mtimeMs: stat.mtimeMs, size: stat.size },
+          { status: 409 },
+        );
+      }
+    }
+
+    await host.fs.writeFile(filePath, body.content, { mode: stat.mode & 0o7777 });
+
+    const saved = await host.fs.stat(filePath);
+    return NextResponse.json({ success: true, size: saved.size, mtimeMs: saved.mtimeMs, host: host.id });
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return NextResponse.json({ error: "File is too large to save", code: "file_too_large_save" }, { status: 413 });
+    }
+    if (error instanceof SyntaxError) {
+      return NextResponse.json({ error: "Invalid JSON request body", code: "invalid_json" }, { status: 400 });
+    }
     return apiErrorResponse(error);
   }
 });

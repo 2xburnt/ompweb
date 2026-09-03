@@ -1431,5 +1431,13 @@
   "terminal.resize": "Resize terminal",
   "terminal.starting": "Starting…",
   "terminal.disconnected": "Disconnected",
-  "terminal.exited": "Exited ({code})"
+  "terminal.exited": "Exited ({code})",
+  "fileViewer.edit": "Edit file",
+  "fileViewer.save": "Save",
+  "fileViewer.saving": "Saving…",
+  "fileViewer.cancelEdit": "Cancel",
+  "fileViewer.editing": "Editing {name}",
+  "fileViewer.saveConflict": "This file changed on disk since it was opened.",
+  "fileViewer.reloadFile": "Reload",
+  "fileViewer.overwrite": "Overwrite"
 }

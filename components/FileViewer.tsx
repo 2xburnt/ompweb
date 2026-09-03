@@ -11,7 +11,7 @@ import {
   vscDarkPlus,
 } from "@/lib/syntax-highlight";
 import ReactMarkdown from "react-markdown";
-import { AtSign, Download, WrapText } from "lucide-react";
+import { AtSign, Download, Pencil, Save, WrapText } from "lucide-react";
 import { useTheme } from "@/hooks/useTheme";
 import {
   DOCX_PREVIEW_MAX_BYTES,
@@ -31,6 +31,7 @@ import type { GitFileDiffResponse } from "@/lib/git-types";
 import { parseFrontmatter } from "@/lib/frontmatter";
 import { FrontmatterCard } from "./FrontmatterCard";
 import { hostFetch, withHostParam } from "@/lib/hosts/client";
+import { formatApiError } from "@/lib/i18n/api-error";
 
 interface Props {
   filePath: string;
@@ -48,6 +49,8 @@ interface FileData {
   content: string;
   language: string;
   size: number;
+  /** Revision the content was read at; sent back on save to detect a clobber. */
+  mtimeMs?: number;
 }
 
 type DisplayMode = "source" | "preview" | "diff";
@@ -208,6 +211,11 @@ function getFileApiUrl(
   // Pinned to the machine the tab was opened from, NOT the currently selected
   // one: the same path on another machine is a different file.
   return withHostParam(`/api/files/${encoded}?${searchParams.toString()}`, hostId ?? undefined);
+}
+
+/** PUT target for a file's contents on a given machine. */
+function getFileWriteUrl(filePath: string, hostId?: string | null): string {
+  return withHostParam(`/api/files/${encodeFilePathForApi(filePath)}`, hostId ?? undefined);
 }
 
 function DownloadLink({ filePath, hostId, sourceSessionId }: { filePath: string; hostId?: string | null; sourceSessionId?: string | null }) {
@@ -831,12 +839,64 @@ function TextFileViewer({ filePath, cwd, hostId, sourceSessionId, onOpenFile, on
   }, [data]);
   const [displayMode, setDisplayMode] = useState<DisplayMode>("source");
   const [wrapLines, setWrapLines] = useState(false);
+  // Editing state. `draft` is non-null exactly while the editor is open, so a
+  // file switch or a reload can discard it in one place.
+  const [draft, setDraft] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [conflict, setConflict] = useState(false);
+  const editorRef = useRef<HTMLTextAreaElement | null>(null);
+  // The loaded revision, read by the save callback without making it depend on
+  // `data` (which changes as the file is watched).
+  const dataRef = useRef<FileData | null>(null);
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
   const [watching, setWatching] = useState(false);
   const esRef = useRef<EventSource | null>(null);
   const gitDiffRequestRef = useRef(0);
   const contentRequestRef = useRef(0);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const [selectedLineRange, setSelectedLineRange] = useState<SelectedLineRange | null>(null);
+
+  /**
+   * Write the draft back. The revision the editor loaded rides along, so a
+   * file an agent changed underneath is reported rather than overwritten.
+   */
+  const saveDraft = useCallback(async (content: string, force = false) => {
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const response = await fetch(getFileWriteUrl(filePath, hostId), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content,
+          ...(force ? {} : { baseMtimeMs: dataRef.current?.mtimeMs, baseSize: dataRef.current?.size }),
+        }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 409) {
+        setConflict(true);
+        setSaveError(formatApiError(body) || t("fileViewer.saveConflict"));
+        return false;
+      }
+      if (!response.ok) {
+        setSaveError(formatApiError(body) || `HTTP ${response.status}`);
+        return false;
+      }
+      setConflict(false);
+      setDraft(null);
+      // Adopt the revision we just wrote so a second save is not a conflict.
+      setData((previous) => (previous ? { ...previous, content, size: body.size ?? previous.size, mtimeMs: body.mtimeMs ?? previous.mtimeMs } : previous));
+      return true;
+    } catch (failure) {
+      setSaveError(failure instanceof Error ? failure.message : String(failure));
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }, [filePath, hostId, t]);
 
   const fetchContent = useCallback((filePath: string) => {
     // Guard against stale responses: bump the request id and ignore any
@@ -889,6 +949,9 @@ function TextFileViewer({ filePath, cwd, hostId, sourceSessionId, onOpenFile, on
     setDisplayMode("source");
     setWrapLines(false);
     setWatching(false);
+    setDraft(null);
+    setSaveError(null);
+    setConflict(false);
 
     if (esRef.current) {
       esRef.current.close();
@@ -1123,7 +1186,41 @@ function TextFileViewer({ filePath, cwd, hostId, sourceSessionId, onOpenFile, on
           )}
 
           <div className="file-viewer-actions">
-            {displayMode === "source" && (
+            {displayMode === "source" && draft !== null && (
+              <>
+                {saving && <span style={{ fontSize: 11, color: "var(--text-dim)" }}>{t("fileViewer.saving")}</span>}
+                <button
+                  type="button"
+                  onClick={() => { setDraft(null); setSaveError(null); setConflict(false); }}
+                  disabled={saving}
+                  style={{ padding: "3px 9px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "transparent", color: "var(--text-muted)", cursor: "pointer", fontSize: 11.5 }}
+                >
+                  {t("fileViewer.cancelEdit")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void saveDraft(draft)}
+                  disabled={saving || draft === data.content}
+                  style={{ display: "inline-flex", alignItems: "center", gap: 5, padding: "3px 9px", border: "1px solid var(--accent-strong)", borderRadius: "var(--radius-control)", background: "var(--accent-strong)", color: "var(--on-accent)", cursor: saving || draft === data.content ? "default" : "pointer", opacity: saving || draft === data.content ? 0.6 : 1, fontSize: 11.5, fontWeight: 600 }}
+                >
+                  <Save size={12} strokeWidth={2} aria-hidden="true" /> {t("fileViewer.save")}
+                </button>
+              </>
+            )}
+            {displayMode === "source" && draft === null && (
+              <Tooltip content={t("fileViewer.edit")}>
+                <button
+                  type="button"
+                  onClick={() => { setDraft(data.content); setSaveError(null); setConflict(false); }}
+                  aria-label={t("fileViewer.edit")}
+                  className="file-viewer-icon-button"
+                  style={{ borderRadius: "var(--radius-control)" }}
+                >
+                  <Pencil size={14} strokeWidth={2} aria-hidden="true" />
+                </button>
+              </Tooltip>
+            )}
+            {displayMode === "source" && draft === null && (
               <>
                 <Tooltip content={t("fileViewer.mentionSelectedLines")}>
                   <button
@@ -1167,8 +1264,74 @@ function TextFileViewer({ filePath, cwd, hostId, sourceSessionId, onOpenFile, on
       </div>
 
       {/* Content area */}
+      {saveError && (
+        <div role="alert" style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 10, padding: "7px 12px", borderBottom: "1px solid var(--border)", background: "var(--bg-subtle)", color: "var(--status-error)", fontSize: 11.5, lineHeight: 1.45 }}>
+          <span style={{ flex: 1, minWidth: 0 }}>{saveError}</span>
+          {conflict && (
+            <>
+              <button
+                type="button"
+                onClick={() => { setDraft(null); setSaveError(null); setConflict(false); void fetchContent(filePath); }}
+                style={{ padding: "2px 8px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 11 }}
+              >
+                {t("fileViewer.reloadFile")}
+              </button>
+              <button
+                type="button"
+                onClick={() => { if (draft !== null) void saveDraft(draft, true); }}
+                style={{ padding: "2px 8px", border: "1px solid var(--status-error)", borderRadius: "var(--radius-control)", background: "transparent", color: "var(--status-error)", cursor: "pointer", fontSize: 11 }}
+              >
+                {t("fileViewer.overwrite")}
+              </button>
+            </>
+          )}
+        </div>
+      )}
+
       <div ref={contentRef} className="file-viewer-content" style={{ flex: 1, overflow: "auto", background: "var(--bg)" }}>
-        {displayMode === "diff" && hasGitDiff ? (
+        {displayMode === "source" && draft !== null ? (
+          <textarea
+            ref={editorRef}
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+                event.preventDefault();
+                if (!saving && draft !== data.content) void saveDraft(draft);
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setDraft(null);
+                setSaveError(null);
+                setConflict(false);
+              }
+            }}
+            spellCheck={false}
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            aria-label={t("fileViewer.editing", { name: getFileName(filePath) })}
+            style={{
+              display: "block",
+              width: "100%",
+              height: "100%",
+              minHeight: 0,
+              boxSizing: "border-box",
+              padding: "12px 16px",
+              border: "none",
+              outline: "none",
+              resize: "none",
+              background: "var(--bg)",
+              color: "var(--text)",
+              fontFamily: "var(--font-mono)",
+              fontSize: 12.5,
+              lineHeight: 1.6,
+              tabSize: 2,
+              whiteSpace: wrapLines ? "pre-wrap" : "pre",
+              overflowWrap: wrapLines ? "anywhere" : "normal",
+            }}
+          />
+        ) : displayMode === "diff" && hasGitDiff ? (
           <DiffView patch={gitDiff.patch!} />
         ) : isHtml && displayMode === "preview" ? (
           <iframe

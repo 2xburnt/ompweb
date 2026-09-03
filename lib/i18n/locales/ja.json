@@ -1432,5 +1432,13 @@
   "terminal.resize": "ターミナルのサイズを変更",
   "terminal.starting": "起動中…",
   "terminal.disconnected": "切断されました",
-  "terminal.exited": "終了しました（{code}）"
+  "terminal.exited": "終了しました（{code}）",
+  "fileViewer.edit": "ファイルを編集",
+  "fileViewer.save": "保存",
+  "fileViewer.saving": "保存中…",
+  "fileViewer.cancelEdit": "キャンセル",
+  "fileViewer.editing": "{name} を編集中",
+  "fileViewer.saveConflict": "開いてからファイルがディスク上で変更されました。",
+  "fileViewer.reloadFile": "再読み込み",
+  "fileViewer.overwrite": "上書き"
 }
