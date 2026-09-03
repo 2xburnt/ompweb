@@ -258,10 +258,31 @@ export function AppShell() {
   });
   const { isDark, preference, toggleTheme } = useTheme();
   const { t, locale } = useI18n();
-  const { hosts, hostId } = useHosts();
+  const { hosts, hostId, loaded: hostsLoaded } = useHosts();
   const enabledHostCount = hosts.filter((host) => host.enabled).length;
   // File tabs only need to name their machine once there is more than one.
   const multipleMachines = enabledHostCount > 1;
+  // Close tabs whose machine is gone. A removed machine's files cannot be
+  // read any more, so the tab would sit there answering every request with
+  // "unknown host" and could not be cleaned up from the viewer.
+  const liveHostKey = useMemo(
+    () => hosts.filter((host) => host.enabled).map((host) => host.id).sort().join("\u0000"),
+    [hosts],
+  );
+  useEffect(() => {
+    if (!hostsLoaded) return;
+    const live = new Set(liveHostKey ? liveHostKey.split("\u0000") : []);
+    setFileTabs((previous) => {
+      const kept = previous.filter((tab) => !tab.hostId || live.has(tab.hostId));
+      if (kept.length === previous.length) return previous;
+      setActiveFileTabId((current) => {
+        if (current && kept.some((tab) => tab.id === current)) return current;
+        return kept.length > 0 ? kept[kept.length - 1].id : null;
+      });
+      if (kept.length === 0) setRightPanelOpen(false);
+      return kept;
+    });
+  }, [hostsLoaded, liveHostKey]);
   const hostNamesById = useMemo(
     () => Object.fromEntries(hosts.map((host) => [host.id, host.name])),
     [hosts],

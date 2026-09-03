@@ -22,6 +22,7 @@ export function SidebarPortalMenu({
   placement = "below",
   align = "end",
   minWidth = 136,
+  zIndex = 1000,
   style,
   children,
 }: {
@@ -32,6 +33,10 @@ export function SidebarPortalMenu({
   /** "end" right-aligns to the anchor, "start" left-aligns to it. */
   align?: "start" | "end";
   minWidth?: number;
+  /** Stacking level. The default sits above the app; a menu opened from
+   *  inside a modal dialog must be raised above the dialog's own layer
+   *  (dialog content is 1001) or it renders behind it. */
+  zIndex?: number;
   style?: CSSProperties;
   children: ReactNode;
 }) {
@@ -146,7 +151,7 @@ export function SidebarPortalMenu({
         top: pos ? pos.top : -9999,
         left: pos ? pos.left : -9999,
         visibility: pos ? "visible" : "hidden",
-        zIndex: 1000,
+        zIndex,
         minWidth,
         padding: 4,
         border: "1px solid var(--border)",

@@ -70,11 +70,10 @@ interface MachineSwitcherProps {
  *  Escape closes (handled by SidebarPortalMenu). */
 export function MachineSwitcher({ onManageMachines }: MachineSwitcherProps) {
   const { t } = useI18n();
-  const { hosts, hostId, current, loaded, setHostId } = useHosts();
+  const { hostId, current, loaded, setHostId } = useHosts();
   const [open, setOpen] = useState(false);
   const [hovered, setHovered] = useState(false);
   const anchorRef = useRef<HTMLButtonElement>(null);
-  const enabledHosts = hosts.filter((host) => host.enabled);
   const close = useCallback(() => setOpen(false), []);
 
   const select = useCallback((id: string) => {
@@ -132,6 +131,30 @@ export function MachineSwitcher({ onManageMachines }: MachineSwitcherProps) {
         <ChevronDown size={12} strokeWidth={2} aria-hidden="true" style={{ flexShrink: 0, color: "var(--text-dim)", transform: open ? "rotate(180deg)" : "none", transition: "transform var(--dur-fast) var(--ease-out-warm)" }} />
       </button>
       <SidebarPortalMenu anchor={anchorRef} open={open} onClose={close} placement="below" align="start" minWidth={236} style={{ maxWidth: 320 }}>
+        <MachineMenuList onSelect={select} onManageMachines={onManageMachines ? () => { setOpen(false); onManageMachines(); } : undefined} />
+      </SidebarPortalMenu>
+    </>
+  );
+}
+
+/**
+ * The machine list shown inside a picker menu: every enabled machine with its
+ * status and omp version, the current one checked, plus an optional
+ * "Manage machines…" entry. Shared by the sidebar switcher and the switcher
+ * built into each machine-scoped settings panel.
+ */
+export function MachineMenuList({
+  onSelect,
+  onManageMachines,
+}: {
+  onSelect: (id: string) => void;
+  onManageMachines?: () => void;
+}) {
+  const { t } = useI18n();
+  const { hosts, hostId } = useHosts();
+  const enabledHosts = hosts.filter((host) => host.enabled);
+  return (
+    <>
         <div role="presentation" style={{ padding: "4px 9px 3px", fontSize: 10, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--text-dim)" }}>
           {t("hosts.switcher.label")}
         </div>
@@ -149,7 +172,7 @@ export function MachineSwitcher({ onManageMachines }: MachineSwitcherProps) {
               role="menuitemradio"
               aria-checked={selected}
               className="sidebar-menu-item"
-              onClick={() => select(host.id)}
+              onClick={() => onSelect(host.id)}
               title={host.status === "error" && host.lastError ? host.lastError : host.ssh ? `${host.ssh.user ? `${host.ssh.user}@` : ""}${host.ssh.host}${host.ssh.port ? `:${host.ssh.port}` : ""}` : undefined}
               style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11.5 }}
             >
@@ -172,7 +195,7 @@ export function MachineSwitcher({ onManageMachines }: MachineSwitcherProps) {
               type="button"
               role="menuitem"
               className="sidebar-menu-item"
-              onClick={() => { setOpen(false); onManageMachines(); }}
+              onClick={onManageMachines}
               style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontSize: 11.5 }}
             >
               <Settings2 size={13} strokeWidth={1.9} aria-hidden="true" style={{ flexShrink: 0 }} />
@@ -180,7 +203,6 @@ export function MachineSwitcher({ onManageMachines }: MachineSwitcherProps) {
             </button>
           </>
         )}
-      </SidebarPortalMenu>
     </>
   );
 }

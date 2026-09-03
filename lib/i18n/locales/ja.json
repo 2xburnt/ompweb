@@ -1421,5 +1421,7 @@
   "errors.invalid_json": "リクエスト本文が有効な JSON ではありません",
   "appUpdateDialog.gitDescription": "このリポジトリの {branch} ブランチに {count} 件の新しいコミットがあり、自動で取得してビルドできます。",
   "appShell.newSession": "新しいセッション",
-  "tabBar.fileOnMachine": "{path}（{machine}）"
+  "tabBar.fileOnMachine": "{path}（{machine}）",
+  "hosts.scope.switchAriaLabel": "マシン: {machine}。マシンを切り替え",
+  "hosts.scope.switchTitle": "マシンを切り替え"
 }

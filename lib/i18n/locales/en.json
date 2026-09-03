@@ -1420,5 +1420,7 @@
   "errors.invalid_json": "The request body is not valid JSON",
   "appUpdateDialog.gitDescription": "{count} new commit(s) on {branch} of this repository can be pulled and built automatically.",
   "appShell.newSession": "New session",
-  "tabBar.fileOnMachine": "{path} on {machine}"
+  "tabBar.fileOnMachine": "{path} on {machine}",
+  "hosts.scope.switchAriaLabel": "Machine: {machine}. Switch machine",
+  "hosts.scope.switchTitle": "Switch machine"
 }

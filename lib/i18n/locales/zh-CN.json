@@ -1421,5 +1421,7 @@
   "errors.invalid_json": "请求体不是有效的 JSON",
   "appUpdateDialog.gitDescription": "此仓库的 {branch} 分支有 {count} 个新提交，可以自动拉取并构建。",
   "appShell.newSession": "新会话",
-  "tabBar.fileOnMachine": "{path}（位于 {machine}）"
+  "tabBar.fileOnMachine": "{path}（位于 {machine}）",
+  "hosts.scope.switchAriaLabel": "机器：{machine}。切换机器",
+  "hosts.scope.switchTitle": "切换机器"
 }

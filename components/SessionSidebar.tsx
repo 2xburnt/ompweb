@@ -450,6 +450,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   // resets the selection; selecting a session/project on another machine
   // updates this first so the switch effect leaves the selection alone.
   const activeHostRef = useRef<string | null>(null);
+
   // Add-project picker state.
   const [addProjectOpen, setAddProjectOpen] = useState(false);
   const [addProjectBusy, setAddProjectBusy] = useState(false);
@@ -603,6 +604,46 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   useEffect(() => {
     void loadProjects();
   }, [loadProjects, refreshKey]);
+
+  // Forget everything belonging to a machine that is no longer configured.
+  // Removing a machine in Settings does not reach into these per-machine maps,
+  // so its projects, sessions and Git state stayed on screen as rows that
+  // could not be opened or cleaned up, and the file explorer kept asking a
+  // machine the server no longer knows ("Unknown host"). Keyed on the set of
+  // live machines, so it also covers a machine being disabled.
+  const liveHostKey = useMemo(
+    () => enabledHosts.map((host) => host.id).sort().join("\u0000"),
+    [enabledHosts],
+  );
+  useEffect(() => {
+    if (!hostsLoaded) return;
+    const live = new Set(liveHostKey ? liveHostKey.split("\u0000") : []);
+    const pruneByHost = <T,>(previous: Record<string, T>): Record<string, T> => {
+      const kept = Object.fromEntries(Object.entries(previous).filter(([id]) => live.has(id)));
+      return Object.keys(kept).length === Object.keys(previous).length ? previous : kept;
+    };
+    setProjectsByHost(pruneByHost);
+    setHomeByHost(pruneByHost);
+    setProjectsErrorByHost(pruneByHost);
+    // These are keyed "<hostId>:<path>", so match on the machine prefix.
+    const pruneByHostPrefix = <T,>(previous: Record<string, T>): Record<string, T> => {
+      const kept = Object.fromEntries(Object.entries(previous).filter(([key]) => live.has(key.slice(0, key.indexOf(":")))));
+      return Object.keys(kept).length === Object.keys(previous).length ? previous : kept;
+    };
+    setWorktreeStateByProject(pruneByHostPrefix);
+    setExpandedProjects((previous) => {
+      if (!previous) return previous;
+      const kept = new Set([...previous].filter((key) => live.has(key.slice(0, key.indexOf(":")))));
+      return kept.size === previous.size ? previous : kept;
+    });
+    // A selection on a removed machine would keep the explorer and worktree
+    // loader pointed at a machine that no longer exists.
+    if (activeHostRef.current && !live.has(activeHostRef.current)) {
+      activeHostRef.current = hostId;
+      setSelectedCwd(null);
+    }
+    void loadSessions();
+  }, [hostsLoaded, liveHostKey, hostId, loadSessions]);
 
 
 
