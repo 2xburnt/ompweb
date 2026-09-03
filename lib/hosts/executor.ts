@@ -24,6 +24,8 @@ import type { HostKind, SshHostConfig } from "./types";
 export interface ExecOptions {
   cwd?: string;
   env?: Record<string, string>;
+  /** Environment values kept out of the remote command line; see SpawnOptionsLike. */
+  secretEnv?: Record<string, string>;
   input?: string | Buffer;
   timeoutMs?: number;
   /** Reject once stdout exceeds this many bytes (default 64 MiB). */
@@ -76,6 +78,16 @@ export class HostFsError extends Error {
 export interface SpawnOptionsLike {
   cwd?: string;
   env?: Record<string, string>;
+  /**
+   * Environment values that must not appear in the remote command line.
+   *
+   * A remote command's arguments are world-readable through /proc on the
+   * machine running it, so anything passed as `env` is visible to every user
+   * there, and to process accounting and log shippers. Values given here are
+   * streamed in over stdin instead and never become part of any argv. Use it
+   * for tokens and keys; ordinary settings belong in `env`.
+   */
+  secretEnv?: Record<string, string>;
 }
 
 export type FileType = "file" | "dir" | "symlink" | "other";
@@ -946,9 +958,36 @@ export class SshExecutor implements HostExecutor {
   }
 
   /** Wrap argv into a POSIX `sh -c` command line that survives any remote login shell. */
+  /** Names of the secrets this command expects on stdin, in order. */
+  private static secretNames(options: SpawnOptionsLike): string[] {
+    return Object.keys(options.secretEnv ?? {});
+  }
+
+  /**
+   * The lines that must precede a command's real stdin when it carries
+   * secrets: one value per line, in the order `secretNames` reports.
+   */
+  static secretPreamble(options: SpawnOptionsLike): string {
+    const secrets = options.secretEnv ?? {};
+    const names = Object.keys(secrets);
+    if (names.length === 0) return "";
+    for (const name of names) {
+      if (/[\r\n]/.test(secrets[name])) {
+        throw new Error(`Secret ${name} cannot contain a newline: it is delimited by one on the wire`);
+      }
+    }
+    return names.map((name) => `${secrets[name]}\n`).join("");
+  }
+
   remoteCommand(argv: readonly string[], options: SpawnOptionsLike = {}): string {
     const parts = [`export PATH=${REMOTE_PATH_PREFIX}:"$PATH"`];
     if (options.cwd) parts.push(`cd ${shellQuote(options.cwd)} || exit 127`);
+    // Secrets arrive on stdin, one line each, and are read into the
+    // environment before exec. `read` on a pipe consumes a byte at a time up
+    // to the newline, so the command's own stdin is left untouched behind it.
+    for (const name of SshExecutor.secretNames(options)) {
+      parts.push(`IFS= read -r ${name} || exit 127`, `export ${name}`);
+    }
     const envPrefix = options.env && Object.keys(options.env).length > 0
       ? `env ${Object.entries(options.env).map(([key, value]) => shellQuote(`${key}=${value}`)).join(" ")} `
       : "";
@@ -958,19 +997,27 @@ export class SshExecutor implements HostExecutor {
 
   exec(argv: readonly string[], options: ExecOptions = {}): Promise<ExecResult> {
     if (argv.length === 0) return Promise.reject(new Error("exec requires a command"));
-    const args = [...this.sshClientArgs(), "--", this.target(), this.remoteCommand(argv, { cwd: options.cwd, env: options.env })];
-    return runProcess("ssh", args, { env: process.env }, { timeoutMs: 120_000, ...options }, [...argv]);
+    const args = [...this.sshClientArgs(), "--", this.target(), this.remoteCommand(argv, { cwd: options.cwd, env: options.env, secretEnv: options.secretEnv })];
+    const preamble = SshExecutor.secretPreamble(options);
+    const withSecrets = preamble
+      ? { ...options, input: preamble + (typeof options.input === "string" ? options.input : options.input?.toString("utf8") ?? "") }
+      : options;
+    return runProcess("ssh", args, { env: process.env }, { timeoutMs: 120_000, ...withSecrets }, [...argv]);
   }
 
   spawn(argv: readonly string[], options: SpawnOptionsLike = {}): ChildProcessWithoutNullStreams {
     if (argv.length === 0) throw new Error("spawn requires a command");
     const args = [...this.sshClientArgs(), "--", this.target(), this.remoteCommand(argv, options)];
-    return spawn("ssh", args, {
+    const preamble = SshExecutor.secretPreamble(options);
+    const child = spawn("ssh", args, {
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       detached: process.platform !== "win32",
     });
+    // The remote shell reads these lines before exec, so they must go first.
+    if (preamble) child.stdin.write(preamble);
+    return child;
   }
 
   /**
