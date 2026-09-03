@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join, resolve } from "path";
-import type { HostConfig, HostKind, HostsFile, SshHostConfig } from "./types";
+import type { CredentialEndpoints, CredentialPolicy, HostConfig, HostKind, HostsFile, SshHostConfig } from "./types";
 
 /**
  * Persistent host configuration: ~/.omp-web/hosts.json (override the app
@@ -39,6 +39,54 @@ export function defaultLocalHostConfig(): HostConfig {
 
 export function defaultHostsFile(): HostsFile {
   return { version: 1, defaultHost: LOCAL_HOST_ID, hosts: [defaultLocalHostConfig()] };
+}
+
+const CREDENTIAL_POLICIES: readonly CredentialPolicy[] = ["local", "broker", "gateway"];
+
+function normalizeCredentialPolicy(value: unknown, endpoints: CredentialEndpoints | undefined): CredentialPolicy {
+  if (value === undefined || value === null || value === "") return "local";
+  if (typeof value !== "string" || !CREDENTIAL_POLICIES.includes(value as CredentialPolicy)) {
+    throw new HostConfigError("invalid_credentials", `credentials must be one of ${CREDENTIAL_POLICIES.join(", ")}`);
+  }
+  const policy = value as CredentialPolicy;
+  // A policy that points at an endpoint we do not have would silently leave the
+  // machine unable to authenticate, so refuse it at the door.
+  if (policy === "broker" && !endpoints?.brokerUrl) {
+    throw new HostConfigError("broker_not_configured", 'credentials "broker" needs credentials.brokerUrl to be set');
+  }
+  if (policy === "gateway" && !endpoints?.gatewayUrl) {
+    throw new HostConfigError("gateway_not_configured", 'credentials "gateway" needs credentials.gatewayUrl to be set');
+  }
+  return policy;
+}
+
+function normalizeEndpoints(value: unknown): CredentialEndpoints | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new HostConfigError("invalid_credentials", "credentials must be an object");
+  }
+  const raw = value as Record<string, unknown>;
+  const url = (field: string): string | undefined => {
+    const parsed = optionalString(raw[field], `credentials.${field}`, 2048);
+    if (!parsed) return undefined;
+    let candidate: URL;
+    try {
+      candidate = new URL(parsed);
+    } catch {
+      throw new HostConfigError("invalid_field", `credentials.${field} must be an absolute URL`);
+    }
+    if (candidate.protocol !== "http:" && candidate.protocol !== "https:") {
+      throw new HostConfigError("invalid_field", `credentials.${field} must be http or https`);
+    }
+    return parsed.replace(/\/+$/, "");
+  };
+  const endpoints: CredentialEndpoints = {
+    ...(url("brokerUrl") ? { brokerUrl: url("brokerUrl") } : {}),
+    ...(optionalString(raw.brokerToken, "credentials.brokerToken", 4096) ? { brokerToken: optionalString(raw.brokerToken, "credentials.brokerToken", 4096) } : {}),
+    ...(url("gatewayUrl") ? { gatewayUrl: url("gatewayUrl") } : {}),
+    ...(optionalString(raw.gatewayToken, "credentials.gatewayToken", 4096) ? { gatewayToken: optionalString(raw.gatewayToken, "credentials.gatewayToken", 4096) } : {}),
+  };
+  return Object.keys(endpoints).length > 0 ? endpoints : undefined;
 }
 
 export function isValidHostId(value: unknown): value is string {
@@ -86,7 +134,7 @@ function normalizeSsh(value: unknown): SshHostConfig {
 }
 
 /** Validate and normalize one host entry. Throws HostConfigError. */
-export function normalizeHostConfig(input: unknown): HostConfig {
+export function normalizeHostConfig(input: unknown, endpoints?: CredentialEndpoints): HostConfig {
   if (!input || typeof input !== "object") throw new HostConfigError("invalid_host", "host must be an object");
   const raw = input as Record<string, unknown>;
   if (!isValidHostId(raw.id)) {
@@ -100,7 +148,8 @@ export function normalizeHostConfig(input: unknown): HostConfig {
   if (ompBin?.startsWith("-")) throw new HostConfigError("invalid_field", "ompBin cannot start with '-'");
   const agentDir = optionalString(raw.agentDir, "agentDir");
   const defaultCwd = optionalString(raw.defaultCwd, "defaultCwd");
-  const config: HostConfig = { id: raw.id, name, kind, enabled };
+  const credentials = normalizeCredentialPolicy(raw.credentials, endpoints);
+  const config: HostConfig = { id: raw.id, name, kind, enabled, credentials };
   if (kind === "ssh") config.ssh = normalizeSsh(raw.ssh);
   if (ompBin) config.ompBin = ompBin;
   if (agentDir) config.agentDir = agentDir;
@@ -117,11 +166,12 @@ export function parseHostsFile(raw: string): HostsFile {
   }
   if (!parsed || typeof parsed !== "object") throw new HostConfigError("invalid_file", "hosts.json must be an object");
   const file = parsed as Record<string, unknown>;
+  const credentials = normalizeEndpoints(file.credentials);
   const hostsRaw = Array.isArray(file.hosts) ? file.hosts : [];
   const hosts: HostConfig[] = [];
   const seen = new Set<string>();
   for (const entry of hostsRaw) {
-    const host = normalizeHostConfig(entry);
+    const host = normalizeHostConfig(entry, credentials);
     if (seen.has(host.id)) throw new HostConfigError("duplicate_id", `duplicate host id "${host.id}"`);
     seen.add(host.id);
     hosts.push(host);
@@ -131,7 +181,7 @@ export function parseHostsFile(raw: string): HostsFile {
   if (!defaultHost || !hosts.some((h) => h.id === defaultHost)) {
     defaultHost = pickDefaultHostId(hosts);
   }
-  return { version: 1, defaultHost, hosts };
+  return { version: 1, defaultHost, ...(credentials ? { credentials } : {}), hosts };
 }
 
 /** The first enabled host; prefers "local" only when nothing else is enabled. */

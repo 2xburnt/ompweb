@@ -3,7 +3,7 @@ import { homedir as osHomedir, tmpdir as osTmpdir } from "os";
 import path from "path";
 import { LOCAL_HOST_ID, getHostsFilePath, loadHostsFile, type LoadedHostsFile } from "./config";
 import { LocalExecutor, SshExecutor, type HostExecutor } from "./executor";
-import type { HostConfig, HostConnectionState, HostSummary } from "./types";
+import type { CredentialEndpoints, CredentialPolicy, HostConfig, HostConnectionState, HostSummary } from "./types";
 
 /**
  * Live host registry: one Host per configured machine, kept on globalThis so
@@ -53,6 +53,10 @@ export class Host {
   ompBin: string | null = null;
   ompVersion: string | null = null;
   probedAt = 0;
+  /** Why the credential policy could not be applied on the last attempt. */
+  credentialError: string | null = null;
+  /** What the machine was last successfully configured for. Null until it succeeds. */
+  private credentialsAppliedFor: string | null = null;
   private readyPromise: Promise<void> | null = null;
   private lastFailureAt = 0;
 
@@ -93,7 +97,11 @@ export class Host {
   /** Ensure the host has been probed; throws HostUnavailableError when it cannot be reached. */
   async ready(): Promise<void> {
     if (!this.enabled) throw new HostUnavailableError(this.id, "host is disabled");
-    if (this.status === "connected") return;
+    if (this.status === "connected") {
+      // Reachable, but pointed at the wrong credentials: fix that before
+      // handing the caller a machine that cannot authenticate.
+      return this.credentialsAreStale ? this.applyCredentials() : undefined;
+    }
     if (this.lastFailureAt && Date.now() - this.lastFailureAt < PROBE_RETRY_MS) {
       throw new HostUnavailableError(this.id, this.lastError ?? "recent connection failure");
     }
@@ -130,6 +138,9 @@ export class Host {
           : path.posix.join(probe.home, ".omp", "agent");
       }
       await this.probeOmp();
+      // Configure credentials before declaring the machine ready, so nothing
+      // starts a session against a machine that cannot authenticate.
+      await this.applyCredentials();
       this.status = "connected";
       this.lastError = null;
       this.probedAt = Date.now();
@@ -176,6 +187,55 @@ export class Host {
     }
   }
 
+  get credentialPolicy(): CredentialPolicy {
+    return this.config.credentials ?? "local";
+  }
+
+  /**
+   * Point the machine at whatever its policy says. A failure here is recorded
+   * and surfaced rather than thrown: a machine whose credentials could not be
+   * configured is still reachable, and its files and sessions still work.
+   */
+  private async applyCredentials(): Promise<void> {
+    const policy = this.credentialPolicy;
+    if (policy === "local" && !this.ompBin) {
+      this.credentialError = null;
+      this.credentialsAppliedFor = this.credentialSignature();
+      return;
+    }
+    try {
+      const { applyCredentialPolicy } = await import("./credentials");
+      await applyCredentialPolicy(this, policy, getCredentialEndpoints());
+      this.credentialError = null;
+      this.credentialsAppliedFor = this.credentialSignature();
+    } catch (error) {
+      this.credentialsAppliedFor = null;
+      this.credentialError = error instanceof Error ? error.message : String(error);
+      console.warn(`[omp-web] host ${this.id}: credential policy "${policy}" could not be applied: ${this.credentialError}`);
+    }
+  }
+
+  /**
+   * What the machine's credentials currently ought to be, as a comparable
+   * string: the policy plus the endpoints it points at. When this stops
+   * matching what we last applied — because the hub's broker moved, its token
+   * rotated, or the last attempt failed — the machine needs reconfiguring.
+   */
+  private credentialSignature(): string {
+    const endpoints = getCredentialEndpoints() ?? {};
+    return JSON.stringify([this.credentialPolicy, endpoints.brokerUrl ?? null, endpoints.brokerToken ?? null, endpoints.gatewayUrl ?? null, endpoints.gatewayToken ?? null]);
+  }
+
+  /**
+   * True when the machine is not configured the way its policy says it should
+   * be. A failed attempt leaves this true, so a hub that was briefly down is
+   * retried on the next call rather than leaving the machine silently
+   * unconfigured for as long as the connection happens to last.
+   */
+  private get credentialsAreStale(): boolean {
+    return this.credentialsAppliedFor !== this.credentialSignature();
+  }
+
   /** Mark the omp probe stale (after `omp update`) so the next ready() re-reads it. */
   invalidateOmp(): void {
     this.ompVersion = null;
@@ -195,6 +255,8 @@ export class Host {
       ...(this.config.ompBin ? { ompBin: this.config.ompBin } : {}),
       ...(this.config.agentDir ? { agentDir: this.config.agentDir } : {}),
       ...(this.config.defaultCwd ? { defaultCwd: this.config.defaultCwd } : {}),
+      credentials: this.credentialPolicy,
+      credentialError: this.credentialError,
       home: this.home,
       platform: this.platform,
       ompVersion: this.ompVersion,
@@ -205,9 +267,15 @@ export class Host {
   }
 }
 
+/** Endpoints the broker and gateway policies point machines at. */
+export function getCredentialEndpoints(): CredentialEndpoints | undefined {
+  return getHostRegistry().credentials;
+}
+
 interface RegistryState {
   hosts: Map<string, Host>;
   defaultId: string;
+  credentials?: CredentialEndpoints;
   filePath: string;
   fileMtimeMs: number;
   fileExists: boolean;
@@ -240,6 +308,7 @@ function buildState(loaded: LoadedHostsFile, previous?: RegistryState): Registry
   return {
     hosts,
     defaultId: loaded.file.defaultHost ?? loaded.file.hosts[0].id,
+    ...(loaded.file.credentials ? { credentials: loaded.file.credentials } : {}),
     filePath: loaded.path,
     fileMtimeMs: loaded.mtimeMs,
     fileExists: loaded.exists,

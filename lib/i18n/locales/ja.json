@@ -1444,5 +1444,13 @@
   "directoryPicker.noEntries": "ここには何もありません",
   "directoryPicker.browse": "参照…",
   "directoryPicker.chooseFile": "ファイルを選択",
-  "directoryPicker.chooseDirectory": "ディレクトリを選択"
+  "directoryPicker.chooseDirectory": "ディレクトリを選択",
+  "hosts.form.credentials": "資格情報",
+  "hosts.form.credentialsOption.local": "このマシンに保存",
+  "hosts.form.credentialsOption.broker": "保管庫から取得",
+  "hosts.form.credentialsOption.gateway": "ゲートウェイ経由",
+  "hosts.form.credentialsHint.local": "このマシンが自身の資格情報を保持します。ハブが停止していても動作するため、無人実行に向いています。",
+  "hosts.form.credentialsHint.broker": "ハブの保管庫から資格情報を取得します。一度のログインで全マシンに適用されますが、ハブに到達できないと認証できません。",
+  "hosts.form.credentialsHint.gateway": "資格情報はこのマシンに渡らず、ハブが付与します。他者もログインできるマシンに適していますが、全リクエストがハブを経由します。",
+  "hosts.credentialFailed": "資格情報を構成できませんでした: {error}"
 }

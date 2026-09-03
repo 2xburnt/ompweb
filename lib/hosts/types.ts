@@ -9,6 +9,32 @@
 
 export type HostKind = "local" | "ssh";
 
+/**
+ * Where a machine gets provider credentials.
+ *
+ * - "local":   the machine keeps its own. It works when the hub is down, which
+ *              matters for anything running unattended, but the credentials
+ *              live on that machine's disk.
+ * - "broker":  the machine fetches credentials from the hub's vault. One login
+ *              covers every machine and revoking is central, but a configured
+ *              broker is authoritative: if it cannot be reached, omp fails
+ *              rather than falling back to anything local.
+ * - "gateway": the machine never receives a credential. It calls the hub's
+ *              gateway, which injects them, so its token can only make model
+ *              calls and cannot be used to extract secrets. The right choice
+ *              for a machine other people can log into, at the cost of routing
+ *              every request through the hub.
+ */
+export type CredentialPolicy = "local" | "broker" | "gateway";
+
+/** Hub-held endpoints the broker and gateway policies point machines at. */
+export interface CredentialEndpoints {
+  brokerUrl?: string;
+  brokerToken?: string;
+  gatewayUrl?: string;
+  gatewayToken?: string;
+}
+
 export interface SshHostConfig {
   /** Hostname, IP, or an alias from ~/.ssh/config (e.g. a Tailscale MagicDNS name). */
   host: string;
@@ -32,12 +58,16 @@ export interface HostConfig {
   agentDir?: string;
   /** Preferred working directory for new sessions on this host. */
   defaultCwd?: string;
+  /** Where this machine gets provider credentials (default "local"). */
+  credentials?: CredentialPolicy;
 }
 
 export interface HostsFile {
   version: 1;
   /** Host selected when a request does not name one. */
   defaultHost?: string;
+  /** Endpoints the "broker" and "gateway" policies point machines at. */
+  credentials?: CredentialEndpoints;
   hosts: HostConfig[];
 }
 
@@ -55,6 +85,9 @@ export interface HostSummary {
   ompBin?: string;
   agentDir?: string;
   defaultCwd?: string;
+  credentials: CredentialPolicy;
+  /** Why the policy could not be applied on the last connect, if it failed. */
+  credentialError: string | null;
   home: string | null;
   platform: string | null;
   ompVersion: string | null;

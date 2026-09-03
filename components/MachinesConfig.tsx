@@ -22,6 +22,7 @@ interface HostFormValues {
   ompBin: string;
   agentDir: string;
   defaultCwd: string;
+  credentials: "local" | "broker" | "gateway";
   enabled: boolean;
   makeDefault: boolean;
 }
@@ -29,7 +30,7 @@ interface HostFormValues {
 type FormErrors = Partial<Record<keyof HostFormValues, string>>;
 
 function emptyForm(): HostFormValues {
-  return { name: "", sshHost: "", user: "", port: "", identityFile: "", ompBin: "", agentDir: "", defaultCwd: "", enabled: true, makeDefault: false };
+  return { name: "", sshHost: "", user: "", port: "", identityFile: "", ompBin: "", agentDir: "", defaultCwd: "", credentials: "local", enabled: true, makeDefault: false };
 }
 
 function formFromHost(host: HostSummary): HostFormValues {
@@ -42,6 +43,7 @@ function formFromHost(host: HostSummary): HostFormValues {
     ompBin: host.ompBin ?? "",
     agentDir: host.agentDir ?? "",
     defaultCwd: host.defaultCwd ?? "",
+    credentials: host.credentials ?? "local",
     enabled: host.enabled,
     makeDefault: host.isDefault,
   };
@@ -69,6 +71,7 @@ function createBody(values: HostFormValues): Record<string, unknown> {
     ...(values.ompBin.trim() ? { ompBin: values.ompBin.trim() } : {}),
     ...(values.agentDir.trim() ? { agentDir: values.agentDir.trim() } : {}),
     ...(values.defaultCwd.trim() ? { defaultCwd: values.defaultCwd.trim() } : {}),
+    credentials: values.credentials,
     enabled: values.enabled,
     makeDefault: values.makeDefault,
   };
@@ -90,6 +93,7 @@ function patchBody(values: HostFormValues, host: HostSummary): Record<string, un
     ompBin: values.ompBin.trim(),
     agentDir: values.agentDir.trim(),
     defaultCwd: values.defaultCwd.trim(),
+    credentials: values.credentials,
     enabled: values.enabled,
   };
 }
@@ -296,6 +300,25 @@ function HostForm({
         </Field>
         <Field label={t("hosts.form.agentDir")} hint={t("hosts.form.agentDirHint")}>
           <PathField id="host-form-agent-dir" value={values.agentDir} onChange={(v) => set("agentDir", v)} placeholder="~/.omp/agent" disabled={busy} mode="directory" hostId={host?.id ?? null} browsable={canBrowse} />
+        </Field>
+        <Field label={t("hosts.form.credentials")} hint={t(`hosts.form.credentialsHint.${values.credentials}`)}>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {(["local", "broker", "gateway"] as const).map((policy) => {
+              const active = values.credentials === policy;
+              return (
+                <button
+                  key={policy}
+                  type="button"
+                  onClick={() => set("credentials", policy)}
+                  disabled={busy}
+                  aria-pressed={active}
+                  style={{ padding: "5px 11px", border: `1px solid ${active ? "var(--accent-strong)" : "var(--border)"}`, borderRadius: "var(--radius-control)", background: active ? "var(--bg-selected)" : "transparent", color: active ? "var(--text)" : "var(--text-muted)", cursor: busy ? "default" : "pointer", fontSize: 12, fontWeight: active ? 600 : 400 }}
+                >
+                  {t(`hosts.form.credentialsOption.${policy}`)}
+                </button>
+              );
+            })}
+          </div>
         </Field>
         <Field label={t("hosts.form.defaultCwd")} hint={t("hosts.form.defaultCwdHint")}>
           <PathField id="host-form-default-cwd" value={values.defaultCwd} onChange={(v) => set("defaultCwd", v)} placeholder="~/projects" disabled={busy} mode="directory" hostId={host?.id ?? null} browsable={canBrowse} />
