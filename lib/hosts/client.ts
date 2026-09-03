@@ -181,6 +181,26 @@ export function hostNameOf(hosts: readonly HostSummary[], hostId: string | null 
   return hosts.find((host) => host.id === hostId)?.name ?? hostId;
 }
 
+/**
+ * Whether it is worth sending a per-machine request to this host.
+ *
+ * The app fans out to every machine on load — projects, home directory — and a
+ * machine that is down does not fail fast: each request sits for the whole
+ * connect timeout before coming back 503. A handful of those saturates the
+ * browser's connection pool and holds up everything queued behind them, and
+ * they teach the user nothing the probe has not already put on screen.
+ *
+ * Failure is read from lastError rather than status alone. A machine that
+ * hangs rather than refusing spends its entire probe reporting "connecting",
+ * so status by itself looks fine right up until the timeout — and that is
+ * precisely the machine not worth waiting for. A machine that has never failed
+ * is still asked, so nothing is skipped merely for being unprobed.
+ */
+export function worthAsking(host: Pick<HostSummary, "status" | "lastError">): boolean {
+  if (host.status === "connected") return true;
+  return !host.lastError && host.status !== "error";
+}
+
 /** Subscribe to the host list + selection. Loads the list on first use. */
 export function useHosts(): UseHostsResult {
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);

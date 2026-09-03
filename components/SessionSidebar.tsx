@@ -15,7 +15,7 @@ import { sortManagedProjects } from "@/lib/project-ordering";
 import { comparableProjectPath } from "@/lib/comparable-path";
 import { Archive, Check, ChevronDown, ChevronRight, FileUp, Folder, GitBranch, MoreHorizontal, Plus, RefreshCw, Search, Server, Settings2, SlidersHorizontal, Trash2, Upload } from "lucide-react";
 import { publishSessionsChanged } from "@/lib/session-change-bus";
-import { hostFetch, useHosts } from "@/lib/hosts/client";
+import { hostFetch, useHosts, worthAsking } from "@/lib/hosts/client";
 import { MachineSwitcher } from "./MachineSwitcher";
 import { groupSessionsByMachine, projectActivityByKey, projectExpansionKey, sessionHostId, sessionProjectPath, type MachineGroup } from "./machine-groups";
 
@@ -424,9 +424,13 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   const { t } = useI18n();
   // Machines: the selected machine scopes projects, worktrees, the explorer
   // and New Session; sessions from every machine are listed together.
-  const { hosts, hostId, loaded: hostsLoaded, setHostId } = useHosts();
+  const { hosts, hostId, loaded: hostsLoaded, setHostId, refresh: refreshHostList } = useHosts();
   const enabledHosts = useMemo(() => hosts.filter((host) => host.enabled), [hosts]);
-  const enabledHostKey = enabledHosts.map((host) => host.id).join("\n");
+  // Machines worth asking: the ones that answered, plus any not yet tried.
+  // Asking a machine that is down costs a full connect timeout per request and
+  // reports nothing the probe has not already put on screen.
+  const reachableHosts = useMemo(() => enabledHosts.filter(worthAsking), [enabledHosts]);
+  const reachableHostKey = reachableHosts.map((host) => host.id).join("\n");
   const multiHost = enabledHosts.length > 1;
   const defaultHostId = hosts.find((host) => host.isDefault)?.id ?? null;
   /** Machine assumed for sessions the server did not tag with a host. */
@@ -444,7 +448,15 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   const projects = hostId ? projectsByHost[hostId] ?? EMPTY_PROJECTS : EMPTY_PROJECTS;
   const [draggedProject, setDraggedProject] = useState<{ host: string; path: string } | null>(null);
   const [projectsErrorByHost, setProjectsErrorByHost] = useState<Record<string, string>>({});
-  const projectsError = hostId ? projectsErrorByHost[hostId] ?? null : null;
+  const selectedHostSummary = hostId ? hosts.find((host) => host.id === hostId) ?? null : null;
+  // A machine that was never asked has no fetch error to report, so the
+  // connection failure the probe already found stands in for one.
+  const projectsError = hostId
+    ? projectsErrorByHost[hostId]
+      ?? (selectedHostSummary?.status === "error"
+        ? t("projects.loadFailed", { detail: selectedHostSummary.lastError ?? t("hosts.status.error") })
+        : null)
+    : null;
   // Collapsed machine groups, persisted like project expansion.
   // Machine the selected cwd belongs to. A machine switch from the header
   // resets the selection; selecting a session/project on another machine
@@ -576,7 +588,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
    *  keeps its own registry). Waits for the machine list so results can be
    *  keyed by machine id. */
   const loadProjects = useCallback(async () => {
-    const ids = enabledHostKey ? enabledHostKey.split("\n") : [];
+    const ids = reachableHostKey ? reachableHostKey.split("\n") : [];
     if (ids.length === 0) return;
     const seq = ++projectsLoadSeqRef.current;
     await Promise.all(ids.map(async (id) => {
@@ -599,11 +611,24 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         setProjectsErrorByHost((prev) => ({ ...prev, [id]: t("projects.loadFailed", { detail: e instanceof Error ? e.message : String(e) }) }));
       }
     }));
-  }, [enabledHostKey, t]);
+  }, [reachableHostKey, t]);
 
   useEffect(() => {
     void loadProjects();
   }, [loadProjects, refreshKey]);
+
+  // Refreshing re-probes the machines too. The fetches above skip machines
+  // whose last probe failed, so nothing else would notice one coming back:
+  // it would stay missing from the sidebar until the page was reloaded.
+  // Re-probing is one request that fans out on the server, rather than the
+  // per-machine requests this replaced.
+  const probedForRefreshRef = useRef(refreshKey);
+  useEffect(() => {
+    // Skipped on mount, where the machine list has just been probed anyway.
+    if (probedForRefreshRef.current === refreshKey) return;
+    probedForRefreshRef.current = refreshKey;
+    void refreshHostList({ probe: true }).catch(() => {});
+  }, [refreshKey, refreshHostList]);
 
   // Forget everything belonging to a machine that is no longer configured.
   // Removing a machine in Settings does not reach into these per-machine maps,
@@ -778,7 +803,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   // fetched from /api/home for machines the probe has not reached yet.
   const homeRequestedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
-    for (const host of enabledHosts) {
+    for (const host of reachableHosts) {
       if (homeByHost[host.id]) continue;
       if (host.home) {
         const home = host.home;
@@ -793,7 +818,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         homeRequestedRef.current.delete(host.id);
       });
     }
-  }, [enabledHosts, homeByHost]);
+  }, [reachableHosts, homeByHost]);
 
   const restoredRef = useRef(false);
   /** Machines whose /api/projects fetch has succeeded at least once; guards

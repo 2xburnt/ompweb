@@ -205,11 +205,16 @@ export function TerminalPane({
       try {
         const wanted = requestedSessionRef.current;
         if (wanted) {
-          const existing = await fetch(`/api/terminal/${encodeURIComponent(wanted)}`, { cache: "no-store" });
+          // Checked against the machine's session list rather than by asking
+          // for the session directly: after a server restart the id is gone,
+          // and a 404 per stale tab is console noise for something entirely
+          // expected. The list is held in memory, so this costs no round trip
+          // to the machine itself.
+          const existing = await hostFetch("/api/terminal", { cache: "no-store" }, hostId);
           if (existing.ok) {
             const body = await existing.json().catch(() => ({}));
-            // A shell that has already exited is not worth reattaching to.
-            if (!(body.terminal as { exit?: unknown } | undefined)?.exit) sessionId = wanted;
+            const open = (body.terminals as Array<{ id: string; exit?: unknown }> | undefined) ?? [];
+            if (open.some((entry) => entry.id === wanted && !entry.exit)) sessionId = wanted;
           }
         }
         if (!sessionId) {
