@@ -1440,5 +1440,9 @@
   "fileViewer.editing": "{name} を編集中",
   "fileViewer.saveConflict": "開いてからファイルがディスク上で変更されました。",
   "fileViewer.reloadFile": "再読み込み",
-  "fileViewer.overwrite": "上書き"
+  "fileViewer.overwrite": "上書き",
+  "directoryPicker.noEntries": "ここには何もありません",
+  "directoryPicker.browse": "参照…",
+  "directoryPicker.chooseFile": "ファイルを選択",
+  "directoryPicker.chooseDirectory": "ディレクトリを選択"
 }

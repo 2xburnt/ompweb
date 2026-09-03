@@ -6,6 +6,8 @@ import { expandHostHome, hostHomedir, hostPath } from "./omp/paths";
 export interface BrowsableDirectory {
   name: string;
   path: string;
+  /** Only present when files were requested; directories omit it. */
+  isFile?: boolean;
 }
 
 /** Platform of the host a request targets: remote hosts are always POSIX, so
@@ -68,11 +70,30 @@ export async function resolveDirectory(directory: string, host: Host = currentHo
 /** Readable subdirectories of `directory` on the host, one readdir round
  * trip. Symlinks count when they point at a directory; dangling, unreadable
  * or file-targeted links are skipped. */
-export async function listDirectories(directory: string, host: Host = currentHost()): Promise<BrowsableDirectory[]> {
+export async function listDirectories(
+  directory: string,
+  host: Host = currentHost(),
+  options: { includeFiles?: boolean } = {},
+): Promise<BrowsableDirectory[]> {
   const entries = await host.fs.readdir(directory);
   const pathApi = host.pathApi;
+  const isDir = (entry: { type: string; targetType?: string }) =>
+    entry.type === "dir" || (entry.type === "symlink" && entry.targetType === "dir");
+  const isFile = (entry: { type: string; targetType?: string }) =>
+    entry.type === "file" || (entry.type === "symlink" && entry.targetType === "file");
+
   return entries
-    .filter((entry) => entry.type === "dir" || (entry.type === "symlink" && entry.targetType === "dir"))
-    .map((entry) => ({ name: entry.name, path: pathApi.join(directory, entry.name) }))
-    .sort((left, right) => left.name.localeCompare(right.name));
+    .filter((entry) => isDir(entry) || (options.includeFiles === true && isFile(entry)))
+    .map((entry) => ({
+      name: entry.name,
+      path: pathApi.join(directory, entry.name),
+      ...(isDir(entry) ? {} : { isFile: true }),
+    }))
+    // Directories first so the tree is navigable before the files below it.
+    .sort((left, right) => {
+      const leftIsFile = left.isFile === true;
+      const rightIsFile = right.isFile === true;
+      if (leftIsFile !== rightIsFile) return leftIsFile ? 1 : -1;
+      return left.name.localeCompare(right.name);
+    });
 }

@@ -35,7 +35,10 @@ export const GET = withHostRoute(async (request: NextRequest) => {
       return NextResponse.json({ error: "Path is not a directory", code: "not_a_directory" }, { status: 400 });
     }
 
-    const directories = await listDirectories(resolved, host);
+    // ?files=1 turns this into a file picker as well, for settings that name
+    // a file rather than a directory (an SSH key, the omp binary).
+    const includeFiles = request.nextUrl.searchParams.get("files") === "1";
+    const directories = await listDirectories(resolved, host, { includeFiles });
 
     return NextResponse.json({
       path: resolved,

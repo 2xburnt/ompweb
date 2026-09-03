@@ -1434,8 +1434,15 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
 
   const modelOptions: ModelOption[] = React.useMemo(() => {
     if (modelList && modelList.length > 0) {
-      return modelList.map((m) => ({ provider: m.provider, modelId: m.id, name: m.name }))
-        .filter((m) => visibleModelKeys === null || visibleModelKeys.has(`${m.provider}:${m.modelId}`))
+      const all = modelList.map((m) => ({ provider: m.provider, modelId: m.id, name: m.name }));
+      const pinned = visibleModelKeys === null
+        ? all
+        : all.filter((m) => visibleModelKeys.has(`${m.provider}:${m.modelId}`));
+      // A pin set that matches nothing would leave the picker empty on a
+      // machine that has models, with no way to recover from inside it. That
+      // happens whenever the set was written for a different machine, so treat
+      // it as no filter rather than as "hide everything".
+      return (pinned.length > 0 ? pinned : all)
         .sort((a, b) => compareModelOptions(modelCollator, a, b));
     }
     return Object.entries(modelNames ?? {}).map(([modelId, name]) => ({

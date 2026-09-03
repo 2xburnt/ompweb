@@ -1,13 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type ReactNode } from "react";
-import { Pencil, Plus, Power, RefreshCw, Star, Trash2, Wifi } from "lucide-react";
+import { FolderOpen, Pencil, Plus, Power, RefreshCw, Star, Trash2, Wifi } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
 import { formatApiError, type ApiErrorPayload } from "@/lib/i18n/api-error";
 import { useHosts } from "@/lib/hosts/client";
 import type { HostSummary } from "@/lib/hosts/types";
 import { Alert, Check, ConfirmDialog, Field, NumInput, TextInput } from "@/components/ui/field";
 import { useIsMobile } from "@/hooks/useIsMobile";
+import { DirectoryPicker } from "./DirectoryPicker";
 import { formatOmpVersion, HostKindIcon, HostStatusDot, hostStatusLabel } from "./MachineSwitcher";
 
 /* ───────────────────────────── form model ───────────────────────────── */
@@ -148,6 +149,66 @@ const chipStyle: CSSProperties = {
 
 /* ───────────────────────────── form ───────────────────────────── */
 
+/**
+ * A path field with an optional browser.
+ *
+ * Typing stays the primary interaction, since a path can name something that
+ * does not exist yet, or a machine that cannot be reached. The browser is an
+ * affordance on top, and is only offered for a machine that is saved and
+ * reachable: there is nothing to list otherwise.
+ */
+function PathField({
+  id,
+  value,
+  onChange,
+  placeholder,
+  disabled,
+  mode,
+  hostId,
+  browsable,
+}: {
+  id: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+  disabled: boolean;
+  mode: "file" | "directory";
+  hostId: string | null;
+  browsable: boolean;
+}) {
+  const { t } = useI18n();
+  const [picking, setPicking] = useState(false);
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <TextInput id={id} value={value} onChange={onChange} placeholder={placeholder} mono disabled={disabled} autoComplete="off" spellCheck={false} />
+      </div>
+      {browsable && (
+        <button
+          type="button"
+          onClick={() => setPicking(true)}
+          disabled={disabled}
+          title={mode === "file" ? t("directoryPicker.chooseFile") : t("directoryPicker.chooseDirectory")}
+          aria-label={mode === "file" ? t("directoryPicker.chooseFile") : t("directoryPicker.chooseDirectory")}
+          style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", gap: 5, padding: "5px 9px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-subtle)", color: "var(--text-muted)", cursor: disabled ? "default" : "pointer", fontSize: 11.5 }}
+        >
+          <FolderOpen size={13} strokeWidth={1.9} aria-hidden="true" />
+          {t("directoryPicker.browse")}
+        </button>
+      )}
+      {picking && (
+        <DirectoryPicker
+          mode={mode}
+          hostId={hostId}
+          startPath={value.trim() || null}
+          onCancel={() => setPicking(false)}
+          onSelect={(path) => { onChange(path); setPicking(false); }}
+        />
+      )}
+    </div>
+  );
+}
+
 function HostForm({
   host,
   busy,
@@ -168,6 +229,9 @@ function HostForm({
   const [errors, setErrors] = useState<FormErrors>({});
   const nameRef = useRef<HTMLInputElement>(null);
   const isSsh = host === null || host.kind === "ssh";
+  // Browsing needs a machine the server already knows and can reach; a machine
+  // being added has neither, so those fields stay type-only until it is saved.
+  const canBrowse = host !== null && host.enabled && host.status === "connected";
 
   useEffect(() => {
     nameRef.current?.focus();
@@ -224,17 +288,17 @@ function HostForm({
         )}
         {isSsh && (
           <Field label={t("hosts.form.identityFile")} hint={t("hosts.form.identityFileHint")}>
-            <TextInput id="host-form-identity" value={values.identityFile} onChange={(v) => set("identityFile", v)} placeholder="~/.ssh/id_ed25519" mono disabled={busy} autoComplete="off" spellCheck={false} />
+            <PathField id="host-form-identity" value={values.identityFile} onChange={(v) => set("identityFile", v)} placeholder="~/.ssh/id_ed25519" disabled={busy} mode="file" hostId={host?.id ?? null} browsable={canBrowse} />
           </Field>
         )}
         <Field label={t("hosts.form.ompBin")} hint={t("hosts.form.ompBinHint")}>
-          <TextInput id="host-form-omp-bin" value={values.ompBin} onChange={(v) => set("ompBin", v)} placeholder="omp" mono disabled={busy} autoComplete="off" spellCheck={false} />
+          <PathField id="host-form-omp-bin" value={values.ompBin} onChange={(v) => set("ompBin", v)} placeholder="omp" disabled={busy} mode="file" hostId={host?.id ?? null} browsable={canBrowse} />
         </Field>
         <Field label={t("hosts.form.agentDir")} hint={t("hosts.form.agentDirHint")}>
-          <TextInput id="host-form-agent-dir" value={values.agentDir} onChange={(v) => set("agentDir", v)} placeholder="~/.omp/agent" mono disabled={busy} autoComplete="off" spellCheck={false} />
+          <PathField id="host-form-agent-dir" value={values.agentDir} onChange={(v) => set("agentDir", v)} placeholder="~/.omp/agent" disabled={busy} mode="directory" hostId={host?.id ?? null} browsable={canBrowse} />
         </Field>
         <Field label={t("hosts.form.defaultCwd")} hint={t("hosts.form.defaultCwdHint")}>
-          <TextInput id="host-form-default-cwd" value={values.defaultCwd} onChange={(v) => set("defaultCwd", v)} placeholder="~/projects" mono disabled={busy} autoComplete="off" spellCheck={false} />
+          <PathField id="host-form-default-cwd" value={values.defaultCwd} onChange={(v) => set("defaultCwd", v)} placeholder="~/projects" disabled={busy} mode="directory" hostId={host?.id ?? null} browsable={canBrowse} />
         </Field>
       </div>
       <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 14 }}>

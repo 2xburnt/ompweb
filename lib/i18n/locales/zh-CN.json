@@ -1440,5 +1440,9 @@
   "fileViewer.editing": "正在编辑 {name}",
   "fileViewer.saveConflict": "打开后该文件已在磁盘上发生更改。",
   "fileViewer.reloadFile": "重新加载",
-  "fileViewer.overwrite": "覆盖"
+  "fileViewer.overwrite": "覆盖",
+  "directoryPicker.noEntries": "此处为空",
+  "directoryPicker.browse": "浏览…",
+  "directoryPicker.chooseFile": "选择文件",
+  "directoryPicker.chooseDirectory": "选择目录"
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useModalDialog } from "@/hooks/useModalDialog";
 import { useI18n } from "@/lib/i18n";
@@ -11,6 +11,8 @@ import { HostStatusDot } from "./MachineSwitcher";
 interface DirectoryEntry {
   name: string;
   path: string;
+  /** Present only in file mode; directories omit it. */
+  isFile?: boolean;
 }
 
 interface BrowseResponse {
@@ -22,8 +24,11 @@ interface BrowseResponse {
   code?: string;
 }
 
-async function loadDirectories(directory: string | undefined, hostId: string | null): Promise<BrowseResponse> {
-  const query = directory ? `?path=${encodeURIComponent(directory)}` : "";
+async function loadDirectories(directory: string | undefined, hostId: string | null, includeFiles = false): Promise<BrowseResponse> {
+  const params = new URLSearchParams();
+  if (directory) params.set("path", directory);
+  if (includeFiles) params.set("files", "1");
+  const query = params.toString() ? `?${params}` : "";
   // Browse the selected machine's filesystem.
   const response = await hostFetch(`/api/cwd/browse${query}`, undefined, hostId);
   const data = await response.json() as BrowseResponse;
@@ -31,6 +36,15 @@ async function loadDirectories(directory: string | undefined, hostId: string | n
     throw new Error(formatApiError({ ...data, error: data.error ?? `HTTP ${response.status}` }));
   }
   return data;
+}
+
+function FileIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" aria-hidden="true">
+      <path d="M9 1.5H4a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5.5z" />
+      <path d="M9 1.5V5.5h4" />
+    </svg>
+  );
 }
 
 function FolderIcon() {
@@ -60,11 +74,25 @@ interface Props {
   onSelect: (path: string) => void;
   busy?: boolean;
   error?: string | null;
+  /** "file" lists files alongside directories and returns the chosen file. */
+  mode?: "directory" | "file";
+  /** Where to open. Defaults to the machine's configured working directory. */
+  startPath?: string | null;
+  /** Machine to browse. Defaults to the selected one. */
+  hostId?: string | null;
+  title?: string;
 }
 
-export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Props) {
+export function DirectoryPicker({ onCancel, onSelect, busy = false, error, mode = "directory", startPath, hostId: hostIdProp, title }: Props) {
   const { t } = useI18n();
-  const { hostId, current: currentHost } = useHosts();
+  const { hostId: selectedHostId, current: selectedHost, hosts } = useHosts();
+  const hostId = hostIdProp ?? selectedHostId;
+  const currentHost = hostIdProp ? hosts.find((entry) => entry.id === hostIdProp) ?? selectedHost : selectedHost;
+  const selectingFile = mode === "file";
+  // Opening at the machine's configured working directory is the point of
+  // setting one; without a start path the picker always began at home.
+  const initialPath = startPath ?? currentHost?.defaultCwd ?? null;
+  const heading = title ?? (selectingFile ? t("directoryPicker.chooseFile") : t("directoryPicker.selectDirectory"));
   const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
   const [currentPath, setCurrentPath] = useState("");
   const [parentDirectory, setParentDirectory] = useState<string | null>(null);
@@ -82,7 +110,7 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
     setLoading(true);
     setLoadError(null);
     try {
-      const data = await loadDirectories(directory, hostId);
+      const data = await loadDirectories(directory, hostId, selectingFile);
       const nextPath = data.path ?? directory ?? "/";
       setCurrentPath(nextPath);
       setParentDirectory(data.parentPath ?? null);
@@ -94,12 +122,17 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
     } finally {
       setLoading(false);
     }
-  }, [hostId]);
+  }, [hostId, selectingFile]);
 
+  const openedRef = useRef(false);
   useEffect(() => {
     setPortalTarget(document.body);
-    void navigateTo();
-  }, [navigateTo]);
+    if (openedRef.current) return;
+    openedRef.current = true;
+    // A configured directory that no longer exists must not leave the picker
+    // stuck on an error: fall back to the machine's home.
+    void navigateTo(initialPath ?? undefined).catch(() => void navigateTo());
+  }, [navigateTo, initialPath]);
 
   const handlePathSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -120,10 +153,10 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
       }}
       style={{ position: "fixed", inset: 0, zIndex: 1002, display: "flex", alignItems: "center", justifyContent: "center", background: "var(--overlay-backdrop)" }}
     >
-      <div className="directory-picker-panel animate-scale-in" ref={dialogRef} role="dialog" aria-modal="true" aria-label={t("directoryPicker.selectDirectory")} tabIndex={-1} style={{ width: 520, maxWidth: "calc(100vw - 16px)", height: "min(620px, calc(100dvh - 16px))", maxHeight: "calc(100dvh - 16px)", display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius-modal)", boxShadow: "var(--shadow-modal)", outline: "none" }}>
+      <div className="directory-picker-panel animate-scale-in" ref={dialogRef} role="dialog" aria-modal="true" aria-label={heading} tabIndex={-1} style={{ width: 520, maxWidth: "calc(100vw - 16px)", height: "min(620px, calc(100dvh - 16px))", maxHeight: "calc(100dvh - 16px)", display: "flex", flexDirection: "column", overflow: "hidden", background: "var(--bg)", border: "1px solid var(--border)", borderRadius: "var(--radius-modal)", boxShadow: "var(--shadow-modal)", outline: "none" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0, padding: "12px 18px", borderBottom: "1px solid var(--border)" }}>
           <div style={{ minWidth: 0, flex: 1 }}>
-            <div style={{ color: "var(--text)", fontWeight: 700, fontSize: 15 }}>{t("directoryPicker.selectDirectory")}</div>
+            <div style={{ color: "var(--text)", fontWeight: 700, fontSize: 15 }}>{heading}</div>
             {currentHost && (
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2, color: "var(--text-muted)", fontSize: 11.5 }}>
                 <HostStatusDot host={currentHost} size={6} />
@@ -209,18 +242,21 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
                 key={entry.path}
                 className="directory-picker-entry"
                 type="button"
-                onClick={() => void navigateTo(entry.path)}
+                onClick={() => { if (entry.isFile) { setPathInput(entry.path); onSelect(entry.path); } else { void navigateTo(entry.path); } }}
+                onDoubleClick={() => { if (!entry.isFile) onSelect(entry.path); }}
                 title={entry.path}
                 style={{ width: "100%", minHeight: 30, display: "flex", alignItems: "center", gap: 7, padding: "5px 8px", border: 0, borderRadius: 5, background: "none", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontFamily: "var(--font-mono)", fontSize: 11, transition: "background-color var(--dur-fast) var(--ease-out-warm), color var(--dur-fast) var(--ease-out-warm)" }}
                 onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text)"; }}
                 onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-muted)"; }}
               >
-                <FolderIcon />
+                {entry.isFile ? <FileIcon /> : <FolderIcon />}
                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.name}</span>
               </button>
             ))
           ) : (
-            <div style={{ padding: 8, color: "var(--text-dim)", fontSize: 11 }}>{t("directoryPicker.noSubdirectories")}</div>
+            <div style={{ padding: 8, color: "var(--text-dim)", fontSize: 11 }}>
+              {selectingFile ? t("directoryPicker.noEntries") : t("directoryPicker.noSubdirectories")}
+            </div>
           )}
           {(loadError || error) && <div style={{ padding: "8px", color: "var(--status-error)", fontSize: 11 }}>{loadError ?? error}</div>}
         </div>

@@ -1868,7 +1868,15 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
   // The pinned composer models belong to the machine being edited: reload the
   // set when the machine changes, and never write one machine's ids under
   // another's key.
+  //
+  // The two effects below run in the same commit when the machine changes, and
+  // clearing the set in the first is only a queued state update, so without
+  // this marker the second would persist the PREVIOUS machine's ids under the
+  // NEW machine's key. Those ids do not exist there, so the composer filtered
+  // every model away and offered nothing to pick.
+  const pinsBelongToHostRef = useRef<string | null>(null);
   useEffect(() => {
+    pinsBelongToHostRef.current = null;
     setVisibleModelKeys(null);
     try {
       const stored = JSON.parse(localStorage.getItem(composerModelsStorageKey(settingsHostId)) ?? "null");
@@ -1876,10 +1884,12 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
     } catch {
       // Invalid UI-only preferences fall back to showing all native runtime models.
     }
+    pinsBelongToHostRef.current = settingsHostId;
   }, [settingsHostId]);
 
   useEffect(() => {
     if (visibleModelKeys === null) return;
+    if (pinsBelongToHostRef.current !== settingsHostId) return;
     try {
       localStorage.setItem(composerModelsStorageKey(settingsHostId), JSON.stringify([...visibleModelKeys]));
       window.dispatchEvent(new Event("omp-composer-models-change"));

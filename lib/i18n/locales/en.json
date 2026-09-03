@@ -1439,5 +1439,9 @@
   "fileViewer.editing": "Editing {name}",
   "fileViewer.saveConflict": "This file changed on disk since it was opened.",
   "fileViewer.reloadFile": "Reload",
-  "fileViewer.overwrite": "Overwrite"
+  "fileViewer.overwrite": "Overwrite",
+  "directoryPicker.noEntries": "Nothing here",
+  "directoryPicker.browse": "Browse…",
+  "directoryPicker.chooseFile": "Choose a file",
+  "directoryPicker.chooseDirectory": "Choose a directory"
 }
