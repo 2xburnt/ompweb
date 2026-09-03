@@ -1422,5 +1422,14 @@
   "appShell.newSession": "New session",
   "tabBar.fileOnMachine": "{path} on {machine}",
   "hosts.scope.switchAriaLabel": "Machine: {machine}. Switch machine",
-  "hosts.scope.switchTitle": "Switch machine"
+  "hosts.scope.switchTitle": "Switch machine",
+  "terminal.title": "Terminal",
+  "terminal.show": "Show terminal",
+  "terminal.hide": "Hide terminal",
+  "terminal.close": "Close terminal",
+  "terminal.restart": "Restart",
+  "terminal.resize": "Resize terminal",
+  "terminal.starting": "Starting…",
+  "terminal.disconnected": "Disconnected",
+  "terminal.exited": "Exited ({code})"
 }

@@ -2,6 +2,9 @@
    on Windows, where a parent user-profile package can make the scanner walk
    protected junctions such as "My Documents" during production builds. */
 @import "tailwindcss" source(none);
+/* xterm.js core styles for the terminal pane (cursor, selection, layers). The
+   colours themselves come from the theme passed to the Terminal instance. */
+@import "@xterm/xterm/css/xterm.css";
 @source inline("data-font-size");
 @source inline("data-ui-scale");
 @source "../app";

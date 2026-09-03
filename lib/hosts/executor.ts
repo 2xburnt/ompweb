@@ -166,6 +166,14 @@ export interface HostExecutor {
   which(binary: string): Promise<string | null>;
   /** ssh client arguments (without the target) for tools that shell out to ssh. */
   sshClientArgs?(): string[];
+  /**
+   * The command to run under a PTY **on the hub** so `argv` ends up attached to
+   * a real terminal on this host. Locally that is just the command; remotely it
+   * is `ssh -tt`, which allocates a terminal on the far side. Because the hub's
+   * PTY gives the ssh client a controlling terminal, window-size changes
+   * propagate all the way to the remote program.
+   */
+  ptyCommand(argv: readonly string[], options?: SpawnOptionsLike): { file: string; args: string[] };
 }
 
 const DEFAULT_MAX_BUFFER = 64 * 1024 * 1024;
@@ -530,6 +538,12 @@ export class LocalExecutor implements HostExecutor {
       // launches LSP servers and extension subprocesses).
       detached: process.platform !== "win32",
     });
+  }
+
+  ptyCommand(argv: readonly string[]): { file: string; args: string[] } {
+    const [file, ...args] = argv;
+    if (!file) throw new Error("ptyCommand requires a command");
+    return { file, args };
   }
 
   async probe(): Promise<HostProbe> {
@@ -957,6 +971,20 @@ export class SshExecutor implements HostExecutor {
       windowsHide: true,
       detached: process.platform !== "win32",
     });
+  }
+
+  /**
+   * `ssh -tt <target> <command>`: the doubled -t forces a remote terminal even
+   * though the ssh client's own stdin is a PTY we created rather than the
+   * user's console. Window-size changes reach the remote program because the
+   * client has a controlling terminal to observe.
+   */
+  ptyCommand(argv: readonly string[], options: SpawnOptionsLike = {}): { file: string; args: string[] } {
+    if (argv.length === 0) throw new Error("ptyCommand requires a command");
+    return {
+      file: "ssh",
+      args: [...this.sshClientArgs(), "-tt", "--", this.target(), this.remoteCommand(argv, options)],
+    };
   }
 
   /** Connectivity + tool-flavor probe; cached after the first success. */

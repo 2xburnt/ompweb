@@ -11,7 +11,7 @@ import { ChatWindow } from "./ChatWindow";
 import { TabBar, type Tab } from "./TabBar";
 import { BranchNavigator } from "./BranchNavigator";
 import { LanguageSwitcher } from "./LanguageSwitcher";
-import { Check, CircleCheck, Folder, Gauge, History, Menu, Moon, PanelLeft, Server, Sun, Terminal, Wand2, Zap } from "lucide-react";
+import { Check, CircleCheck, Folder, Gauge, History, Menu, Moon, PanelLeft, ScrollText, Server, SquareTerminal, Sun, Wand2, Zap } from "lucide-react";
 import { useTheme } from "@/hooks/useTheme";
 import { formatCompactNumber, formatPercent, getCacheHitRate } from "@/lib/format";
 import { translate, useI18n } from "@/lib/i18n";
@@ -21,6 +21,8 @@ import { copyText } from "@/lib/clipboard";
 import { getFileName } from "@/lib/file-paths";
 import { buildAtMentionText, buildFileAtMentionsText, buildFileLineMentionText } from "@/lib/file-fuzzy";
 import { getInitialNavigation } from "@/lib/initial-navigation";
+// xterm touches `window` at module scope, so it must never reach the server bundle.
+const TerminalPane = dynamic(() => import("./TerminalPane").then((module) => module.TerminalPane), { ssr: false });
 import { getCurrentHostId, hostFetch, hostNameOf, setCurrentHostId, useHosts } from "@/lib/hosts/client";
 import { comparableProjectPath } from "@/lib/comparable-path";
 import { showCompletionNotification } from "@/lib/browser-notifications";
@@ -62,6 +64,10 @@ const COMPLETED_APP_UPDATE_KEY = "omp-web:completed-app-update";
 const SIDEBAR_MIN_WIDTH = 200;
 const SIDEBAR_MAX_WIDTH = 520;
 const SIDEBAR_DEFAULT_WIDTH = 260;
+const TERMINAL_OPEN_STORAGE_KEY = "omp-web:terminal-open";
+const TERMINAL_HEIGHT_STORAGE_KEY = "omp-web:terminal-height";
+const TERMINAL_MIN_HEIGHT = 80;
+const TERMINAL_DEFAULT_HEIGHT = 260;
 const APP_UPDATE_POLL_MS = 500;
 const APP_UPDATE_STOPPING_POLL_MS = 200;
 const APP_UPDATE_TIMEOUT_MS = 15 * 60 * 1_000;
@@ -345,6 +351,58 @@ export function AppShell() {
   // Persist the committed width (after each change; skipped mid-drag, then
   // written once the drag ends). The first run is skipped so the mount-time
   // default cannot overwrite the stored width before it is loaded.
+  // Terminal pane: spans the chat and file area along the bottom, never the
+  // sidebar, so the workspace list stays full height beside it.
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [terminalHeight, setTerminalHeight] = useState<number>(TERMINAL_DEFAULT_HEIGHT);
+  const [terminalResizing, setTerminalResizing] = useState(false);
+
+  useEffect(() => {
+    try {
+      setTerminalOpen(window.localStorage.getItem(TERMINAL_OPEN_STORAGE_KEY) === "1");
+      const stored = Number.parseInt(window.localStorage.getItem(TERMINAL_HEIGHT_STORAGE_KEY) ?? "", 10);
+      if (Number.isFinite(stored)) setTerminalHeight(Math.max(TERMINAL_MIN_HEIGHT, stored));
+    } catch {
+      // storage unavailable — defaults are fine
+    }
+  }, []);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(TERMINAL_OPEN_STORAGE_KEY, terminalOpen ? "1" : "0");
+    } catch {
+      // ignore
+    }
+  }, [terminalOpen]);
+  useEffect(() => {
+    if (terminalResizing) return;
+    try {
+      window.localStorage.setItem(TERMINAL_HEIGHT_STORAGE_KEY, String(Math.round(terminalHeight)));
+    } catch {
+      // ignore
+    }
+  }, [terminalHeight, terminalResizing]);
+
+  /** Drag the divider between the workspace and the terminal. */
+  const handleTerminalResizeStart = useCallback((event: React.MouseEvent) => {
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = terminalHeight;
+    setTerminalResizing(true);
+    const onMove = (move: MouseEvent) => {
+      // Dragging up grows the pane; leave room for the chat above it.
+      const next = startHeight + (startY - move.clientY);
+      const max = Math.max(TERMINAL_MIN_HEIGHT, window.innerHeight - 200);
+      setTerminalHeight(Math.min(max, Math.max(TERMINAL_MIN_HEIGHT, next)));
+    };
+    const onUp = () => {
+      setTerminalResizing(false);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [terminalHeight]);
+
   const sidebarWidthMountedRef = useRef(false);
   useEffect(() => {
     if (!sidebarWidthMountedRef.current) {
@@ -1041,6 +1099,11 @@ export function AppShell() {
 
   const initialSessionId = initialNavigation.sessionId;
   const [activeCwd, setActiveCwd] = useState<string | null>(null);
+  // Machine the active directory belongs to. During a machine switch the
+  // directory still points at the previous machine for a render, and handing
+  // that path to the new machine opened a shell in a directory that does not
+  // exist there.
+  const [activeCwdHost, setActiveCwdHost] = useState<string | null>(null);
   // True once the initial ?session= URL param has been resolved (or confirmed absent)
   const [initialSessionRestored, setInitialSessionRestored] = useState<boolean>(() => !initialSessionId);
   // During the initial URL restore the sidebar adopts the restored cwd and
@@ -1086,6 +1149,7 @@ export function AppShell() {
 
   const handleCwdChange = useCallback((cwd: string | null, projectRoot?: string | null, cwdHostId?: string | null) => {
     setActiveCwd(cwd);
+    setActiveCwdHost(cwd ? cwdHostId ?? null : null);
     // Skip if cwd is null (initial mount) or during the initial URL restore.
     if (!cwd) return;
     // Skip only when the notification matches the cwd we're suppressing for.
@@ -1377,6 +1441,20 @@ export function AppShell() {
     handleOpenFile(filePath, getFileName(filePath), selectedSession?.id ?? null, selectedSession?.host ?? hostId);
   }, [handleOpenFile, hostId, selectedSession?.host, selectedSession?.id]);
 
+  /**
+   * Directory the terminal should open in: only a path that belongs to the
+   * selected machine. A session's own directory is safe because the session
+   * carries its machine; the active workspace is only trusted while its
+   * recorded machine still matches. Otherwise the shell starts at the
+   * machine's home, which always exists.
+   */
+  const terminalCwd = (() => {
+    if (selectedSession?.cwd && selectedSession.host === hostId) return selectedSession.cwd;
+    if (activeCwd && activeCwdHost === hostId) return activeCwd;
+    if (newSessionCwd && activeCwdHost === hostId) return newSessionCwd;
+    return null;
+  })();
+
   const handleViewFullHistory = useCallback(() => {
     if (!selectedSession) return;
     window.open(
@@ -1593,6 +1671,11 @@ export function AppShell() {
         />
       )}
 
+      {/* Workspace column: chat + file panel in a row, terminal beneath them.
+          The sidebar sits outside this column, so the terminal spans only the
+          chat and file area and the workspace list keeps its full height. */}
+      <div style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, overflow: "hidden" }}>
+      <div style={{ display: "flex", flex: 1, minHeight: 0, overflow: "hidden" }}>
       {/* Center: chat */}
       <main style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minWidth: 0 }}>
         {/* Top bar: 3-zone segmented control bar */}
@@ -1662,11 +1745,21 @@ export function AppShell() {
                   aria-pressed={activeTopPanel === "system"}
                   className="shell-toolbar-btn ui-focus-ring"
                 >
-                  <Terminal size={16} strokeWidth={1.8} aria-hidden="true" style={{ color: systemPrompt ? "var(--accent)" : undefined }} />
+                  <ScrollText size={16} strokeWidth={1.8} aria-hidden="true" style={{ color: systemPrompt ? "var(--accent)" : undefined }} />
                 </button>
               </>
             )}
           </div>
+
+          <button
+            onClick={() => setTerminalOpen((open) => !open)}
+            title={terminalOpen ? t("terminal.hide") : t("terminal.show")}
+            aria-label={terminalOpen ? t("terminal.hide") : t("terminal.show")}
+            aria-pressed={terminalOpen}
+            className="shell-toolbar-btn ui-focus-ring"
+          >
+            <SquareTerminal size={16} strokeWidth={1.8} aria-hidden="true" style={{ color: terminalOpen ? "var(--accent)" : undefined }} />
+          </button>
 
           {/* Center Zone: Workspace & Session Breadcrumb + Auto-name action */}
           {showChat && (() => {
@@ -2484,6 +2577,37 @@ export function AppShell() {
             </div>
           )}
         </div>
+      </div>
+      </div>
+
+      {terminalOpen && (
+        <>
+          <div
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label={t("terminal.resize")}
+            onMouseDown={handleTerminalResizeStart}
+            onDoubleClick={() => setTerminalHeight(TERMINAL_DEFAULT_HEIGHT)}
+            title={t("terminal.resize")}
+            style={{
+              height: 5,
+              flexShrink: 0,
+              cursor: "row-resize",
+              background: terminalResizing ? "color-mix(in srgb, var(--accent) 35%, transparent)" : "var(--border)",
+              transition: "background var(--dur-fast) var(--ease-out-warm)",
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.background = "color-mix(in srgb, var(--accent) 35%, transparent)"; }}
+            onMouseLeave={(e) => { if (!terminalResizing) e.currentTarget.style.background = "var(--border)"; }}
+          />
+          <div style={{ height: terminalHeight, flexShrink: 0, minHeight: TERMINAL_MIN_HEIGHT, overflow: "hidden" }}>
+            <TerminalPane
+              hostId={hostId}
+              cwd={terminalCwd}
+              onClose={() => setTerminalOpen(false)}
+            />
+          </div>
+        </>
+      )}
       </div>
     </div>
     {/* File panel toggle — always visible at top-right */}

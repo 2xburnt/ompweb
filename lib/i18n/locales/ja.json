@@ -1423,5 +1423,14 @@
   "appShell.newSession": "新しいセッション",
   "tabBar.fileOnMachine": "{path}（{machine}）",
   "hosts.scope.switchAriaLabel": "マシン: {machine}。マシンを切り替え",
-  "hosts.scope.switchTitle": "マシンを切り替え"
+  "hosts.scope.switchTitle": "マシンを切り替え",
+  "terminal.title": "ターミナル",
+  "terminal.show": "ターミナルを表示",
+  "terminal.hide": "ターミナルを非表示",
+  "terminal.close": "ターミナルを閉じる",
+  "terminal.restart": "再起動",
+  "terminal.resize": "ターミナルのサイズを変更",
+  "terminal.starting": "起動中…",
+  "terminal.disconnected": "切断されました",
+  "terminal.exited": "終了しました（{code}）"
 }

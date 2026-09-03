@@ -1423,5 +1423,14 @@
   "appShell.newSession": "新会话",
   "tabBar.fileOnMachine": "{path}（位于 {machine}）",
   "hosts.scope.switchAriaLabel": "机器：{machine}。切换机器",
-  "hosts.scope.switchTitle": "切换机器"
+  "hosts.scope.switchTitle": "切换机器",
+  "terminal.title": "终端",
+  "terminal.show": "显示终端",
+  "terminal.hide": "隐藏终端",
+  "terminal.close": "关闭终端",
+  "terminal.restart": "重启",
+  "terminal.resize": "调整终端大小",
+  "terminal.starting": "正在启动…",
+  "terminal.disconnected": "已断开",
+  "terminal.exited": "已退出（{code}）"
 }
