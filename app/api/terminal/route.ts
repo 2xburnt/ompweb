@@ -24,11 +24,17 @@ export function terminalErrorResponse(error: unknown): NextResponse {
   return NextResponse.json({ error: "Terminal request failed", code: "terminal_request_failed" }, { status: 500 });
 }
 
-// GET /api/terminal[?host=<id>] — open terminals on the selected machine.
-export const GET = withHostRoute(async () => {
+// GET /api/terminal[?host=<id>][?all=1] — open terminals on the selected
+// machine, or on every machine. The fleet-wide listing is what lets the UI put
+// its tabs back after a reload without having to reach each machine first.
+export const GET = withHostRoute(async (req: Request) => {
   try {
     const host = currentHost();
-    return NextResponse.json({ terminals: listTerminals(host.id), host: host.id }, { headers: { "Cache-Control": "no-store" } });
+    const all = new URL(req.url).searchParams.get("all") === "1";
+    return NextResponse.json(
+      { terminals: all ? listTerminals() : listTerminals(host.id), host: host.id },
+      { headers: { "Cache-Control": "no-store" } },
+    );
   } catch (error) {
     return terminalErrorResponse(error);
   }

@@ -22,7 +22,7 @@ import { getFileName } from "@/lib/file-paths";
 import { buildAtMentionText, buildFileAtMentionsText, buildFileLineMentionText } from "@/lib/file-fuzzy";
 import { getInitialNavigation } from "@/lib/initial-navigation";
 // xterm touches `window` at module scope, so it must never reach the server bundle.
-const TerminalPane = dynamic(() => import("./TerminalPane").then((module) => module.TerminalPane), { ssr: false });
+const TerminalTabs = dynamic(() => import("./TerminalTabs").then((module) => module.TerminalTabs), { ssr: false });
 import { getCurrentHostId, hostFetch, hostNameOf, setCurrentHostId, useHosts } from "@/lib/hosts/client";
 import { comparableProjectPath } from "@/lib/comparable-path";
 import { showCompletionNotification } from "@/lib/browser-notifications";
@@ -2600,7 +2600,7 @@ export function AppShell() {
             onMouseLeave={(e) => { if (!terminalResizing) e.currentTarget.style.background = "var(--border)"; }}
           />
           <div style={{ height: terminalHeight, flexShrink: 0, minHeight: TERMINAL_MIN_HEIGHT, overflow: "hidden" }}>
-            <TerminalPane
+            <TerminalTabs
               hostId={hostId}
               cwd={terminalCwd}
               onClose={() => setTerminalOpen(false)}

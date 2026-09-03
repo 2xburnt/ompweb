@@ -1451,5 +1451,8 @@
   "hosts.form.credentialsHint.local": "This machine keeps its own credentials. It keeps working when the hub is down, which matters for anything running unattended.",
   "hosts.form.credentialsHint.broker": "This machine fetches credentials from the hub's vault. One login covers every machine, but if the hub is unreachable it cannot authenticate at all.",
   "hosts.form.credentialsHint.gateway": "This machine never receives a credential; it calls the hub, which adds them. Right for machines other people can log into, at the cost of routing every request through the hub.",
-  "hosts.credentialFailed": "Credentials could not be configured: {error}"
+  "hosts.credentialFailed": "Credentials could not be configured: {error}",
+  "terminal.newTab": "New terminal on a machine",
+  "terminal.closeTab": "Close this terminal",
+  "terminal.noTabs": "No terminals open."
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { Plug, RotateCcw, X } from "lucide-react";
 import { hostFetch, hostNameOf, useHosts } from "@/lib/hosts/client";
 import { useI18n } from "@/lib/i18n";
@@ -54,13 +54,32 @@ type Status = "starting" | "connected" | "exited" | "error";
 export function TerminalPane({
   hostId,
   cwd,
+  sessionId,
+  onSessionChange,
   onClose,
+  onExit,
+  tabs,
 }: {
   /** Machine to open the shell on. Changing it replaces the session. */
   hostId: string | null;
   /** Directory to start in; the machine's home when omitted. */
   cwd?: string | null;
+  /**
+   * Shell to reattach to, read once when the pane mounts. Null opens a new one.
+   * The owner of the tab holds this, not the pane: two tabs on the same machine
+   * must be two shells, which is not something the pane can work out for itself.
+   */
+  sessionId?: string | null;
+  /** Reports the shell this pane settled on, so the tab can reattach to it later. */
+  onSessionChange?: (sessionId: string | null) => void;
   onClose: () => void;
+  /** The shell ended on its own (exit, or the machine went away). */
+  onExit?: () => void;
+  /**
+   * Tab strip for the header. The pane is short, so its chrome is a single
+   * row: tabs on the left, this session's status and controls on the right.
+   */
+  tabs?: ReactNode;
 }) {
   const { t } = useI18n();
   const { isDark } = useTheme();
@@ -74,6 +93,11 @@ export function TerminalPane({
   // The working directory only matters when a shell is created; a later change
   // must not tear down a running one, so it is read from a ref.
   const cwdRef = useRef(cwd);
+  // Read once: the parent re-renders as tabs come and go, and re-running the
+  // session effect on every one of those would churn shells.
+  const requestedSessionRef = useRef(sessionId ?? null);
+  const onSessionChangeRef = useRef(onSessionChange);
+  const onExitRef = useRef(onExit);
   const [status, setStatus] = useState<Status>("starting");
   const [error, setError] = useState<string | null>(null);
   const [exitCode, setExitCode] = useState<number | null>(null);
@@ -83,7 +107,9 @@ export function TerminalPane({
 
   useEffect(() => {
     cwdRef.current = cwd;
-  }, [cwd]);
+    onSessionChangeRef.current = onSessionChange;
+    onExitRef.current = onExit;
+  }, [cwd, onSessionChange, onExit]);
 
   const sendInput = useCallback((data: string) => {
     const id = sessionIdRef.current;
@@ -171,17 +197,20 @@ export function TerminalPane({
         term.dispose();
       };
 
-      // Reuse the machine's existing shell rather than opening another one.
-      // Re-running this effect (a changed working directory, a remount) must
-      // reattach to the session already running there: creating one each time
-      // left orphaned shells behind and greeted the user with a fresh prompt.
+      // Reattach to this tab's own shell rather than opening another one: a
+      // remount (tab switch, dropped stream, reload) must resume the session
+      // the user was looking at, not leave an orphan behind and greet them
+      // with a fresh prompt.
       let sessionId: string | null = null;
       try {
-        const existing = await hostFetch("/api/terminal", { cache: "no-store" }, hostId);
-        if (existing.ok) {
-          const body = await existing.json().catch(() => ({}));
-          const open = (body.terminals as Array<{ id: string; exit?: unknown }> | undefined)?.filter((entry) => !entry.exit) ?? [];
-          sessionId = open.length > 0 ? open[open.length - 1].id : null;
+        const wanted = requestedSessionRef.current;
+        if (wanted) {
+          const existing = await fetch(`/api/terminal/${encodeURIComponent(wanted)}`, { cache: "no-store" });
+          if (existing.ok) {
+            const body = await existing.json().catch(() => ({}));
+            // A shell that has already exited is not worth reattaching to.
+            if (!(body.terminal as { exit?: unknown } | undefined)?.exit) sessionId = wanted;
+          }
         }
         if (!sessionId) {
           // Sized to the pane so the first paint is already correct.
@@ -204,6 +233,8 @@ export function TerminalPane({
       if (cancelled || !sessionId) return;
       const created = { id: sessionId };
       sessionIdRef.current = created.id;
+      requestedSessionRef.current = created.id;
+      onSessionChangeRef.current?.(created.id);
 
       term.onData(sendInput);
       term.onResize(({ cols, rows }) => sendResize(cols, rows));
@@ -248,6 +279,7 @@ export function TerminalPane({
           setStatus("exited");
           setExitCode(typeof frame.code === "number" ? frame.code : null);
           source?.close();
+          onExitRef.current?.();
         }
       };
       source.onerror = () => {
@@ -269,12 +301,9 @@ export function TerminalPane({
     };
   }, [hostId, restartKey, isDark, sendInput, sendResize]);
 
-  const closeSession = useCallback(() => {
-    const id = sessionIdRef.current;
-    if (id) {
-      void fetch(`/api/terminal/${encodeURIComponent(id)}`, { method: "DELETE", keepalive: true }).catch(() => {});
-      sessionIdRef.current = null;
-    }
+  // Hides the pane; the shell keeps running. Closing a tab is what ends a
+  // shell, so putting the terminal away does not throw away what is in it.
+  const hidePane = useCallback(() => {
     onClose();
   }, [onClose]);
 
@@ -284,6 +313,10 @@ export function TerminalPane({
       void fetch(`/api/terminal/${encodeURIComponent(id)}`, { method: "DELETE", keepalive: true }).catch(() => {});
       sessionIdRef.current = null;
     }
+    // Forget the dead shell so the next run opens a new one instead of trying
+    // to reattach to something that has just been deleted.
+    requestedSessionRef.current = null;
+    onSessionChangeRef.current?.(null);
     setRestartKey((key) => key + 1);
   }, []);
 
@@ -310,12 +343,18 @@ export function TerminalPane({
           color: "var(--text-muted)",
         }}
       >
-        <Plug size={12} strokeWidth={1.9} aria-hidden="true" style={{ flexShrink: 0 }} />
-        <span style={{ fontWeight: 600, letterSpacing: "0.06em", textTransform: "uppercase", fontSize: 10 }}>
-          {t("terminal.title")}
-        </span>
+        {tabs ?? (
+          <>
+            <Plug size={12} strokeWidth={1.9} aria-hidden="true" style={{ flexShrink: 0 }} />
+            <span style={{ fontWeight: 600, letterSpacing: "0.06em", textTransform: "uppercase", fontSize: 10 }}>
+              {t("terminal.title")}
+            </span>
+          </>
+        )}
         <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: status === "error" ? "var(--status-error)" : "var(--text-dim)" }}>
-          {statusLabel}
+          {/* With a tab strip the machine name is already on the tab, so an
+              idle session needs no further label. */}
+          {tabs && status === "connected" ? "" : statusLabel}
         </span>
         <span style={{ flex: 1 }} />
         {(status === "exited" || status === "error") && (
@@ -331,7 +370,7 @@ export function TerminalPane({
         )}
         <button
           type="button"
-          onClick={closeSession}
+          onClick={hidePane}
           title={t("terminal.close")}
           aria-label={t("terminal.close")}
           style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 22, height: 22, border: "none", borderRadius: "var(--radius-control)", background: "transparent", color: "var(--text-dim)", cursor: "pointer", flexShrink: 0 }}

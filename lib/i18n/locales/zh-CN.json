@@ -1452,5 +1452,8 @@
   "hosts.form.credentialsHint.local": "该机器保存自己的凭据。中枢不可用时仍可工作，这对无人值守的任务很重要。",
   "hosts.form.credentialsHint.broker": "该机器从中枢保管库获取凭据。一次登录适用于所有机器，但中枢不可达时将无法认证。",
   "hosts.form.credentialsHint.gateway": "该机器不会收到凭据；请求经由中枢代为附加。适用于他人也能登录的机器，代价是所有请求都要经过中枢。",
-  "hosts.credentialFailed": "无法配置凭据：{error}"
+  "hosts.credentialFailed": "无法配置凭据：{error}",
+  "terminal.newTab": "在某台机器上新建终端",
+  "terminal.closeTab": "关闭此终端",
+  "terminal.noTabs": "没有打开的终端。"
 }
