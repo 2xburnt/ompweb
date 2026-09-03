@@ -71,7 +71,11 @@ function isWindowsDriveRoot(directory: string): boolean {
 
 interface Props {
   onCancel: () => void;
-  onSelect: (path: string) => void;
+  /** The chosen path, and the machine it lives on. */
+  onSelect: (path: string, hostId: string | null) => void;
+  /** Let the machine be chosen here rather than requiring a switch first.
+   *  A workspace is a machine and a folder, so both are picked together. */
+  allowHostChange?: boolean;
   busy?: boolean;
   error?: string | null;
   /** "file" lists files alongside directories and returns the chosen file. */
@@ -83,11 +87,15 @@ interface Props {
   title?: string;
 }
 
-export function DirectoryPicker({ onCancel, onSelect, busy = false, error, mode = "directory", startPath, hostId: hostIdProp, title }: Props) {
+export function DirectoryPicker({ onCancel, onSelect, busy = false, error, mode = "directory", startPath, hostId: hostIdProp, title, allowHostChange = false }: Props) {
   const { t } = useI18n();
   const { hostId: selectedHostId, current: selectedHost, hosts } = useHosts();
-  const hostId = hostIdProp ?? selectedHostId;
-  const currentHost = hostIdProp ? hosts.find((entry) => entry.id === hostIdProp) ?? selectedHost : selectedHost;
+  // Which machine is being browsed. Local state so choosing one here does not
+  // change the rest of the app until a workspace is actually selected.
+  const [browseHostId, setBrowseHostId] = useState<string | null>(hostIdProp ?? selectedHostId);
+  const hostId = allowHostChange ? browseHostId : hostIdProp ?? selectedHostId;
+  const currentHost = hosts.find((entry) => entry.id === hostId) ?? selectedHost;
+  const enabledHosts = hosts.filter((entry) => entry.enabled);
   const selectingFile = mode === "file";
   // Opening at the machine's configured working directory is the point of
   // setting one; without a start path the picker always began at home.
@@ -124,6 +132,20 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error, mode 
     }
   }, [hostId, selectingFile]);
 
+  useEffect(() => {
+    navigateToRef.current = navigateTo;
+  }, [navigateTo]);
+
+  const chooseHost = useCallback((nextHostId: string) => {
+    if (nextHostId === browseHostId) return;
+    setBrowseHostId(nextHostId);
+    const target = hosts.find((entry) => entry.id === nextHostId);
+    // Start where that machine wants to start, not in the previous machine's
+    // path, which does not exist there.
+    void navigateToRef.current?.(target?.defaultCwd ?? undefined);
+  }, [browseHostId, hosts]);
+
+  const navigateToRef = useRef<((directory?: string) => Promise<void>) | null>(null);
   const openedRef = useRef(false);
   useEffect(() => {
     setPortalTarget(document.body);
@@ -218,6 +240,31 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error, mode 
           </button>
         </form>
 
+        {allowHostChange && enabledHosts.length > 1 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0, padding: "8px 18px", borderBottom: "1px solid var(--border)", overflowX: "auto" }}>
+            <span style={{ flexShrink: 0, marginRight: 2, color: "var(--text-dim)", fontSize: 10, fontWeight: 600, letterSpacing: "0.08em", textTransform: "uppercase" }}>
+              {t("hosts.switcher.label")}
+            </span>
+            {enabledHosts.map((entry) => {
+              const active = entry.id === hostId;
+              return (
+                <button
+                  key={entry.id}
+                  type="button"
+                  onClick={() => chooseHost(entry.id)}
+                  disabled={busy}
+                  aria-pressed={active}
+                  title={entry.status === "error" && entry.lastError ? entry.lastError : entry.name}
+                  style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", gap: 5, padding: "3px 9px", border: `1px solid ${active ? "var(--accent-strong)" : "var(--border)"}`, borderRadius: 999, background: active ? "var(--bg-selected)" : "transparent", color: active ? "var(--text)" : "var(--text-muted)", cursor: busy ? "default" : "pointer", fontSize: 11.5, fontWeight: active ? 600 : 400 }}
+                >
+                  <HostStatusDot host={entry} size={6} />
+                  {entry.name}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
         <div className="directory-picker-list" style={{ flex: 1, minHeight: 0, overflow: "auto", padding: "8px 10px" }}>
           {loading ? (
             <div style={{ display: "grid", gap: 6, padding: 8 }} aria-busy="true" aria-label={t("directoryPicker.loadingDirectories")}>
@@ -242,8 +289,8 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error, mode 
                 key={entry.path}
                 className="directory-picker-entry"
                 type="button"
-                onClick={() => { if (entry.isFile) { setPathInput(entry.path); onSelect(entry.path); } else { void navigateTo(entry.path); } }}
-                onDoubleClick={() => { if (!entry.isFile) onSelect(entry.path); }}
+                onClick={() => { if (entry.isFile) { setPathInput(entry.path); onSelect(entry.path, hostId); } else { void navigateTo(entry.path); } }}
+                onDoubleClick={() => { if (!entry.isFile) onSelect(entry.path, hostId); }}
                 title={entry.path}
                 style={{ width: "100%", minHeight: 30, display: "flex", alignItems: "center", gap: 7, padding: "5px 8px", border: 0, borderRadius: 5, background: "none", color: "var(--text-muted)", cursor: "pointer", textAlign: "left", fontFamily: "var(--font-mono)", fontSize: 11, transition: "background-color var(--dur-fast) var(--ease-out-warm), color var(--dur-fast) var(--ease-out-warm)" }}
                 onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text)"; }}
@@ -266,7 +313,7 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error, mode 
           <button
             className="directory-picker-action"
             type="button"
-            onClick={() => onSelect(currentPath)}
+            onClick={() => onSelect(currentPath, hostId)}
             disabled={!canSelect}
             title={hasUncommittedPath ? t("directoryPicker.openPathBeforeSelecting") : t("directoryPicker.selectCurrentDirectory")}
             style={{ padding: "6px 16px", border: 0, borderRadius: 6, background: "var(--accent)", color: "var(--on-accent)", fontSize: 13, fontWeight: 600, opacity: canSelect ? 1 : 0.6, cursor: canSelect ? "pointer" : "default" }}

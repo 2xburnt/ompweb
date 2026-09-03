@@ -1291,9 +1291,12 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     if (expandedProjects === null) expandProject(project);
   }, [selectedProject, expandedProjects, expandProject]);
 
-  const commitAddProject = useCallback(async (candidate?: string) => {
+  // A workspace is a machine and a folder, both chosen in the picker, so the
+  // machine no longer has to be selected before adding one.
+  const commitAddProject = useCallback(async (candidate?: string, candidateHost?: string | null) => {
     const path = (candidate ?? "").trim();
     if (!path || addProjectBusy) return;
+    const targetHost = candidateHost ?? hostId;
 
     setAddProjectBusy(true);
     setAddProjectError(null);
@@ -1302,23 +1305,25 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ cwd: path }),
-      });
+      }, targetHost);
       const data = await res.json().catch(() => ({})) as { project?: ManagedProject; error?: string; code?: string };
       if (!res.ok || data.error || !data.project) {
         setAddProjectError(formatApiError({ ...data, error: data.error ?? `HTTP ${res.status}` }));
         return;
       }
       await loadProjects();
-      // Activate + expand the newly added project and close the picker.
+      // Activate + expand the newly added project and close the picker. The
+      // machine comes with it, so adding a workspace elsewhere moves there.
+      adoptHost(targetHost);
       setSelectedCwd(data.project.path);
-      expandProject(data.project.path);
+      expandProject(data.project.path, targetHost);
       setAddProjectOpen(false);
     } catch (e) {
       setAddProjectError(e instanceof Error ? e.message : String(e));
     } finally {
       setAddProjectBusy(false);
     }
-  }, [addProjectBusy, loadProjects, expandProject]);
+  }, [addProjectBusy, loadProjects, expandProject, adoptHost, hostId]);
 
   const handleUpdateProjectPresentation = useCallback(async (projectPath: string, updates: { alias?: string | null; sortOrder?: number | null }, host: string | null = hostId) => {
     try {
@@ -1660,7 +1665,8 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             setAddProjectOpen(false);
             setAddProjectError(null);
           }}
-          onSelect={(path) => void commitAddProject(path)}
+          allowHostChange
+          onSelect={(path, pickedHost) => void commitAddProject(path, pickedHost)}
         />
       )}
       {/* Header: branding + quiet utilities + New Session */}
