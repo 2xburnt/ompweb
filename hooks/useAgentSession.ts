@@ -1,5 +1,6 @@
 "use client";
 
+import { getCurrentHostId, hostFetch, useHosts } from "@/lib/hosts/client";
 import { useState, useCallback, useRef, useEffect, useMemo, useReducer } from "react";
 import type {
   AgentMessage,
@@ -610,6 +611,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // False once this hook instance unmounts: background loops (prompt/bash
   // settlement polling) must not keep firing on a dead instance.
   const hookAliveRef = useRef(true);
+  // Selected machine, subscribed so a machine switch re-runs the model load.
+  const { hostId: selectedHostId } = useHosts();
   const [modelNames, setModelNames] = useState<Record<string, string>>({});
   const [modelList, setModelList] = useState<ModelEntry[]>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
@@ -716,6 +719,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const ignoreProgrammaticScrollUntilRef = useRef(0);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  /** Machine the pending new session was created on (see ensureNewSession). */
+  const newSessionHostRef = useRef<string | null>(null);
   const ensuringNewSessionRef = useRef<Promise<string | null> | null>(null);
   const newSessionPromotedRef = useRef(false);
   // Raw child-session events stream at token rate; coalesce the per-subagent
@@ -1162,9 +1167,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const sid = sessionIdRef.current;
     if (!isNew || !newSessionCwd || !sid || newSessionPromotedRef.current) return;
     newSessionPromotedRef.current = true;
+    // Tag the transient row with the machine it was started on so the
+    // sidebar files it under that machine before the server list catches up.
+    const host = newSessionHostRef.current ?? getCurrentHostId();
     onSessionCreated?.({
       id: sid,
       path: "",
+      ...(host ? { host } : {}),
       cwd: newSessionCwd,
       name: undefined,
       created: new Date().toISOString(),
@@ -1183,11 +1192,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const selectedModel = newSessionModel ?? newSessionDefaultModel;
       if (selectedModel) setPendingModel(selectedModel);
       const toolNames = getToolNamesForPreset(toolPreset);
-      const res = await fetch("/api/agent/new", {
+      // New sessions start on the selected machine: the id goes in the body
+      // and, via hostFetch, in the query.
+      const host = getCurrentHostId();
+      newSessionHostRef.current = host;
+      const res = await hostFetch("/api/agent/new", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           cwd: newSessionCwd,
+          ...(host ? { host } : {}),
           type: "ensure_session",
           toolNames,
           ...(selectedModel ? { provider: selectedModel.provider, modelId: selectedModel.modelId } : {}),
@@ -2886,12 +2900,21 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [isCompacting, loadSession, refreshLiveModelState]);
 
+  // Machine that owns this conversation: an existing session's own machine,
+  // otherwise the machine selected for the new session.
+  const modelHostId = session?.host ?? selectedHostId;
+
   const loadModels = useCallback(async (signal?: AbortSignal) => {
     setModelsLoading(true);
     try {
       const modelCwd = newSessionCwd ?? session?.cwd ?? "";
       const modelsUrl = modelCwd ? `/api/models?cwd=${encodeURIComponent(modelCwd)}` : "/api/models";
-      const res = await fetch(modelsUrl, { cache: "no-store", ...(signal ? { signal } : {}) });
+      // The model registry (auth, models.yml) lives on the machine that runs
+      // omp, so it must be read from the session's machine — not from whatever
+      // machine happens to be selected in the sidebar. An unpinned fetch here
+      // silently returned the DEFAULT machine's models, so a session on one
+      // machine could show an empty or foreign model list.
+      const res = await hostFetch(modelsUrl, { cache: "no-store", ...(signal ? { signal } : {}) }, modelHostId);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as ModelsResponse;
       setModelNames(d.models);
@@ -2914,7 +2937,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } finally {
       setModelsLoading(false);
     }
-  }, [isNew, newSessionCwd, session?.cwd]);
+  }, [isNew, modelHostId, newSessionCwd, session?.cwd]);
 
   const handleBuiltinSlashCommand = useCallback(async (text: string): Promise<BuiltinSlashCommandResult> => {
     if (!text.startsWith("/")) return { handled: false };
@@ -3415,7 +3438,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   return {
     // State
     data, loading, error, activeLeafId, messages, entryIds, showPreCompactionHistory, streamState,
-    agentRunning, modelNames, modelList, modelsLoading, modelError, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel, fastModeEnabled, fastModeActive, autoRetryEnabled, interruptMode, autoCompactionEnabled, steeringMode, followUpMode,
+    agentRunning, modelHostId, modelNames, modelList, modelsLoading, modelError, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel, fastModeEnabled, fastModeActive, autoRetryEnabled, interruptMode, autoCompactionEnabled, steeringMode, followUpMode,
     liveModelMeta,
     retryInfo, contextUsage, systemPrompt, forkingEntryId,
     isCompacting, compactError, compactResult, tokensPerSecond, currentModel, displayModel, isAutoModelSelection: !displayModel, sessionStats, agentPhase,

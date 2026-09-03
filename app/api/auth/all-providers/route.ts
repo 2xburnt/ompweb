@@ -1,3 +1,5 @@
+import { currentHost } from "@/lib/hosts/context";
+import { withHostRoute } from "@/lib/hosts/route";
 import { readModelsConfig } from "@/lib/omp/models-config";
 import { type OmpLoginProvider, type OmpModel, runUtilityCommand } from "@/lib/omp/rpc-utility";
 
@@ -9,11 +11,13 @@ export const dynamic = "force-dynamic";
 // via get_available_models — so this endpoint lists configured providers only.
 // Unconfigured API-key providers cannot be set up from the web UI (see the
 // api-key route), so they are intentionally absent.
-export async function GET() {
+export const GET = withHostRoute(async () => {
+  const host = currentHost();
   try {
     const modelsResponse = await runUtilityCommand<{ models?: unknown }>(
       { type: "get_available_models" },
       120_000,
+      host,
     );
     const models = Array.isArray(modelsResponse.models)
       ? modelsResponse.models.filter((model): model is OmpModel => (
@@ -24,6 +28,7 @@ export async function GET() {
     const loginResponse = await runUtilityCommand<{ providers?: unknown }>(
       { type: "get_login_providers" },
       30_000,
+      host,
     );
     const loginProviders = Array.isArray(loginResponse.providers)
       ? loginResponse.providers.filter((provider): provider is OmpLoginProvider => (
@@ -38,7 +43,7 @@ export async function GET() {
     // custom models.yml providers are managed in the editor tree.
     const oauthAuthenticated = new Set(loginProviders.filter((p) => p.authenticated).map((p) => p.id));
     const loginNames = new Map(loginProviders.map((p) => [p.id, p.name]));
-    const customProviders = new Set(Object.keys(readModelsConfig().providers ?? {}));
+    const customProviders = new Set(Object.keys((await readModelsConfig(host)).providers ?? {}));
 
     const counts = new Map<string, number>();
     for (const model of models) {
@@ -57,9 +62,9 @@ export async function GET() {
     }
     result.sort((a, b) => a.displayName.localeCompare(b.displayName));
 
-    return Response.json({ providers: result });
+    return Response.json({ providers: result, host: host.id });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return Response.json({ providers: [], error: message }, { status: 500 });
+    return Response.json({ providers: [], error: message, host: host.id }, { status: 500 });
   }
-}
+});

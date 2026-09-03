@@ -1,5 +1,7 @@
 "use client";
 
+import { hostFetch, useHosts } from "@/lib/hosts/client";
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertCircle, Bot, Check, Copy, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
 import { Alert } from "@/components/ui/field";
@@ -48,6 +50,9 @@ function fileStem(filePath: string): string {
 
 export function AgentsConfig({ cwd }: { cwd: string | null }) {
   const { t, tn } = useI18n();
+  // Agents live in the selected machine's omp installation: reload the roster
+  // when the machine changes and pin every read/write to it.
+  const { hostId } = useHosts();
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -63,6 +68,8 @@ export function AgentsConfig({ cwd }: { cwd: string | null }) {
   const loadGenerationRef = useRef(0);
   const cwdRef = useRef(cwd);
   cwdRef.current = cwd;
+  const hostRef = useRef<string | null>(hostId);
+  hostRef.current = hostId;
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [modelCsv, setModelCsv] = useState("");
@@ -74,14 +81,15 @@ export function AgentsConfig({ cwd }: { cwd: string | null }) {
   const load = useCallback(async (forceSelect = false) => {
     const generation = ++loadGenerationRef.current;
     const requestCwd = cwd;
-    const isCurrent = () => loadGenerationRef.current === generation && cwdRef.current === requestCwd;
+    const requestHost = hostId;
+    const isCurrent = () => loadGenerationRef.current === generation && cwdRef.current === requestCwd && hostRef.current === requestHost;
     setLoading(true);
     setMessage(null);
     setWorkspaceCheckPending(Boolean(requestCwd));
     try {
       const params = new URLSearchParams();
       if (cwd) params.set("cwd", cwd);
-      let res = await fetch(`/api/agents?${params.toString()}`);
+      let res = await hostFetch(`/api/agents?${params.toString()}`, undefined, requestHost ?? undefined);
       let data = (await res.json()) as AgentsResponse;
       if (!isCurrent()) return;
       if (!res.ok || data.error) {
@@ -89,7 +97,7 @@ export function AgentsConfig({ cwd }: { cwd: string | null }) {
         // A project can remain in the sidebar after its directory is moved or
         // deleted. Keep global agents usable while the API continues to reject
         // writes against that missing workspace.
-        res = await fetch("/api/agents");
+        res = await hostFetch("/api/agents", undefined, requestHost ?? undefined);
         data = (await res.json()) as AgentsResponse;
         if (!isCurrent()) return;
         if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
@@ -123,7 +131,17 @@ export function AgentsConfig({ cwd }: { cwd: string | null }) {
       setWorkspaceCheckPending(false);
       setMessage(msg);
     } finally { if (isCurrent()) { setLoading(false); setWorkspaceCheckPending(false); } }
-  }, [cwd, creating, t]);
+  }, [cwd, hostId, creating, t]);
+  // Machine switch: clear the previous machine's roster and editor before the
+  // reload lands so no stale agent can be edited or saved to the new machine.
+  useEffect(() => {
+    setAgents([]);
+    setDiagnostics([]);
+    setMessage(null);
+    setCreating(false);
+    selectedRef.current = null;
+    setSelected(null);
+  }, [hostId]);
   useEffect(() => { void load(); }, [load]);
   useEffect(() => {
     setWorkspaceUnavailable(false);
@@ -176,7 +194,7 @@ export function AgentsConfig({ cwd }: { cwd: string | null }) {
     setSaving(true); setMessage(null);
     try {
       const scope: "user" | "project" = canEditProject ? "project" : "user";
-      const res = await fetch("/api/agents", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "unpack", scope, cwd: scope === "project" ? cwd : undefined }) });
+      const res = await hostFetch("/api/agents", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "unpack", scope, cwd: scope === "project" ? cwd : undefined }) }, hostRef.current ?? undefined);
       const data = (await res.json()) as { error?: string; total?: number; written?: number };
       if (!res.ok || data.error) {
         if (isCurrent() && res.status === 403 && scope === "project") setWorkspaceUnavailable(true);
@@ -212,7 +230,7 @@ export function AgentsConfig({ cwd }: { cwd: string | null }) {
         return;
       }
       const previousName = creating || isBundledActive || !active ? undefined : fileStem(active.filePath);
-      const res = await fetch("/api/agents", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd: scope === "project" ? cwd : undefined, scope, name: trimmedName, previousName, agent: payload }) });
+      const res = await hostFetch("/api/agents", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd: scope === "project" ? cwd : undefined, scope, name: trimmedName, previousName, agent: payload }) }, hostRef.current ?? undefined);
       const data = (await res.json()) as { error?: string };
       if (!res.ok || data.error) {
         if (isCurrent() && res.status === 403 && scope === "project") setWorkspaceUnavailable(true);
@@ -230,7 +248,7 @@ export function AgentsConfig({ cwd }: { cwd: string | null }) {
     const isCurrent = () => loadGenerationRef.current === requestGeneration && cwdRef.current === requestCwd;
     setSaving(true); setMessage(null);
     try {
-      const res = await fetch("/api/agents", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd: active.scope === "project" ? cwd : undefined, scope: active.scope, name: fileStem(active.filePath) }) });
+      const res = await hostFetch("/api/agents", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd: active.scope === "project" ? cwd : undefined, scope: active.scope, name: fileStem(active.filePath) }) }, hostRef.current ?? undefined);
       const data = (await res.json()) as { error?: string };
       if (!res.ok || data.error) {
         if (isCurrent() && res.status === 403 && active.scope === "project") setWorkspaceUnavailable(true);

@@ -1,9 +1,11 @@
 import { existsSync } from "fs";
 import { homedir } from "os";
+import { currentHost } from "./hosts/context";
+import type { Host } from "./hosts/registry";
 import { validateAgentImages } from "./image-attachments";
 import { invalidateModelsCache } from "./models-cache";
 import { RpcCommandError, RpcCommandTimeoutError, RpcProcess, type RpcFrame } from "./omp/rpc-process";
-import { readNativeSettings } from "./omp/settings-config";
+import { getCachedNativeSettings } from "./omp/settings-config";
 import { cacheSessionPath, invalidateSessionListCache } from "./session-reader";
 import { PRESET_FULL } from "./tool-presets";
 import type {
@@ -168,8 +170,16 @@ function toImageContents(value: unknown): Array<{ type: "image"; data: string; m
  * resume path skips the chdir when the recorded project dir is gone and keeps
  * the launch cwd (main.ts), so hand it a live directory and let it decide.
  */
-export function resolveSpawnCwd(recordedCwd?: string | null): string {
-  return resolveSpawnCwdResult(recordedCwd).cwd;
+export async function resolveSpawnCwd(recordedCwd?: string | null, host: Host = currentHost()): Promise<string> {
+  return (await resolveSpawnCwdResult(recordedCwd, host)).cwd;
+}
+
+async function directoryExists(host: Host, dir: string): Promise<boolean> {
+  try {
+    return (await host.fs.stat(dir)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -179,15 +189,17 @@ export function resolveSpawnCwd(recordedCwd?: string | null): string {
  * directory the sidebar/header still advertises — a silent wrong-tree fallback
  * would let file tool calls edit an unexpected repo with no signal.
  */
-export function resolveSpawnCwdResult(recordedCwd?: string | null): { cwd: string; fellBack: boolean } {
-  if (recordedCwd && existsSync(recordedCwd)) return { cwd: recordedCwd, fellBack: false };
-  try {
-    const serverCwd = process.cwd();
-    if (serverCwd && existsSync(serverCwd)) return { cwd: serverCwd, fellBack: true };
-  } catch {
-    // process.cwd() itself throws when the server's own cwd was removed.
+export async function resolveSpawnCwdResult(recordedCwd?: string | null, host: Host = currentHost()): Promise<{ cwd: string; fellBack: boolean }> {
+  if (recordedCwd && await directoryExists(host, recordedCwd)) return { cwd: recordedCwd, fellBack: false };
+  if (host.isLocal) {
+    try {
+      const serverCwd = process.cwd();
+      if (serverCwd && existsSync(serverCwd)) return { cwd: serverCwd, fellBack: true };
+    } catch {
+      // process.cwd() itself throws when the server's own cwd was removed.
+    }
   }
-  return { cwd: homedir(), fellBack: true };
+  return { cwd: host.home ?? homedir(), fellBack: true };
 }
 
 /** omp's CompactionResult historically omitted any post-compaction token
@@ -255,6 +267,9 @@ export class AgentSessionWrapper {
   private _sessionFile = "";
   private _sessionName: string | undefined;
   private proc: RpcProcess;
+  /** Machine the omp child runs on; every file path this wrapper handles
+   * (cwd, session file) lives there. */
+  readonly host: Host;
   readonly cwd: string;
   /** Whether the child was spawned with --advisor. The flag is spawn-time
    * only (no runtime RPC toggles it), so applying a changed advisor setting
@@ -269,6 +284,7 @@ export class AgentSessionWrapper {
   // runnable under Node's strip-only TypeScript mode for probes/tests.
   constructor(proc: RpcProcess, cwd: string, recordedCwd?: string | null, advisorSpawned = false) {
     this.proc = proc;
+    this.host = proc.host;
     this.cwd = cwd;
     this.recordedCwd = recordedCwd ?? null;
     this.advisorSpawned = advisorSpawned;
@@ -333,7 +349,7 @@ export class AgentSessionWrapper {
     this.streaming = state.isStreaming;
     this.compacting = state.isCompacting;
     this.fastModeEnabled = state.fastModeEnabled ?? state.fastMode ?? this.fastModeEnabled;
-    if (this._sessionFile) cacheSessionPath(this._sessionId, this._sessionFile);
+    if (this._sessionFile) cacheSessionPath(this._sessionId, this._sessionFile, this.host.id);
   }
 
   handleProcessExit(stderrTail: string): void {
@@ -387,7 +403,7 @@ export class AgentSessionWrapper {
         // files added inside a project subdirectory), hiding the running
         // session from the list until the next invalidation (agent_end).
         // Re-signal once the file actually lands.
-        if (this._sessionFile && !existsSync(this._sessionFile)) {
+        if (this._sessionFile) {
           this.signalWhenSessionFileAppears();
         }
         break;
@@ -536,7 +552,9 @@ export class AgentSessionWrapper {
     // prompts, including login/editor confirmations, remain interactive.
     let autoApproveExtension = false;
     try {
-      autoApproveExtension = readNativeSettings().settings.tools?.approval?.extension === "allow";
+      // Synchronous frame handler: the host's config.yml is served from the
+      // settings cache (refreshed in the background by settings-config).
+      autoApproveExtension = getCachedNativeSettings(this.host).settings.tools?.approval?.extension === "allow";
     } catch {
       // A malformed config must not prevent normal interactive approval.
     }
@@ -651,21 +669,27 @@ export class AgentSessionWrapper {
    *  destroy. */
   private signalWhenSessionFileAppears(): void {
     if (this.sessionFileSignalTimer) return;
+    // A remote probe is an ssh round trip, so poll it more slowly.
+    const intervalMs = this.host.isLocal ? 250 : 1000;
+    const maxAttempts = this.host.isLocal ? 40 : 10;
     let attempts = 0;
     const check = () => {
       this.sessionFileSignalTimer = null;
       if (!this._alive || !this._sessionFile) return;
-      if (!existsSync(this._sessionFile)) {
-        attempts += 1;
-        if (attempts < 40) {
-          this.sessionFileSignalTimer = setTimeout(check, 250);
+      void this.host.fs.exists(this._sessionFile).catch(() => false).then((exists) => {
+        if (!this._alive) return;
+        if (!exists) {
+          attempts += 1;
+          if (attempts < maxAttempts) {
+            this.sessionFileSignalTimer = setTimeout(check, intervalMs);
+          }
+          return;
         }
-        return;
-      }
-      invalidateSessionListCache();
-      notifyRunningChange({ refreshSessionList: true });
+        invalidateSessionListCache();
+        notifyRunningChange({ refreshSessionList: true });
+      });
     };
-    this.sessionFileSignalTimer = setTimeout(check, 250);
+    this.sessionFileSignalTimer = setTimeout(check, intervalMs);
   }
   private lastIdleReset = 0;
   private resetIdleTimer(force = false): void {
@@ -882,7 +906,7 @@ export class AgentSessionWrapper {
   private async restart(): Promise<void> {
     if (this.restarting) throw new WebRpcError(RESTARTING_MESSAGE, "session_restarting");
     const sessionFile = this._sessionFile;
-    const resumable = !!sessionFile && existsSync(sessionFile);
+    const resumable = !!sessionFile && await this.host.fs.exists(sessionFile).catch(() => false);
     const old = this.proc;
     // Stays true for the whole restart so send() rejects commands that would
     // otherwise hit the disposed or half-built child.
@@ -904,6 +928,7 @@ export class AgentSessionWrapper {
       this.streaming = false;
       this.compacting = false;
       const proc = new RpcProcess({
+        host: this.host,
         cwd: this.cwd,
         extraArgs: buildSessionSpawnArgs(resumable ? sessionFile : ""),
         onExit: ({ stderrTail }) => {
@@ -1267,6 +1292,8 @@ export class AgentSessionWrapper {
 export interface RunningRpcSession {
   id: string;
   cwd: string;
+  /** Id of the host the session runs on. */
+  host: string;
 }
 
 export interface RunningSessionUpdate {
@@ -1302,14 +1329,14 @@ export function getRpcSession(sessionId: string): AgentSessionWrapper | undefine
 }
 
 export function getRunningRpcSessions(): RunningRpcSession[] {
-  const map = new Map<string, string>();
+  const map = new Map<string, { cwd: string; host: string }>();
   for (const [sessionId, session] of getRegistry()) {
     if (session.isRunning()) {
       const realId = session.sessionId || sessionId;
-      map.set(realId, session.cwd);
+      map.set(realId, { cwd: session.cwd, host: session.host.id });
     }
   }
-  return [...map.entries()].map(([id, cwd]) => ({ id, cwd }));
+  return [...map.entries()].map(([id, { cwd, host }]) => ({ id, cwd, host }));
 }
 
 export function getRunningRpcSessionIds(): string[] {
@@ -1318,10 +1345,15 @@ export function getRunningRpcSessionIds(): string[] {
 
 /** Stop all live omp children after an explicit runtime update. The browser will
  * reconnect sessions on demand and start them with the updated executable. */
-export async function restartAllRpcSessions(): Promise<number> {
-  const sessions = [...new Set(getRegistry().values())];
+export async function restartAllRpcSessions(hostId?: string): Promise<number> {
+  const sessions = [...new Set(getRegistry().values())].filter((session) => !hostId || session.host.id === hostId);
   await Promise.all(sessions.map((session) => session.destroyAndWait()));
   return sessions.length;
+}
+
+/** Stop every live omp child on one host (host removed or disabled). */
+export function destroyRpcSessionsForHost(hostId: string): Promise<number> {
+  return restartAllRpcSessions(hostId);
 }
 
 // ----------------------------------------------------------------------------
@@ -1407,11 +1439,14 @@ export async function startRpcSession(
   const inflight = locks.get(sessionId);
   if (inflight) return inflight;
 
+  const host = currentHost();
   const starting = (async () => {
+    await host.ready();
     // The wrapper needs the process and the process's onExit needs the wrapper;
     // the holder breaks that cycle (onExit only fires once the child dies).
     const holder: { wrapper?: AgentSessionWrapper } = {};
     const proc = new RpcProcess({
+      host,
       cwd,
       extraArgs: buildSessionSpawnArgs(sessionFile, toolNames, advisor === true),
       onExit: ({ stderrTail }) => holder.wrapper?.handleProcessExit(stderrTail),

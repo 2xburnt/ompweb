@@ -1,6 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { hostFetch, useHosts } from "@/lib/hosts/client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { Alert } from "@/components/ui/field";
 import { toast } from "@/components/ui/toast";
@@ -35,6 +37,11 @@ function serverSummary(config: Record<string, unknown>): { type: string; target:
 
 export function McpConfig({ cwd, sessionId }: { cwd: string | null; sessionId?: string | null }) {
   const { t } = useI18n();
+  // MCP servers are configured on one machine; reload when it changes and pin
+  // every request so a slow response cannot land on the wrong machine.
+  const { hostId } = useHosts();
+  const hostRef = useRef<string | null>(hostId);
+  hostRef.current = hostId;
   const [servers, setServers] = useState<McpServer[]>([]);
   const [userConfig, setUserConfig] = useState<McpUserConfig | null>(null);
   const [liveServers, setLiveServers] = useState<McpLiveServer[] | null>(null);
@@ -49,13 +56,15 @@ export function McpConfig({ cwd, sessionId }: { cwd: string | null; sessionId?: 
   const [message, setMessage] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    const targetHost = hostId;
     setLoading(true);
     try {
       const params = new URLSearchParams();
       if (cwd) params.set("cwd", cwd);
       if (sessionId) params.set("sessionId", sessionId);
-      const response = await fetch(`/api/mcp?${params}`);
+      const response = await hostFetch(`/api/mcp?${params}`, undefined, targetHost ?? undefined);
       const data = await response.json() as { servers?: McpServer[]; user?: McpUserConfig; inventory?: McpLiveServer[]; liveServers?: McpLiveServer[]; liveError?: string; path?: string; error?: string };
+      if (hostRef.current !== targetHost) return;
       if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
       setServers(data.servers ?? []);
       setUserConfig(data.user ?? null);
@@ -65,11 +74,26 @@ export function McpConfig({ cwd, sessionId }: { cwd: string | null; sessionId?: 
       setPath(data.path ?? null);
       setSelected((current) => current && data.servers?.some((server) => server.name === current) ? current : null);
     } catch (error) {
+      if (hostRef.current !== targetHost) return;
       const detail = error instanceof Error ? error.message : String(error);
       setMessage(detail);
     } finally {
+      if (hostRef.current === targetHost) setLoading(false);
     }
-  }, [cwd, sessionId, t]);
+  }, [cwd, sessionId, hostId]);
+
+  // Machine switch: drop the previous machine's servers before reloading so a
+  // stale row can never be selected (and then saved to the new machine).
+  useEffect(() => {
+    setServers([]);
+    setUserConfig(null);
+    setLiveServers(null);
+    setInventory(null);
+    setLiveError(null);
+    setPath(null);
+    setSelected(null);
+    setMessage(null);
+  }, [hostId]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -103,7 +127,7 @@ export function McpConfig({ cwd, sessionId }: { cwd: string | null; sessionId?: 
     if (!server) return;
     setSaving(true);
     try {
-      const response = await fetch("/api/mcp", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, server }) });
+      const response = await hostFetch("/api/mcp", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, server }) }, hostId ?? undefined);
       const data = await response.json() as { message?: string; error?: string };
       if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
       setMessage(data.message ?? t("mcpConfig.validConfig"));
@@ -120,7 +144,7 @@ export function McpConfig({ cwd, sessionId }: { cwd: string | null; sessionId?: 
     if (!server) return;
     setSaving(true);
     try {
-      const response = await fetch("/api/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd, name, previousName: selected ?? undefined, server }) });
+      const response = await hostFetch("/api/mcp", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd, name, previousName: selected ?? undefined, server }) }, hostId ?? undefined);
       const data = await response.json() as { error?: string };
       if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
       setSelected(name);
@@ -138,7 +162,7 @@ export function McpConfig({ cwd, sessionId }: { cwd: string | null; sessionId?: 
     if (!selected) return;
     setSaving(true);
     try {
-      const response = await fetch("/api/mcp", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd, name: selected }) });
+      const response = await hostFetch("/api/mcp", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd, name: selected }) }, hostId ?? undefined);
       const data = await response.json() as { error?: string };
       if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
       add();

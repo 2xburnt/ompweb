@@ -54,6 +54,8 @@ export async function GET(request: Request) {
   return NextResponse.json({
     ...status,
     selfUpdateSupported: support.supported,
+    ...(support.reason ? { selfUpdateReason: support.reason } : {}),
+    supervisor: support.supervisor,
     ...(selfUpdateStatus ? { selfUpdateStatus } : {}),
   }, { headers: { "Cache-Control": "no-store" } });
 }

@@ -412,6 +412,10 @@ export interface SessionTreeNode {
 }
 
 export interface SessionInfo {
+  /** Id of the host (machine) that owns the session. Always set by the server;
+   *  optional because the client builds transient SessionInfo objects. */
+  host?: string;
+  /** Session file path on that host. */
   path: string;
   id: string;
   cwd: string;

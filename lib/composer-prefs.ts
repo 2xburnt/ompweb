@@ -27,3 +27,15 @@ export function setSubmitDuringRunBehavior(behavior: SubmitDuringRunBehavior): v
     // storage unavailable — the preference simply won't persist
   }
 }
+
+/**
+ * localStorage key holding which models the composer lists, per machine.
+ *
+ * Model ids are machine-specific (each machine has its own omp auth and
+ * models.yml), so one shared key let a set pinned on one machine filter
+ * another machine's list down to nothing. An absent key means "no filter",
+ * which is the right default for a machine that has never been customized.
+ */
+export function composerModelsStorageKey(hostId: string | null | undefined): string {
+  return hostId ? `omp-composer-models:${hostId}` : "omp-composer-models";
+}

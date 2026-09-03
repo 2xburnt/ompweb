@@ -1,19 +1,26 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, type Stats } from "fs";
-import { homedir } from "os";
-import { isAbsolute, resolve } from "path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "fs";
+import path from "path";
 import { comparableProjectPath } from "./comparable-path";
-import { getAgentDir } from "./omp/paths";
+import { currentHost, withHost } from "./hosts/context";
+import type { Host } from "./hosts/registry";
+import { expandHostHome, getAgentDir, hostPath } from "./omp/paths";
 import type { ManagedProject } from "./types";
 
 // ============================================================================
 // Project registry: which directories the user explicitly manages, and which
 // of them are hidden from the sidebar. Stored as ~/.omp/agent/projects.json
-// (the same agent dir as sessions), written atomically so a crash can never
-// leave a half-written registry. Hiding is reversible: the entry (and its
-// sessions) is restored by adding the directory again.
+// (the same agent dir as sessions) ON EACH HOST, written atomically so a crash
+// can never leave a half-written registry. Hiding is reversible: the entry
+// (and its sessions) is restored by adding the directory again.
 //
 // Paths are stored in their canonical (worktree-resolved) projectRoot form so
 // worktrees always group under their main repository.
+//
+// Two access paths exist:
+//   - loadProjectRegistry()/saveProjectRegistry(): synchronous, LOCAL machine
+//     only (lib/worktree.ts uses it for removed-worktree inference).
+//   - readProjectRegistry()/saveProjectRegistryOnHost(): async, go through the
+//     host filesystem boundary of the current (or given) host.
 // ============================================================================
 
 export interface ProjectRegistryEntry {
@@ -47,9 +54,17 @@ export class ProjectPathError extends Error {
 }
 
 const EMPTY_REGISTRY: ProjectRegistryFile = { version: 1, projects: [] };
+const REGISTRY_FILE_NAME = "projects.json";
+/** A registry entry is ~150 bytes; this bound still holds tens of thousands. */
+const REGISTRY_MAX_BYTES = 8 * 1024 * 1024;
 
-function canonicalProjectPath(value: string): string {
-  const resolved = resolve(value);
+/** Canonical form of a project path on a host. The local machine resolves
+ * symlinks synchronously (the registry helpers below are sync and shared with
+ * the local-only worktree inference); a remote path is a POSIX path that git
+ * already printed symlink-free, so it is only made absolute. */
+function canonicalProjectPath(value: string, host: Host = currentHost()): string {
+  if (!host.isLocal) return path.posix.resolve(value);
+  const resolved = path.resolve(value);
   try {
     return realpathSync(resolved);
   } catch {
@@ -59,7 +74,7 @@ function canonicalProjectPath(value: string): string {
 
 /** Parse registry JSON; missing, corrupt, or foreign-shaped input yields an
  *  empty registry rather than failing the whole sidebar. */
-export function parseProjectRegistry(raw: string): ProjectRegistryFile {
+export function parseProjectRegistry(raw: string, host: Host = currentHost()): ProjectRegistryFile {
   try {
     const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return EMPTY_REGISTRY;
@@ -69,7 +84,7 @@ export function parseProjectRegistry(raw: string): ProjectRegistryFile {
       if (!item || typeof item !== "object" || Array.isArray(item)) continue;
       if (!("path" in item) || typeof item.path !== "string" || !item.path.trim()) continue;
       entries.push({
-        path: canonicalProjectPath(item.path.trim()),
+        path: canonicalProjectPath(item.path.trim(), host),
         addedAt: "addedAt" in item && typeof item.addedAt === "string"
           ? item.addedAt
           : new Date(0).toISOString(),
@@ -84,8 +99,14 @@ export function parseProjectRegistry(raw: string): ProjectRegistryFile {
   }
 }
 
+/** projects.json location inside the host's omp agent directory. */
+function registryPathOnHost(host: Host): string {
+  return withHost(host, () => hostPath().resolve(getAgentDir(), REGISTRY_FILE_NAME));
+}
+
+/** Synchronous, LOCAL-machine-only registry read (lib/worktree.ts inference). */
 export function loadProjectRegistry(): ProjectRegistryFile {
-  const registryPath = resolve(getAgentDir(), "projects.json");
+  const registryPath = path.resolve(getAgentDir(), REGISTRY_FILE_NAME);
   if (!existsSync(registryPath)) return EMPTY_REGISTRY;
   try {
     return parseProjectRegistry(readFileSync(registryPath, "utf8"));
@@ -94,11 +115,12 @@ export function loadProjectRegistry(): ProjectRegistryFile {
   }
 }
 
-/** Atomic persistence: write a temp file in the same directory, then rename
- *  over the registry. A crash mid-write leaves the previous registry intact. */
+/** Synchronous, LOCAL-machine-only atomic persistence: write a temp file in
+ *  the same directory, then rename over the registry. A crash mid-write leaves
+ *  the previous registry intact. */
 export function saveProjectRegistry(registry: ProjectRegistryFile): void {
-  const registryPath = resolve(getAgentDir(), "projects.json");
-  mkdirSync(resolve(registryPath, ".."), { recursive: true });
+  const registryPath = path.resolve(getAgentDir(), REGISTRY_FILE_NAME);
+  mkdirSync(path.resolve(registryPath, ".."), { recursive: true });
   const temp = `${registryPath}.tmp-${process.pid}-${Date.now()}`;
   try {
     writeFileSync(temp, `${JSON.stringify(registry, null, 2)}\n`, "utf8");
@@ -113,14 +135,35 @@ export function saveProjectRegistry(registry: ProjectRegistryFile): void {
   }
 }
 
+/** Host-aware registry read: one bounded readFile against the host's agent
+ *  dir. A missing or unreadable file is an empty registry. */
+export async function readProjectRegistry(host: Host = currentHost()): Promise<ProjectRegistryFile> {
+  const registryPath = registryPathOnHost(host);
+  let raw: Buffer;
+  try {
+    raw = await host.fs.readFile(registryPath, { maxBytes: REGISTRY_MAX_BYTES });
+  } catch {
+    return EMPTY_REGISTRY;
+  }
+  return parseProjectRegistry(raw.toString("utf8"), host);
+}
+
+/** Host-aware atomic persistence (host.fs.writeFile is temp-file + rename on
+ *  every executor). The agent directory is created when missing. */
+export async function saveProjectRegistryOnHost(registry: ProjectRegistryFile, host: Host = currentHost()): Promise<void> {
+  const registryPath = registryPathOnHost(host);
+  await host.fs.mkdir(host.pathApi.dirname(registryPath), { recursive: true });
+  await host.fs.writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
+}
+
 /** Register a project (or restore a hidden one). Re-adding refreshes addedAt,
  *  which moves the project to the front of the most-recently-added ordering. */
 export function upsertProject(
   registry: ProjectRegistryFile,
-  path: string,
+  projectPath: string,
   now = new Date().toISOString(),
 ): ProjectRegistryFile {
-  const canonical = canonicalProjectPath(path);
+  const canonical = canonicalProjectPath(projectPath);
   const key = comparableProjectPath(canonical);
   const projects = registry.projects.filter((p) => comparableProjectPath(p.path) !== key);
   projects.push({ path: canonical, addedAt: now, hidden: false });
@@ -159,8 +202,8 @@ export function updateProjectsPresentation(
   };
 }
 
-export function hideProject(registry: ProjectRegistryFile, path: string): ProjectRegistryFile {
-  const canonical = canonicalProjectPath(path);
+export function hideProject(registry: ProjectRegistryFile, projectPath: string): ProjectRegistryFile {
+  const canonical = canonicalProjectPath(projectPath);
   const key = comparableProjectPath(canonical);
   const existing = registry.projects.some((p) => comparableProjectPath(p.path) === key);
   const projects = registry.projects.map((p) =>
@@ -198,7 +241,7 @@ export function mergeProjects(registry: ProjectRegistryFile, discovered: Iterabl
   }
   const extra: ManagedProject[] = [];
   const extraSeen = new Set<string>();
-  for (const raw of new Set([...discovered].filter(Boolean).map(canonicalProjectPath))) {
+  for (const raw of new Set([...discovered].filter(Boolean).map((value) => canonicalProjectPath(value)))) {
     const key = comparableProjectPath(raw);
     if (hidden.has(key) || registeredSeen.has(key) || extraSeen.has(key)) continue;
     extraSeen.add(key);
@@ -208,29 +251,30 @@ export function mergeProjects(registry: ProjectRegistryFile, discovered: Iterabl
   return [...registered, ...extra];
 }
 
-/** Normalize a user-supplied path: ~ and ~/ expand to the home directory,
- *  relative paths resolve against the server cwd (mirrors /api/cwd/validate). */
-function normalizeCwd(cwd: string): string {
-  if (cwd === "~") return homedir();
-  if (cwd.startsWith("~/")) return resolve(homedir(), cwd.slice(2));
-  return isAbsolute(cwd) ? cwd : resolve(cwd);
+/** Normalize a user-supplied path on the current host: ~ and ~/ expand to the
+ *  host's home directory, relative paths resolve against the server cwd
+ *  (mirrors /api/cwd/validate). */
+export function normalizeProjectCwd(cwd: string): string {
+  const expanded = expandHostHome(cwd);
+  const pathApi = hostPath();
+  return pathApi.isAbsolute(expanded) ? expanded : pathApi.resolve(expanded);
 }
 
-/** Validate and canonicalize a candidate project path. Throws ProjectPathError
- *  with a stable code on failure (path_required / directory_not_found /
- *  not_a_directory). */
-export function validateProjectPath(cwd: string): string {
+/** Validate and canonicalize a candidate project path on the host. Throws
+ *  ProjectPathError with a stable code on failure (path_required /
+ *  directory_not_found / not_a_directory). */
+export async function validateProjectPath(cwd: string, host: Host = currentHost()): Promise<string> {
   const trimmed = typeof cwd === "string" ? cwd.trim() : "";
   if (!trimmed) throw new ProjectPathError("path_required", "Path is required");
 
-  const normalized = normalizeCwd(trimmed);
-  let stat: Stats;
+  const normalized = withHost(host, () => normalizeProjectCwd(trimmed));
+  let isDirectory: boolean;
   try {
-    stat = statSync(normalized);
+    isDirectory = (await host.fs.stat(normalized)).isDirectory();
   } catch {
     throw new ProjectPathError("directory_not_found", `Directory does not exist: ${cwd}`);
   }
-  if (!stat.isDirectory()) {
+  if (!isDirectory) {
     throw new ProjectPathError("not_a_directory", `Path is not a directory: ${cwd}`);
   }
   return normalized;

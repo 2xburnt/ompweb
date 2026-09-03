@@ -1,20 +1,22 @@
-import { statSync } from "fs";
-import { basename } from "path";
-import { readModelsConfig } from "./omp/models-config";
-import { forEachFileLineSync, invalidateSessionFileListCache } from "./omp/session-files";
+import { currentHost } from "./hosts/context";
+import type { Host } from "./hosts/registry";
+import { readModelsConfig, type ModelsFileConfig } from "./omp/models-config";
+import { hostPath } from "./omp/paths";
+import { forEachFileLine, invalidateSessionFileListCache } from "./omp/session-files";
 import { isRecord } from "./type-guards";
 import {
   calculateCacheSavings,
   calculateUsageCost,
   resolveModelRates,
 } from "./usage-rates";
-import { getUsageReportFromDb } from "./usage-db";
+import { getUsageReportFromDb, type UsageReportResponse } from "./usage-db";
 import type {
   UsageQueryOptions,
   UsageRecord,
-  UsageReport,
   UsageTimeRange,
 } from "./usage-types";
+
+export type { UsageReportResponse } from "./usage-db";
 
 interface SessionUsageCacheEntry {
   mtimeMs: number;
@@ -43,14 +45,19 @@ function estimateUsageEntryBytes(entry: SessionUsageCacheEntry): number {
   return entry.records.length * 200 + 128;
 }
 
-function setUsageCacheEntry(filePath: string, entry: SessionUsageCacheEntry): void {
+/** The same path on two hosts is two files: cache per (host, path). */
+function usageCacheKey(host: Host, filePath: string): string {
+  return `${host.id}\0${filePath}`;
+}
+
+function setUsageCacheEntry(cacheKey: string, entry: SessionUsageCacheEntry): void {
   const cache = getUsageCache();
-  const existing = cache.get(filePath);
+  const existing = cache.get(cacheKey);
   if (existing) {
     usageCacheApproxBytes -= estimateUsageEntryBytes(existing);
   }
   const entryBytes = estimateUsageEntryBytes(entry);
-  cache.set(filePath, entry);
+  cache.set(cacheKey, entry);
   usageCacheApproxBytes += entryBytes;
 
   while (cache.size > MAX_USAGE_CACHE_ENTRIES || usageCacheApproxBytes > MAX_USAGE_CACHE_BYTES) {
@@ -160,25 +167,28 @@ export function computeTimeRangeBounds(
 }
 
 /**
- * Parse an individual session .jsonl file and extract all Assistant usage records.
- * Uses mtime + file size cache to avoid disk reading on subsequent requests.
+ * Parse an individual session .jsonl file on its host and extract all
+ * Assistant usage records. The file streams line by line (never materialized
+ * whole); an mtime + size memo skips unchanged files on subsequent requests.
  */
-export function parseSessionUsage(filePath: string, customModelsConfig = readModelsConfig()): UsageRecord[] {
+export async function parseSessionUsage(filePath: string, customModelsConfig?: ModelsFileConfig, host: Host = currentHost()): Promise<UsageRecord[]> {
   let stats;
   try {
-    stats = statSync(filePath);
+    stats = await host.fs.stat(filePath);
     if (!stats.isFile() || stats.size === 0) return [];
   } catch {
     return [];
   }
+  const modelsConfig = customModelsConfig ?? await readModelsConfig(host);
 
   const cache = getUsageCache();
-  const cached = cache.get(filePath);
+  const cacheKey = usageCacheKey(host, filePath);
+  const cached = cache.get(cacheKey);
   if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
     return cached.records;
   }
 
-  let sessionId = basename(filePath, ".jsonl");
+  let sessionId = hostPath().basename(filePath, ".jsonl");
   let sessionCwd = "";
   let sessionTimestamp = stats.mtimeMs;
   let activeProvider = "";
@@ -186,7 +196,7 @@ export function parseSessionUsage(filePath: string, customModelsConfig = readMod
   const records: UsageRecord[] = [];
 
   try {
-    forEachFileLineSync(filePath, (rawLine) => {
+    await forEachFileLine(filePath, (rawLine) => {
       if (!rawLine || rawLine.length < 5) return;
       let parsed: Record<string, unknown>;
       try {
@@ -256,7 +266,7 @@ export function parseSessionUsage(filePath: string, customModelsConfig = readMod
               if (!isNaN(parsedTime)) timestamp = parsedTime;
             }
 
-            const rates = resolveModelRates(provider, model, customModelsConfig);
+            const rates = resolveModelRates(provider, model, modelsConfig);
             const { cost, quality } = calculateUsageCost(rawUsage, rates);
             const cacheSavings = calculateCacheSavings(rawUsage, rates);
 
@@ -317,7 +327,7 @@ export function parseSessionUsage(filePath: string, customModelsConfig = readMod
                 if (!isNaN(parsedTime)) timestamp = parsedTime;
               }
 
-              const rates = resolveModelRates(subProvider, subModel, customModelsConfig);
+              const rates = resolveModelRates(subProvider, subModel, modelsConfig);
               const { cost, quality } = calculateUsageCost(u, rates);
               const cacheSavings = calculateCacheSavings(u, rates);
 
@@ -343,12 +353,12 @@ export function parseSessionUsage(filePath: string, customModelsConfig = readMod
           }
         }
       }
-    });
+    }, host);
   } catch {
     // Return partially collected records on read error
   }
 
-  setUsageCacheEntry(filePath, {
+  setUsageCacheEntry(cacheKey, {
     mtimeMs: stats.mtimeMs,
     size: stats.size,
     records,
@@ -359,10 +369,12 @@ export function parseSessionUsage(filePath: string, customModelsConfig = readMod
 }
 
 /**
- * Generate full usage report over all sessions according to query options.
- * Backed by the persistent local SQLite usage database.
+ * Generate the usage report for the current host. The local machine is backed
+ * by the persistent SQLite usage database; a remote host is queried read-only
+ * through its `sqlite3` CLI (see usage-db.ts) and reports `unsupported` when
+ * that is not possible.
  */
-export async function getUsageReport(options: UsageQueryOptions = {}): Promise<UsageReport> {
+export async function getUsageReport(options: UsageQueryOptions = {}): Promise<UsageReportResponse> {
   if (options.forceRefresh) {
     invalidateUsageCache();
     invalidateSessionFileListCache();

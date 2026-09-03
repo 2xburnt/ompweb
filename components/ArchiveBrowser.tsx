@@ -1,5 +1,8 @@
 "use client";
 
+import { hostFetch, useHosts } from "@/lib/hosts/client";
+import { MachineScopeNote } from "./MachineScopeNote";
+
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useI18n } from "@/lib/i18n";
 import { formatApiError } from "@/lib/i18n/api-error";
@@ -201,6 +204,11 @@ export function MetadataRow({
 
 export function ArchiveBrowser({ open, onClose, onRestored }: ArchiveBrowserProps) {
   const { t, locale } = useI18n();
+  // Archived sessions live on the machine that ran them: reload the list when
+  // the machine changes and restore onto the machine the archive came from.
+  const { hostId } = useHosts();
+  const hostRef = useRef<string | null>(hostId);
+  hostRef.current = hostId;
   const [archives, setArchives] = useState<ArchivedSessionInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -213,17 +221,20 @@ export function ArchiveBrowser({ open, onClose, onRestored }: ArchiveBrowserProp
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   const fetchArchives = useCallback(async (isManualRefresh = false) => {
+    const targetHost = hostId;
     if (isManualRefresh) setRefreshing(true);
     else setLoading(true);
     setError(null);
 
     try {
-      const res = await fetch("/api/sessions/archive");
+      const res = await hostFetch("/api/sessions/archive", undefined, targetHost ?? undefined);
+      if (hostRef.current !== targetHost) return;
       if (!res.ok) {
         const payload = await res.json().catch(() => ({})) as { error?: string; code?: string };
         throw new Error(formatApiError(payload, `errors.http${res.status}`));
       }
       const data = (await res.json()) as { archives?: ArchivedSessionInfo[] };
+      if (hostRef.current !== targetHost) return;
       const items = Array.isArray(data.archives) ? data.archives : [];
       setArchives(items);
       setSelectedKey((prevKey) => {
@@ -231,12 +242,23 @@ export function ArchiveBrowser({ open, onClose, onRestored }: ArchiveBrowserProp
         return items.length > 0 ? items[0].key : null;
       });
     } catch (err) {
+      if (hostRef.current !== targetHost) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (hostRef.current === targetHost) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
-  }, []);
+  }, [hostId]);
+
+  // Machine switch: drop the previous machine's archives before reloading so a
+  // stale row can never be restored onto the machine now selected.
+  useEffect(() => {
+    setArchives([]);
+    setSelectedKey(null);
+    setError(null);
+  }, [hostId]);
 
   useEffect(() => {
     if (open) {
@@ -307,13 +329,13 @@ export function ArchiveBrowser({ open, onClose, onRestored }: ArchiveBrowserProp
       setRestoringKey(archive.key);
 
       try {
-        const res = await fetch("/api/sessions/archive", {
+        const res = await hostFetch("/api/sessions/archive", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({ key: archive.key }),
-        });
+        }, hostRef.current ?? undefined);
 
         if (!res.ok) {
           const payload = await res.json().catch(() => ({})) as { error?: string; code?: string };
@@ -385,6 +407,7 @@ export function ArchiveBrowser({ open, onClose, onRestored }: ArchiveBrowserProp
                 <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>
                   {t("archiveBrowser.description")}
                 </div>
+                <MachineScopeNote intent="viewing" style={{ marginTop: 6 }} />
               </div>
             </div>
 

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { resolveSessionPathOr404 } from "@/lib/api-utils";
+import { withSessionRoute } from "@/lib/hosts/route";
 import { extractSubagentHistory } from "@/lib/subagent-history";
 import { getRpcSession } from "@/lib/rpc-manager";
 
@@ -9,12 +10,13 @@ export const dynamic = "force-dynamic";
  * GET /api/sessions/[id]/subagents
  *
  * On-disk subagent roster for a session, recovered from the parent file's task
- * toolResults (works without a live RPC process — survives page reloads).
+ * toolResults on the session's host (works without a live RPC process —
+ * survives page reloads).
  */
-export async function GET(
+export const GET = withSessionRoute(async (
   _req: Request,
   { params }: { params: Promise<{ id: string }> }
-) {
+) => {
   const { id } = await params;
   try {
     const resolved = await resolveSessionPathOr404(id);
@@ -29,7 +31,7 @@ export async function GET(
       return resolved.response;
     }
     const filePath = resolved.filePath;
-    const subagents = extractSubagentHistory(filePath);
+    const subagents = await extractSubagentHistory(filePath);
     return NextResponse.json({ subagents });
   } catch (error) {
     return NextResponse.json(
@@ -37,4 +39,4 @@ export async function GET(
       { status: 500 },
     );
   }
-}
+});

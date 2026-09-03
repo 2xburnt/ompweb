@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
 import { getSessionEntries } from "@/lib/session-reader";
 import { apiErrorResponse, resolveSessionPathOr404 } from "@/lib/api-utils";
+import { withSessionRoute } from "@/lib/hosts/route";
 import { isRecord } from "@/lib/type-guards";
 
-export async function GET(
+export const GET = withSessionRoute(async (
   req: Request,
   { params }: { params: Promise<{ id: string; entryId: string }> },
-) {
+) => {
   const { id, entryId } = await params;
   const blockIndexParam = new URL(req.url).searchParams.get("blockIndex");
   const blockIndex = blockIndexParam === null ? Number.NaN : Number(blockIndexParam);
@@ -19,8 +20,9 @@ export async function GET(
     if ("response" in resolved) return resolved.response;
     const filePath = resolved.filePath;
 
-    // Lenient JSONL parsing keeps omp's malformed-line tolerance.
-    const entry = getSessionEntries(filePath).find((candidate) => candidate.id === entryId);
+    // Lenient JSONL parsing keeps omp's malformed-line tolerance; entries are
+    // memoized per (host, path, size, mtime) so repeated lookups are one stat.
+    const entry = (await getSessionEntries(filePath)).find((candidate) => candidate.id === entryId);
     if (!entry || entry.type !== "message" || !isRecord(entry.message) || entry.message.role !== "assistant") {
       return NextResponse.json({ error: "Assistant message not found", code: "assistant_message_not_found" }, { status: 404 });
     }
@@ -34,4 +36,4 @@ export async function GET(
   } catch (error) {
     return apiErrorResponse(error);
   }
-}
+});

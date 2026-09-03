@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
-import { dirname } from "path";
 import { isMap, parseDocument, stringify } from "yaml";
-import { getSettingsPath } from "./paths";
+import { currentHost, withHost } from "../hosts/context";
+import type { Host } from "../hosts/registry";
 import { isRecord } from "../type-guards";
+import { readTextFile } from "./host-io";
+import { getSettingsPath, resolveSettingsPath } from "./paths";
 
 export type NativeSettings = {
   defaultThinkingLevel?: "auto" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -41,9 +42,11 @@ const COMPACTION_STRATEGIES = new Set(["snapcompact", "handoff", "context-full",
 const MEMORY_BACKENDS = new Set(["off", "local", "mnemopi", "hindsight"]);
 const MEMORY_SCOPES = new Set(["global", "per-project", "per-project-tagged"]);
 
-function configPath(): string {
-  return getSettingsPath();
-}
+// config.yml is small; anything past this is not a settings file.
+const MAX_SETTINGS_BYTES = 4 * 1024 * 1024;
+// How long a cached copy (used by the synchronous rpc-manager check) is served
+// before a background re-read is kicked off.
+const CACHE_REFRESH_MS = 5_000;
 
 function stringArray(value: unknown): string[] | undefined {
   return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : undefined;
@@ -57,18 +60,16 @@ function assertOptionalBoolean(value: unknown, name: string): void {
   if (value !== undefined && typeof value !== "boolean") throw new Error(`${name} must be a boolean`);
 }
 
-function readDocument() {
-  const path = configPath();
-  const doc = parseDocument(existsSync(path) ? readFileSync(path, "utf8") : "");
+async function readDocument(host: Host) {
+  const path = await withHost(host, () => resolveSettingsPath());
+  const doc = parseDocument((await readTextFile(host, path, MAX_SETTINGS_BYTES)) ?? "");
   if (doc.errors.length > 0) throw new Error(`${path} is not valid YAML: ${doc.errors[0].message}`);
   return { path, doc };
 }
 
-/** Returns the persisted native OMP values only; omitted keys keep OMP defaults. */
-export function readNativeSettings(): { path: string; settings: NativeSettings } {
-  const { path, doc } = readDocument();
-  const data = doc.toJS();
-  if (!isRecord(data)) return { path, settings: {} };
+/** Pick the reviewed subset of native OMP settings out of a parsed config.yml. */
+export function extractNativeSettings(data: unknown): NativeSettings {
+  if (!isRecord(data)) return {};
   const advisor = isRecord(data.advisor) ? data.advisor : {};
   const tools = isRecord(data.tools) ? data.tools : {};
   const approval = isRecord(tools.approval) ? tools.approval : {};
@@ -84,8 +85,6 @@ export function readNativeSettings(): { path: string; settings: NativeSettings }
   const registryHasScopedEntries = [data.enabledModels, data.disabledProviders, data.modelProviderOrder]
     .some((value) => Array.isArray(value) && !value.every((item) => typeof item === "string"));
   return {
-    path,
-    settings: {
       ...(THINKING_LEVELS.has(data.defaultThinkingLevel as string) ? { defaultThinkingLevel: data.defaultThinkingLevel as NativeSettings["defaultThinkingLevel"] } : {}),
       ...(typeof data.hideThinkingBlock === "boolean" ? { hideThinkingBlock: data.hideThinkingBlock } : {}),
       ...(typeof data.externalThinking === "boolean" ? { externalThinking: data.externalThinking } : {}),
@@ -143,12 +142,70 @@ export function readNativeSettings(): { path: string; settings: NativeSettings }
         ...(typeof mcp.notifications === "boolean" ? { notifications: mcp.notifications } : {}),
         ...(typeof mcp.notificationDebounceMs === "number" && Number.isInteger(mcp.notificationDebounceMs) ? { notificationDebounceMs: mcp.notificationDebounceMs } : {}),
       } } : {}),
-    },
   };
 }
 
+interface CachedNativeSettings {
+  path: string;
+  settings: NativeSettings;
+  readAt: number;
+}
+
+declare global {
+  var __ompNativeSettingsCache: Map<string, CachedNativeSettings> | undefined;
+  var __ompNativeSettingsRefreshes: Map<string, Promise<void>> | undefined;
+}
+
+function settingsCache(): Map<string, CachedNativeSettings> {
+  return (globalThis.__ompNativeSettingsCache ??= new Map());
+}
+
+function rememberSettings(host: Host, path: string, settings: NativeSettings): void {
+  settingsCache().set(host.id, { path, settings, readAt: Date.now() });
+}
+
+/** Returns the persisted native OMP values only; omitted keys keep OMP defaults. */
+export async function readNativeSettings(host: Host = currentHost()): Promise<{ path: string; settings: NativeSettings }> {
+  const { path, doc } = await readDocument(host);
+  const settings = extractNativeSettings(doc.toJS());
+  rememberSettings(host, path, settings);
+  return { path, settings };
+}
+
+function scheduleSettingsRefresh(host: Host): void {
+  const refreshes = (globalThis.__ompNativeSettingsRefreshes ??= new Map<string, Promise<void>>());
+  if (refreshes.has(host.id)) return;
+  const refresh = readNativeSettings(host).then(
+    () => undefined,
+    () => {
+      // A malformed (or unreadable) config must not keep serving stale values
+      // that omp itself no longer honors: fall back to "no overrides".
+      let path = "";
+      try { path = withHost(host, () => getSettingsPath()); } catch { /* unprobed host */ }
+      rememberSettings(host, path, {});
+    },
+  ).finally(() => {
+    refreshes.delete(host.id);
+  });
+  refreshes.set(host.id, refresh);
+}
+
+/**
+ * Synchronous view of a host's native settings for callers that cannot await
+ * (rpc-manager's frame handler). Serves the last read result and refreshes it
+ * in the background; until the first read completes it reports no overrides.
+ */
+export function getCachedNativeSettings(host: Host = currentHost()): { path: string; settings: NativeSettings } {
+  const cached = settingsCache().get(host.id);
+  if (!cached || Date.now() - cached.readAt >= CACHE_REFRESH_MS) scheduleSettingsRefresh(host);
+  if (cached) return { path: cached.path, settings: cached.settings };
+  let path = "";
+  try { path = withHost(host, () => getSettingsPath()); } catch { /* unprobed host */ }
+  return { path, settings: {} };
+}
+
 /** Validates and applies a reviewed subset of OMP's global config schema. */
-export function writeNativeSettings(settings: NativeSettings): void {
+export async function writeNativeSettings(settings: NativeSettings, host: Host = currentHost()): Promise<void> {
   if (!isRecord(settings)) throw new Error("Settings must be an object");
   assertOptionalRecord(settings.advisor, "advisor");
   assertOptionalRecord(settings.tools, "tools");
@@ -204,12 +261,12 @@ export function writeNativeSettings(settings: NativeSettings): void {
     if (values !== undefined && (!Array.isArray(values) || values.some((value) => typeof value !== "string" || !value.trim()))) throw new Error(`${key} must contain non-empty strings`);
   }
 
-  const { path, doc } = readDocument();
-  mkdirSync(dirname(path), { recursive: true });
+  const { path, doc } = await readDocument(host);
+  await host.fs.mkdir(host.pathApi.dirname(path), { recursive: true });
   if (doc.contents === null) {
-    const temp = `${path}.tmp-${process.pid}-${Date.now()}`;
-    writeFileSync(temp, stringify(settings), "utf8");
-    renameSync(temp, path);
+    const text = stringify(settings);
+    await host.fs.writeFile(path, text);
+    rememberSettings(host, path, extractNativeSettings(parseDocument(text).toJS()));
     return;
   }
   if (!isMap(doc.contents)) throw new Error(`${path} must contain a YAML mapping`);
@@ -231,7 +288,8 @@ export function writeNativeSettings(settings: NativeSettings): void {
   for (const [key, value] of Object.entries(settings.autolearn ?? {})) doc.setIn(["autolearn", key], value);
   for (const [key, value] of Object.entries(settings.mnemopi ?? {})) doc.setIn(["mnemopi", key], value);
   for (const [key, value] of Object.entries(settings.mcp ?? {})) doc.setIn(["mcp", key], value);
-  const temp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(temp, doc.toString(), "utf8");
-  renameSync(temp, path);
+  const text = doc.toString();
+  // host.fs.writeFile is atomic (temp file + rename in the target directory).
+  await host.fs.writeFile(path, text);
+  rememberSettings(host, path, extractNativeSettings(parseDocument(text).toJS()));
 }

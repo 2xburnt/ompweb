@@ -1,5 +1,5 @@
-import { execFile } from "child_process";
-import { promisify } from "util";
+import { currentHost } from "./hosts/context";
+import type { Host } from "./hosts/registry";
 import { resolveOmpBin } from "./omp/omp-cli";
 import { asNumber, isRecord } from "./type-guards";
 import type {
@@ -8,7 +8,6 @@ import type {
   ProviderUsageWindowId,
 } from "./provider-usage-types";
 
-const execFileAsync = promisify(execFile);
 const USAGE_TIMEOUT_MS = 30_000;
 const USAGE_MAX_BUFFER = 4 * 1024 * 1024;
 const USAGE_CACHE_TTL_MS = 5 * 60_000;
@@ -17,8 +16,9 @@ type UsageQuery = { provider?: string; modelId?: string };
 
 type CachedUsage = { expiresAt: number; output: string };
 
-let usageCache: CachedUsage | undefined;
-let usageInFlight: Promise<string> | undefined;
+// Per host: usage is reported by the omp install (and credentials) on that machine.
+const usageCache = new Map<string, CachedUsage>();
+const usageInFlight = new Map<string, Promise<string>>();
 
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
@@ -156,34 +156,49 @@ export function parseProviderUsageOutput(output: string, query: UsageQuery = {},
   return { generatedAt, reports };
 }
 
-async function fetchProviderUsage(): Promise<string> {
-  const bin = resolveOmpBin();
-  if (!bin) throw new Error("omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN.");
-  const { stdout } = await execFileAsync(bin, ["usage", "--json", "--redact"], {
-    timeout: USAGE_TIMEOUT_MS,
+async function fetchProviderUsage(host: Host): Promise<string> {
+  const bin = resolveOmpBin(host);
+  if (!bin) {
+    throw new Error(host.isLocal
+      ? "omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN."
+      : `omp binary not found on host "${host.id}"`);
+  }
+  const { stdout } = await host.executor.exec([bin, "usage", "--json", "--redact"], {
+    timeoutMs: USAGE_TIMEOUT_MS,
     maxBuffer: USAGE_MAX_BUFFER,
-    windowsHide: true,
+    env: { FORCE_COLOR: "0", NO_COLOR: "1" },
   });
-  return stdout;
+  return stdout.toString("utf8");
 }
 
-function getUsageOutput(): Promise<string> {
-  if (usageCache && usageCache.expiresAt > Date.now()) return Promise.resolve(usageCache.output);
-  if (usageInFlight) return usageInFlight;
-  usageInFlight = fetchProviderUsage()
+function getUsageOutput(host: Host): Promise<string> {
+  const cached = usageCache.get(host.id);
+  if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.output);
+  const inFlight = usageInFlight.get(host.id);
+  if (inFlight) return inFlight;
+  const load = fetchProviderUsage(host)
     .then((output) => {
-      usageCache = { output, expiresAt: Date.now() + USAGE_CACHE_TTL_MS };
+      usageCache.set(host.id, { output, expiresAt: Date.now() + USAGE_CACHE_TTL_MS });
       return output;
     })
-    .finally(() => { usageInFlight = undefined; });
-  return usageInFlight;
+    .finally(() => {
+      if (usageInFlight.get(host.id) === load) usageInFlight.delete(host.id);
+    });
+  usageInFlight.set(host.id, load);
+  return load;
 }
 
-export async function getProviderUsage(query: UsageQuery = {}): Promise<ProviderUsageSnapshot> {
-  return parseProviderUsageOutput(await getUsageOutput(), query);
+export async function getProviderUsage(query: UsageQuery = {}, host: Host = currentHost()): Promise<ProviderUsageSnapshot> {
+  return parseProviderUsageOutput(await getUsageOutput(host), query);
 }
 
-export function clearProviderUsageCache(): void {
-  usageCache = undefined;
-  usageInFlight = undefined;
+/** Drop the cached `omp usage` output (one host, or every host). */
+export function clearProviderUsageCache(hostId?: string): void {
+  if (hostId === undefined) {
+    usageCache.clear();
+    usageInFlight.clear();
+    return;
+  }
+  usageCache.delete(hostId);
+  usageInFlight.delete(hostId);
 }

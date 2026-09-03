@@ -1,4 +1,4 @@
-import { getSessionEntries, resolveSessionPath } from "./session-reader";
+import { getSessionEntries, resolveSessionLocation } from "./session-reader";
 import {
   isBashOutputPathReferencedByEntries,
   isFilePathReferencedByEntries,
@@ -7,6 +7,8 @@ import {
 
 export { isFilePathReferencedByEntries } from "./session-file-references-core";
 
+/** Entries are read on the host that owns the session, regardless of the
+ * host context the caller runs in: a session id is unique across machines. */
 async function isPathReferencedBySession(
   filePath: string,
   sessionId: string | null,
@@ -14,9 +16,9 @@ async function isPathReferencedBySession(
 ): Promise<boolean> {
   if (!isValidSessionId(sessionId)) return false;
   try {
-    const sessionPath = await resolveSessionPath(sessionId);
-    if (!sessionPath) return false;
-    return check(filePath, getSessionEntries(sessionPath));
+    const location = await resolveSessionLocation(sessionId);
+    if (!location) return false;
+    return check(filePath, await getSessionEntries(location.path, location.host));
   } catch {
     return false;
   }

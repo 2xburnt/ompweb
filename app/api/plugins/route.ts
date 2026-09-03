@@ -1,7 +1,8 @@
-import { NextResponse } from "next/server";
-import { execFile } from "child_process";
-import { existsSync, promises as fs } from "fs";
-import { basename, extname, join } from "path";
+import { NextResponse, type NextRequest } from "next/server";
+import { currentHost } from "@/lib/hosts/context";
+import type { Host } from "@/lib/hosts/registry";
+import { withHostRoute } from "@/lib/hosts/route";
+import { existingPaths } from "@/lib/omp/host-io";
 import { resolveOmpBin } from "@/lib/omp/omp-cli";
 import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-access";
 import type {
@@ -15,9 +16,10 @@ import type {
 
 export const dynamic = "force-dynamic";
 
-// Plugin management is delegated to the user's omp binary (`omp plugin ...`);
-// omp-web never embeds the Bun-only SDK. `--json` output shapes are mirrored
-// from oh-my-pi coding-agent src/cli/plugin-cli.ts + extensibility/plugins.
+// Plugin management is delegated to the host's omp binary (`omp plugin ...`
+// through the host executor); omp-web never embeds the Bun-only SDK. `--json`
+// output shapes are mirrored from oh-my-pi coding-agent src/cli/plugin-cli.ts
+// + extensibility/plugins.
 
 type PluginAction = "install" | "remove" | "update" | "disable" | "enable";
 
@@ -66,35 +68,31 @@ function emptyCounts(): PluginResourceCounts {
   return { extensions: 0, skills: 0, prompts: 0, themes: 0 };
 }
 
-function runOmp(
+async function runOmp(
+  host: Host,
   args: string[],
   opts: { cwd?: string; timeout?: number } = {},
 ): Promise<{ stdout: string; stderr: string }> {
-  const bin = resolveOmpBin();
+  const bin = resolveOmpBin(host);
   if (!bin) {
-    return Promise.reject(new Error("omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN."));
+    throw new Error(host.isLocal
+      ? "omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN."
+      : `omp binary not found on host "${host.id}". Install oh-my-pi there or set the host's ompBin.`);
   }
-  return new Promise((resolve, reject) => {
-    execFile(
-      bin,
-      args,
-      {
-        cwd: opts.cwd,
-        timeout: opts.timeout ?? 60_000,
-        maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" },
-        windowsHide: true,
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          const detail = (stderr || stdout || error.message).replace(ANSI_RE, "").trim();
-          reject(new Error(detail.slice(-600) || `omp ${args.join(" ")} failed`));
-        } else {
-          resolve({ stdout, stderr });
-        }
-      },
-    );
+  const result = await host.executor.exec([bin, ...args], {
+    cwd: opts.cwd,
+    timeoutMs: opts.timeout ?? 60_000,
+    maxBuffer: 16 * 1024 * 1024,
+    env: { FORCE_COLOR: "0", NO_COLOR: "1" },
+    allowFailure: true,
   });
+  const stdout = result.stdout.toString("utf8");
+  const stderr = result.stderr;
+  if (result.code !== 0) {
+    const detail = (stderr || stdout || `exit ${result.signal ?? result.code ?? "unknown"}`).replace(ANSI_RE, "").trim();
+    throw new Error(detail.slice(-600) || `omp ${args.join(" ")} failed`);
+  }
+  return { stdout, stderr };
 }
 
 /** Parse `--json` stdout, tolerating stray non-JSON lines before the payload. */
@@ -109,42 +107,41 @@ function parseJsonLoose<T>(stdout: string): T | null {
   }
 }
 
-/** Best-effort scan of a plugin's skills/ directory (omp discovers plugin-root
- * skills the same way) so the UI can show a resource count. */
-async function scanPluginSkills(pluginPath: string): Promise<PluginResourceInfo[]> {
-  const skillsDir = join(pluginPath, "skills");
+/** Best-effort scan of a plugin's skills/ directory on the host (omp discovers
+ * plugin-root skills the same way) so the UI can show a resource count. */
+async function scanPluginSkills(host: Host, pluginPath: string): Promise<PluginResourceInfo[]> {
+  const pathApi = host.pathApi;
+  const skillsDir = pathApi.join(pluginPath, "skills");
   let entries;
   try {
-    const readDirectory = Reflect.get(fs, "readdir") as typeof fs.readdir;
-    entries = await readDirectory(skillsDir, { withFileTypes: true });
+    entries = await host.fs.readdir(skillsDir);
   } catch {
     return [];
   }
-  const resources: PluginResourceInfo[] = [];
-  for (const entry of entries) {
-    if (entry.name.startsWith(".") || (!entry.isDirectory() && !entry.isSymbolicLink())) continue;
-    const skillPath = join(skillsDir, entry.name, "SKILL.md");
-    if (existsSync(skillPath)) {
-      resources.push({
-        kind: "skill",
-        name: entry.name,
-        path: skillPath,
-        relativePath: join("skills", entry.name, "SKILL.md"),
-      });
-    }
-  }
-  return resources;
+  const candidates = entries
+    .filter((entry) => !entry.name.startsWith(".") && (entry.isDirectory() || entry.isSymbolicLink()))
+    .map((entry) => ({ name: entry.name, path: pathApi.join(skillsDir, entry.name, "SKILL.md") }));
+  const present = await existingPaths(host, candidates.map((candidate) => candidate.path));
+  return candidates
+    .filter((candidate) => present.has(candidate.path))
+    .map((candidate) => ({
+      kind: "skill" as const,
+      name: candidate.name,
+      path: candidate.path,
+      relativePath: pathApi.join("skills", candidate.name, "SKILL.md"),
+    }));
 }
 
-function manifestResources(pluginPath: string, manifest: OmpPluginManifest | undefined): PluginResourceInfo[] {
+function manifestResources(host: Host, pluginPath: string, manifest: OmpPluginManifest | undefined): PluginResourceInfo[] {
+  const pathApi = host.pathApi;
   const resources: PluginResourceInfo[] = [];
   const push = (kind: PluginResourceInfo["kind"], rel: string) => {
-    const file = basename(rel);
-    const ext = extname(file);
+    const file = pathApi.basename(rel);
+    const ext = pathApi.extname(file);
     resources.push({
       kind,
       name: ext ? file.slice(0, -ext.length) : file,
-      path: join(pluginPath, rel),
+      path: pathApi.join(pluginPath, rel),
       relativePath: rel,
     });
   };
@@ -156,10 +153,10 @@ function manifestResources(pluginPath: string, manifest: OmpPluginManifest | und
   return resources;
 }
 
-async function toNpmPackageInfo(plugin: OmpNpmPlugin): Promise<PluginPackageInfo> {
+async function toNpmPackageInfo(host: Host, plugin: OmpNpmPlugin): Promise<PluginPackageInfo> {
   const resources = [
-    ...manifestResources(plugin.path, plugin.manifest),
-    ...(await scanPluginSkills(plugin.path)),
+    ...manifestResources(host, plugin.path, plugin.manifest),
+    ...(await scanPluginSkills(host, plugin.path)),
   ];
   const counts = emptyCounts();
   for (const resource of resources) {
@@ -168,7 +165,7 @@ async function toNpmPackageInfo(plugin: OmpNpmPlugin): Promise<PluginPackageInfo
     else if (resource.kind === "prompt") counts.prompts += 1;
     else counts.themes += 1;
   }
-  const installed = Boolean(plugin.path && existsSync(plugin.path));
+  const installed = Boolean(plugin.path && (await host.fs.exists(plugin.path)));
   const resourceCount = counts.extensions + counts.skills + counts.prompts + counts.themes;
   return {
     source: plugin.name,
@@ -191,11 +188,11 @@ async function toNpmPackageInfo(plugin: OmpNpmPlugin): Promise<PluginPackageInfo
   };
 }
 
-async function toMarketplacePackageInfo(plugin: OmpMarketplacePlugin): Promise<PluginPackageInfo> {
+async function toMarketplacePackageInfo(host: Host, plugin: OmpMarketplacePlugin): Promise<PluginPackageInfo> {
   const entry = plugin.entries?.[0];
   const installedPath = entry?.installPath;
-  const installed = Boolean(installedPath && existsSync(installedPath));
-  const resources = installedPath ? await scanPluginSkills(installedPath) : [];
+  const installed = Boolean(installedPath && (await host.fs.exists(installedPath)));
+  const resources = installedPath ? await scanPluginSkills(host, installedPath) : [];
   const counts = emptyCounts();
   counts.skills = resources.length;
   const disabled = entry?.enabled === false;
@@ -214,13 +211,13 @@ async function toMarketplacePackageInfo(plugin: OmpMarketplacePlugin): Promise<P
   };
 }
 
-async function readPlugins(cwd: string): Promise<PluginsResponse> {
+async function readPlugins(host: Host, cwd: string): Promise<PluginsResponse & { host: string }> {
   const diagnostics: PluginDiagnostic[] = [];
   const packages: PluginPackageInfo[] = [];
   const totals = emptyCounts();
 
   try {
-    const { stdout } = await runOmp(["plugin", "list", "--json"], { cwd, timeout: 60_000 });
+    const { stdout } = await runOmp(host, ["plugin", "list", "--json"], { cwd, timeout: 60_000 });
     const list = parseJsonLoose<OmpPluginList>(stdout);
     if (!list) {
       diagnostics.push({
@@ -229,10 +226,10 @@ async function readPlugins(cwd: string): Promise<PluginsResponse> {
       });
     } else {
       for (const plugin of list.npm ?? []) {
-        packages.push(await toNpmPackageInfo(plugin));
+        packages.push(await toNpmPackageInfo(host, plugin));
       }
       for (const plugin of list.marketplace ?? []) {
-        const info = await toMarketplacePackageInfo(plugin);
+        const info = await toMarketplacePackageInfo(host, plugin);
         if (plugin.shadowedBy) {
           diagnostics.push({
             type: "warning",
@@ -256,7 +253,7 @@ async function readPlugins(cwd: string): Promise<PluginsResponse> {
     });
   }
 
-  return { packages, totals, diagnostics };
+  return { packages, totals, diagnostics, host: host.id };
 }
 
 function readScope(scope: unknown): PluginScope {
@@ -273,24 +270,26 @@ function pluginErrorResponse(error: unknown): NextResponse {
   return NextResponse.json({ error: message }, { status: 500 });
 }
 
-export async function GET(req: Request) {
+export const GET = withHostRoute(async (req: NextRequest) => {
+  const host = currentHost();
   const { searchParams } = new URL(req.url);
   const cwd = searchParams.get("cwd");
   if (!cwd) return NextResponse.json({ error: "cwd required", code: "cwd_required" }, { status: 400 });
 
   try {
-    const allowedRoots = await getAllowedFileRoots();
-    if (!isExistingFilePathAllowed(cwd, allowedRoots)) {
+    const allowedRoots = await getAllowedFileRoots(host);
+    if (!(await isExistingFilePathAllowed(cwd, allowedRoots, host))) {
       return NextResponse.json({ error: "Access denied", code: "access_denied" }, { status: 403 });
     }
-    return NextResponse.json(await readPlugins(cwd));
+    return NextResponse.json(await readPlugins(host, cwd));
   } catch (error) {
     return pluginErrorResponse(error);
   }
-}
+});
 
 // POST /api/plugins body: { action, source?, scope?, cwd }
-export async function POST(req: Request) {
+export const POST = withHostRoute(async (req: NextRequest) => {
+  const host = currentHost();
   try {
     const body = await req.json() as {
       action?: PluginAction;
@@ -300,8 +299,8 @@ export async function POST(req: Request) {
     };
     if (!body.cwd) return NextResponse.json({ error: "cwd required", code: "cwd_required" }, { status: 400 });
     if (!body.action) return NextResponse.json({ error: "action required", code: "action_required" }, { status: 400 });
-    const allowedRoots = await getAllowedFileRoots();
-    if (!isExistingFilePathAllowed(body.cwd, allowedRoots)) {
+    const allowedRoots = await getAllowedFileRoots(host);
+    if (!(await isExistingFilePathAllowed(body.cwd, allowedRoots, host))) {
       return NextResponse.json({ error: "Access denied", code: "access_denied" }, { status: 403 });
     }
 
@@ -310,21 +309,21 @@ export async function POST(req: Request) {
 
     if (body.action === "install") {
       if (!source) return NextResponse.json({ error: "source required", code: "source_required" }, { status: 400 });
-      await runOmp(["plugin", "install", source, "--json", ...scopeArgs], { cwd: body.cwd, timeout: 300_000 });
+      await runOmp(host, ["plugin", "install", source, "--json", ...scopeArgs], { cwd: body.cwd, timeout: 300_000 });
     } else if (body.action === "remove") {
       if (!source) return NextResponse.json({ error: "source required", code: "source_required" }, { status: 400 });
-      await runOmp(["plugin", "uninstall", source, "--json", ...scopeArgs], { cwd: body.cwd, timeout: 120_000 });
+      await runOmp(host, ["plugin", "uninstall", source, "--json", ...scopeArgs], { cwd: body.cwd, timeout: 120_000 });
     } else if (body.action === "update") {
-      await runOmp(["plugin", "upgrade", ...(source ? [source, ...scopeArgs] : [])], { cwd: body.cwd, timeout: 300_000 });
+      await runOmp(host, ["plugin", "upgrade", ...(source ? [source, ...scopeArgs] : [])], { cwd: body.cwd, timeout: 300_000 });
     } else if (body.action === "disable" || body.action === "enable") {
       if (!source) return NextResponse.json({ error: "source required", code: "source_required" }, { status: 400 });
-      await runOmp(["plugin", body.action, source, "--json", ...scopeArgs], { cwd: body.cwd, timeout: 60_000 });
+      await runOmp(host, ["plugin", body.action, source, "--json", ...scopeArgs], { cwd: body.cwd, timeout: 60_000 });
     } else {
       return NextResponse.json({ error: `Unsupported action: ${body.action}`, code: "plugin_unsupported_action" }, { status: 400 });
     }
 
-    return NextResponse.json(await readPlugins(body.cwd));
+    return NextResponse.json(await readPlugins(host, body.cwd));
   } catch (error) {
     return pluginErrorResponse(error);
   }
-}
+});

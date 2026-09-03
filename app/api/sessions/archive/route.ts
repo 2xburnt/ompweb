@@ -1,12 +1,15 @@
 import { NextResponse } from "next/server";
 import { apiErrorResponse } from "@/lib/api-utils";
+import { withHostRoute } from "@/lib/hosts/route";
 import { listArchivedSessions, restoreArchivedSession } from "@/lib/omp/archive";
 import { invalidateSessionListCache } from "@/lib/session-reader";
 import type { ArchivedSessionInfo } from "@/lib/types";
 
 export const runtime = "nodejs";
 
-export async function GET() {
+// GET /api/sessions/archive?host=<id> — archived sessions of one host (the
+// default host when none is named).
+export const GET = withHostRoute<[Request]>(async () => {
   try {
     const archives = await listArchivedSessions();
     const response: ArchivedSessionInfo[] = archives.map((archive) => ({
@@ -25,15 +28,17 @@ export async function GET() {
   } catch (error) {
     return apiErrorResponse(error);
   }
-}
+});
 
-export async function POST(req: Request) {
+// POST /api/sessions/archive?host=<id>  body: { key } — restore an archive on
+// that host into its active sessions tree.
+export const POST = withHostRoute(async (req: Request) => {
   try {
     const body = await req.json() as { key?: unknown };
     if (typeof body.key !== "string" || !body.key.trim()) {
       return NextResponse.json({ error: "Archive key is required", code: "archive_key_required" }, { status: 400 });
     }
-    const sessionId = restoreArchivedSession(body.key);
+    const sessionId = await restoreArchivedSession(body.key);
     invalidateSessionListCache();
     return NextResponse.json({ ok: true, sessionId });
   } catch (error) {
@@ -41,4 +46,4 @@ export async function POST(req: Request) {
     const status = message.includes("Invalid archive key") || message.includes("required") ? 400 : message.includes("not found") ? 404 : message.includes("already exists") ? 409 : 500;
     return NextResponse.json({ error: message, code: "archive_restore_failed" }, { status });
   }
-}
+});

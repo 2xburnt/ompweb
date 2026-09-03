@@ -1,4 +1,5 @@
-import { NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
+import { withHostRoute } from "@/lib/hosts/route";
 import {
   flattenModelsDevCatalog,
   recommendModelCatalogPreset,
@@ -62,7 +63,9 @@ async function loadCatalog(): Promise<ModelCatalogEntry[]> {
 // Searches the models.dev catalog (1h TTL, in-flight dedup) and derives an
 // "add model" preset recommendation for the query. Provider/base-url hints
 // steer both search ranking and the recommendation's metadata/pricing source.
-export async function GET(req: Request) {
+// The catalog is fetched from models.dev, not from any host, so the host is
+// only parsed for consistency and never probed.
+export const GET = withHostRoute(async (req: NextRequest) => {
   const { searchParams } = new URL(req.url);
   const query = (searchParams.get("q") ?? "").slice(0, 120);
   const provider = (searchParams.get("provider") ?? "").slice(0, 120);
@@ -78,4 +81,4 @@ export async function GET(req: Request) {
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : String(error) }, { status: 502 });
   }
-}
+}, { ready: false });

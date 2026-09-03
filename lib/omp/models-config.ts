@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
-import { basename, dirname, join } from "path";
 import { isMap, isScalar, isSeq, parseDocument, stringify, type Document } from "yaml";
-import { getModelsConfigPath } from "./paths";
+import { currentHost, withHost } from "../hosts/context";
+import type { Host } from "../hosts/registry";
 import { isRecord } from "../type-guards";
+import { readTextFile } from "./host-io";
+import { resolveModelsConfigPath } from "./paths";
 
 /**
  * Direct YAML access to omp's custom-models file (~/.omp/agent/models.yml).
@@ -24,6 +25,9 @@ export const MODEL_API_OPTIONS = [
 ] as const;
 
 export const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+// models.yml is hand-sized; a larger file is not something the editor should load.
+const MAX_MODELS_CONFIG_BYTES = 8 * 1024 * 1024;
 
 export interface ModelThinkingConfig {
   mode?: string;
@@ -149,14 +153,15 @@ function sanitizeModelsConfig(config: ModelsFileConfig): ModelsFileConfig {
   return { ...config, providers };
 }
 
-/** Read models.yml, reporting rather than swallowing parse failures. */
-export function readModelsConfigFile(): ModelsConfigFile {
-  const path = getModelsConfigPath();
-  if (!existsSync(path)) return { path, exists: false, config: { providers: {} } };
+/** Read models.yml on the host, reporting rather than swallowing parse failures. */
+export async function readModelsConfigFile(host: Host = currentHost()): Promise<ModelsConfigFile> {
+  const path = await withHost(host, () => resolveModelsConfigPath());
 
   let source: string;
   try {
-    source = readFileSync(path, "utf8");
+    const text = await readTextFile(host, path, MAX_MODELS_CONFIG_BYTES);
+    if (text === null) return { path, exists: false, config: { providers: {} } };
+    source = text;
   } catch (error) {
     return { path, exists: true, config: { providers: {} }, parseError: String(error) };
   }
@@ -185,8 +190,8 @@ export function readModelsConfigFile(): ModelsConfigFile {
 /** Tolerant read for consumers that only inspect the config (a broken file
  * reads as empty). Anything that writes the file back must go through
  * readModelsConfigFile()/writeModelsConfig() so a parse error blocks the write. */
-export function readModelsConfig(): ModelsFileConfig {
-  return readModelsConfigFile().config;
+export async function readModelsConfig(host: Host = currentHost()): Promise<ModelsFileConfig> {
+  return (await readModelsConfigFile(host)).config;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -294,22 +299,15 @@ export interface WriteModelsConfigOptions {
   overwriteUnparseable?: boolean;
 }
 
-export function writeModelsConfig(config: ModelsFileConfig, options: WriteModelsConfigOptions = {}): void {
-  const current = readModelsConfigFile();
+export async function writeModelsConfig(config: ModelsFileConfig, options: WriteModelsConfigOptions = {}, host: Host = currentHost()): Promise<void> {
+  const current = await readModelsConfigFile(host);
   if (current.parseError && !options.overwriteUnparseable) {
     throw new ModelsConfigParseError(current.path, current.parseError);
   }
   const text = serializeModelsConfig(sanitizeModelsConfig(config), current.parseError ? undefined : current.source);
-  const dir = dirname(current.path);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  // Write-then-rename: a crash mid-write must not leave models.yml truncated,
-  // which would disable every custom model until the user repairs it by hand.
-  const temp = join(dir, `.${basename(current.path)}.omp-web-${process.pid}-${Date.now()}.tmp`);
-  try {
-    writeFileSync(temp, text, "utf8");
-    renameSync(temp, current.path);
-  } catch (error) {
-    rmSync(temp, { force: true });
-    throw error;
-  }
+  await host.fs.mkdir(host.pathApi.dirname(current.path), { recursive: true });
+  // host.fs.writeFile is write-then-rename: a crash mid-write must not leave
+  // models.yml truncated, which would disable every custom model until the
+  // user repairs it by hand.
+  await host.fs.writeFile(current.path, text);
 }

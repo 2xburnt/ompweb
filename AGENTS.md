@@ -37,8 +37,43 @@ Browser                Next.js Server                    omp child process
   │◀── data: {...} ─────────│                                    │
 ```
 
-**Session browsing** (read-only): pure-Node parsing of omp session `.jsonl`
-files via `lib/session-reader.ts` — no child process involved.  
+### Hosts (multi-machine, remote-first)
+
+Every machine that runs omp is a **host** (`lib/hosts/`). The serving machine is
+the `local` host; any other machine is an `ssh` host reached over one
+multiplexed OpenSSH connection (`ControlMaster`). **Nothing is mirrored to the
+hub's disk** — the hub may have no storage to spare — so every read is a bounded
+request against the host's own filesystem and every write goes straight back.
+
+- `lib/hosts/executor.ts` — the boundary: `HostExecutor.exec/spawn` and `HostFs`
+  (stat, typed readdir, `walkFiles`, `readHead`, batched `readSlices`,
+  streamed `forEachLine`, atomic `writeFile`, in-place `writeAt`, …). The local
+  host uses syscalls; the ssh host runs POSIX `sh` scripts (GNU **and** BSD
+  coreutils) and parses length/NUL-framed output. Prefer one round trip per
+  operation: batch into a script instead of looping over `exec`.
+- `lib/hosts/registry.ts` — `Host` objects from `~/.omp-web/hosts.json`
+  (`OMP_WEB_HOME` / `OMP_WEB_HOSTS_FILE`), lazy probe (`host.ready()` learns
+  home/tmp/platform/tool flavors and the omp binary + version), failure backoff.
+- `lib/hosts/context.ts` — `currentHost()` via AsyncLocalStorage; outside a
+  request it falls back to the local host (or the default when local is disabled).
+- `lib/hosts/route.ts` — `withHostRoute` (host from `?host=` / `x-omp-host`,
+  default otherwise) and `withSessionRoute` (host derived from the session id).
+  Library code never takes a host parameter from the route; it calls
+  `currentHost()`.
+- `lib/omp/paths.ts` — `getAgentDir()` & friends return paths **on the current
+  host**; use `hostPath()` (POSIX for remote), `hostHomedir()`, `expandHostHome()`.
+- Caches that used to be keyed by path are keyed by `${host.id}\0${path}`; the
+  same path on two machines is two files. `projectKey` is `${hostId}:${key}`.
+- Session ids are unique across machines, so `/api/sessions/[id]/*` and
+  `/api/agent/[id]*` need no host parameter (`resolveSessionLocation`). Spawn
+  paths pass `{ verify: true }` so a deleted file is never resumed.
+- Remote hosts report whole-second mtimes; never compare them with local ones.
+- The client keeps the selected machine in `lib/hosts/client.ts` (`useHosts`,
+  `hostFetch`, `withHostParam`) and passes `host` on `/api/agent/new`.
+
+**Session browsing** (read-only): bounded parsing of omp session `.jsonl` files
+via `lib/session-reader.ts` over the host filesystem — a directory walk plus
+4 KiB/32 KiB prefix/suffix windows per changed file, no child process.  
 **Sending a message**: `startRpcSession()` in `lib/rpc-manager.ts` spawns
 `omp --mode rpc-ui` (one process per active session) through
 `lib/omp/rpc-process.ts`.
@@ -48,7 +83,7 @@ Shared foundations in `lib/omp/`:
 - `paths.ts` — Node port of omp's directory resolution (`~/.omp/agent`,
   profiles, XDG, session dir slugs).
 - `omp-cli.ts` — locate/probe the installed `omp` binary (`resolveOmpBin`,
-  `getOmpVersion`).
+  `getOmpVersion`), per host.
 - `rpc-process.ts` — process + NDJSON protocol layer (`RpcProcess`).
 
 ---
@@ -81,8 +116,12 @@ app/api/
   skills/install/route.ts         POST install skills through npx skills add
   skills/search/route.ts          GET/POST skills.sh search
   worktrees/route.ts              GET/POST/DELETE git worktrees
+  hosts/route.ts                  GET list machines (?probe=1) | POST add | PUT default
+  hosts/[id]/route.ts             GET/PATCH/DELETE one machine
+  hosts/[id]/test/route.ts        POST re-probe connectivity + omp version
 
 lib/
+  hosts/               machines: config, executor (local + ssh), registry, request context, route wrappers, client store
   omp/                 shared omp foundations (paths, CLI probe, RpcProcess)
   agent-client.ts      typed fetch helper for /api/agent commands
   draft-store.ts       local draft persistence helpers

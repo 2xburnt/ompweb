@@ -1,6 +1,8 @@
 import { existsSync, realpathSync, statSync } from "fs";
 import { homedir, tmpdir } from "os";
 import * as path from "path";
+import { currentHostOrNull } from "../hosts/context";
+import type { Host } from "../hosts/registry";
 
 /**
  * Node port of oh-my-pi's directory resolution (packages/utils/src/dirs.ts).
@@ -12,6 +14,46 @@ import * as path from "path";
 
 const APP_NAME = "omp";
 const CONFIG_DIR_NAME = ".omp";
+
+/** The remote host of the current request, or null for the local machine. */
+function remoteHost(): Host | null {
+  const host = currentHostOrNull();
+  return host && !host.isLocal ? host : null;
+}
+
+/** Path API for the current host: remote machines are always POSIX. */
+export function hostPath(): typeof path.posix {
+  return remoteHost() ? path.posix : path;
+}
+
+function requireRemoteAgentDir(host: Host): string {
+  if (!host.agentDir) {
+    throw new Error(`Host "${host.id}" has not been probed yet; call host.ready() before resolving omp paths`);
+  }
+  return host.agentDir;
+}
+
+/** Home directory on the current host (remote hosts must be probed first). */
+export function hostHomedir(): string {
+  const host = remoteHost();
+  if (!host) return homedir();
+  if (!host.home) throw new Error(`Host "${host.id}" has not been probed yet`);
+  return host.home;
+}
+
+/** Temp directory on the current host. */
+export function hostTmpdir(): string {
+  const host = remoteHost();
+  if (!host) return tmpdir();
+  return host.tmp ?? "/tmp";
+}
+
+/** Expand a leading "~" against the current host's home directory. */
+export function expandHostHome(value: string): string {
+  if (value === "~") return hostHomedir();
+  if (value.startsWith("~/")) return hostPath().join(hostHomedir(), value.slice(2));
+  return value;
+}
 
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 // Windows reserves these basenames and any `BASENAME.<ext>` form of them,
@@ -59,6 +101,8 @@ export function getConfigDirName(): string {
 
 /** Config root: ~/.omp, or ~/.omp/profiles/<name> for a named profile. */
 export function getConfigRoot(): string {
+  const remote = remoteHost();
+  if (remote) return path.posix.dirname(requireRemoteAgentDir(remote));
   const base = path.join(homedir(), getConfigDirName());
   const profile = getActiveProfile();
   return profile ? path.join(base, "profiles", profile) : base;
@@ -68,6 +112,8 @@ export function getConfigRoot(): string {
  * but a named profile takes precedence over the override (matching omp, where
  * profile activation rewrites PI_CODING_AGENT_DIR itself). */
 export function getAgentDir(): string {
+  const remote = remoteHost();
+  if (remote) return requireRemoteAgentDir(remote);
   const profile = getActiveProfile();
   const override = process.env.PI_CODING_AGENT_DIR;
   if (override && !profile) return path.resolve(override);
@@ -88,6 +134,8 @@ function isDefaultAgentDir(): boolean {
  * XDG layout as opt-in via `omp config init-xdg`. XDG flattens the `agent/`
  * prefix: ~/.omp/agent/sessions → $XDG_DATA_HOME/omp/sessions. */
 function xdgDataAgentRoot(): string | undefined {
+  // Remote hosts: the agent dir is whatever the host reports; no XDG probing.
+  if (remoteHost()) return undefined;
   if (process.platform !== "linux" && process.platform !== "darwin") return undefined;
   if (!isDefaultAgentDir()) return undefined;
   const value = process.env.XDG_DATA_HOME;
@@ -107,7 +155,7 @@ function xdgDataAgentRoot(): string | undefined {
 
 function agentDataSubdir(subdir: string): string {
   const xdg = xdgDataAgentRoot();
-  return path.join(xdg ?? getAgentDir(), subdir);
+  return hostPath().join(xdg ?? getAgentDir(), subdir);
 }
 
 /** ~/.omp/agent/sessions (or $XDG_DATA_HOME/omp/sessions). */
@@ -117,7 +165,8 @@ export function getSessionsDir(): string {
 
 /** OMP's gc archive root for compressed session JSONL files. */
 export function getArchivedSessionsDir(): string {
-  return path.join(path.dirname(getSessionsDir()), "archive", "sessions");
+  const pathApi = hostPath();
+  return pathApi.join(pathApi.dirname(getSessionsDir()), "archive", "sessions");
 }
 
 /** Content-addressed blob store referenced from session entries. */
@@ -125,29 +174,59 @@ export function getBlobsDir(): string {
   return agentDataSubdir("blobs");
 }
 
-/** Settings file (YAML). config.yml is canonical, config.yaml the fallback. */
+/** Settings file (YAML). config.yml is canonical, config.yaml the fallback.
+ * On a remote host the fallback probe is skipped (use resolveSettingsPath). */
 export function getSettingsPath(): string {
+  const pathApi = hostPath();
   const dir = getAgentDir();
-  const canonical = path.join(dir, "config.yml");
+  const canonical = pathApi.join(dir, "config.yml");
+  if (remoteHost()) return canonical;
   if (existsSync(canonical)) return canonical;
-  const fallback = path.join(dir, "config.yaml");
+  const fallback = pathApi.join(dir, "config.yaml");
   if (existsSync(fallback)) return fallback;
   return canonical;
 }
 
-/** Custom models file (YAML). models.yml canonical, models.yaml fallback. */
-export function getModelsConfigPath(): string {
+/** Host-aware settings path: honors the .yaml fallback on remote hosts too. */
+export async function resolveSettingsPath(): Promise<string> {
+  const host = remoteHost();
+  if (!host) return getSettingsPath();
   const dir = getAgentDir();
-  const canonical = path.join(dir, "models.yml");
+  const canonical = path.posix.join(dir, "config.yml");
+  if (await host.fs.exists(canonical)) return canonical;
+  const fallback = path.posix.join(dir, "config.yaml");
+  if (await host.fs.exists(fallback)) return fallback;
+  return canonical;
+}
+
+/** Custom models file (YAML). models.yml canonical, models.yaml fallback.
+ * On a remote host the fallback probe is skipped (use resolveModelsConfigPath). */
+export function getModelsConfigPath(): string {
+  const pathApi = hostPath();
+  const dir = getAgentDir();
+  const canonical = pathApi.join(dir, "models.yml");
+  if (remoteHost()) return canonical;
   if (existsSync(canonical)) return canonical;
-  const fallback = path.join(dir, "models.yaml");
+  const fallback = pathApi.join(dir, "models.yaml");
   if (existsSync(fallback)) return fallback;
+  return canonical;
+}
+
+/** Host-aware models config path: honors the .yaml fallback on remote hosts too. */
+export async function resolveModelsConfigPath(): Promise<string> {
+  const host = remoteHost();
+  if (!host) return getModelsConfigPath();
+  const dir = getAgentDir();
+  const canonical = path.posix.join(dir, "models.yml");
+  if (await host.fs.exists(canonical)) return canonical;
+  const fallback = path.posix.join(dir, "models.yaml");
+  if (await host.fs.exists(fallback)) return fallback;
   return canonical;
 }
 
 /** User-level skills directory (~/.omp/agent/skills). */
 export function getUserSkillsDir(): string {
-  return path.join(getAgentDir(), "skills");
+  return hostPath().join(getAgentDir(), "skills");
 }
 
 /** Best-effort canonicalization mirroring omp's resolveEquivalentPath: resolve
@@ -178,15 +257,19 @@ function encodeLegacyAbsoluteSessionDirName(cwd: string): string {
  * - otherwise: legacy absolute encoding "--abs-path-dashed--"
  */
 export function getSessionDirNameForCwd(cwd: string): string {
-  const canonicalCwd = canonicalize(path.resolve(cwd));
-  const canonicalHome = canonicalize(homedir());
-  const canonicalTmp = canonicalize(tmpdir());
-  const homeRelative = path.relative(canonicalHome, canonicalCwd);
-  const tempRelative = path.relative(canonicalTmp, canonicalCwd);
-  if (homeRelative === "" || (!homeRelative.startsWith("..") && !path.isAbsolute(homeRelative))) {
+  const remote = remoteHost();
+  // Remote paths cannot be canonicalized locally; omp on the remote resolves
+  // symlinks itself, so the slug is computed from the path as recorded.
+  const pathApi = remote ? path.posix : path;
+  const canonicalCwd = remote ? pathApi.resolve(cwd) : canonicalize(path.resolve(cwd));
+  const canonicalHome = remote ? hostHomedir() : canonicalize(homedir());
+  const canonicalTmp = remote ? hostTmpdir() : canonicalize(tmpdir());
+  const homeRelative = pathApi.relative(canonicalHome, canonicalCwd);
+  const tempRelative = pathApi.relative(canonicalTmp, canonicalCwd);
+  if (homeRelative === "" || (!homeRelative.startsWith("..") && !pathApi.isAbsolute(homeRelative))) {
     return encodeRelativeSessionDirName("-", homeRelative);
   }
-  if (tempRelative === "" || (!tempRelative.startsWith("..") && !path.isAbsolute(tempRelative))) {
+  if (tempRelative === "" || (!tempRelative.startsWith("..") && !pathApi.isAbsolute(tempRelative))) {
     return encodeRelativeSessionDirName("-tmp", tempRelative);
   }
   return encodeLegacyAbsoluteSessionDirName(canonicalCwd);
@@ -194,11 +277,38 @@ export function getSessionDirNameForCwd(cwd: string): string {
 
 /** User-level agents directory (~/.omp/agent/agents). */
 export function getUserAgentsDir(): string {
-  return path.join(getAgentDir(), "agents");
+  return hostPath().join(getAgentDir(), "agents");
 }
 
-/** Project-level agents directory (./.omp/agents at git root, or cwd fallback). */
+/** Host-aware project agents dir: walks up to the nearest .omp/agents or git
+ * root on the current host. */
+export async function resolveProjectAgentsDir(cwd: string): Promise<string> {
+  const host = remoteHost();
+  if (!host) return getProjectAgentsDir(cwd);
+  const pathApi = path.posix;
+  let current = pathApi.resolve(cwd);
+  const home = hostHomedir();
+  while (true) {
+    const candidate = pathApi.join(current, ".omp", "agents");
+    try {
+      if ((await host.fs.stat(candidate)).isDirectory()) return candidate;
+    } catch {
+      // Keep walking until the nearest project boundary.
+    }
+    if (await host.fs.exists(pathApi.join(current, ".git"))) return candidate;
+    if (current === home) break;
+    const parent = pathApi.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return pathApi.join(pathApi.resolve(cwd), ".omp", "agents");
+}
+
+/** Project-level agents directory (./.omp/agents at git root, or cwd fallback).
+ * Local-only synchronous walk; remote hosts get the cwd-based fallback (use
+ * resolveProjectAgentsDir for an accurate answer). */
 export function getProjectAgentsDir(cwd: string): string {
+  if (remoteHost()) return path.posix.join(path.posix.resolve(cwd), ".omp", "agents");
   let current = path.resolve(cwd);
   const home = homedir();
   while (true) {

@@ -7,10 +7,16 @@
 // `results: SingleResult[]` snapshots, so the roster can be recovered after a
 // page reload without the live RPC registry (get_subagent_messages is
 // registry-gated and rejects unknown session files).
+//
+// Every read goes through the session host's filesystem boundary: nothing is
+// mirrored locally, reads are bounded, and remote lookups are batched so a
+// roster costs one directory listing rather than one probe per agent.
 
-import { closeSync, existsSync, openSync, readSync, realpathSync, statSync } from "fs";
-import { basename, dirname, join } from "path";
+import { open } from "fs/promises";
+import { currentHost } from "./hosts/context";
+import type { Host } from "./hosts/registry";
 import { getSessionEntries, entryToUiMessage } from "./session-reader";
+import { hostPath } from "./omp/paths";
 import { parseJsonlLenient } from "./omp/session-files";
 import { parseSubagentProgress } from "./subagent-types";
 import type { SubagentHistoryEntry, SubagentHistoryResult, SubagentAgentSource } from "./subagent-types";
@@ -18,14 +24,16 @@ import type { AgentMessage, SessionEntry } from "./types";
 import { asNumber, asString, isRecord } from "./type-guards";
 import { taskResultStructuredOutput, taskResultUsageCost } from "./task-result-details";
 
-/** Sibling artifacts directory for a parent session file. */
+/** Sibling artifacts directory for a parent session file (a path on the
+ * session's host: POSIX joins for remote hosts). */
 export function siblingDirForSession(sessionFilePath: string): string {
-  return join(dirname(sessionFilePath), basename(sessionFilePath, ".jsonl"));
+  const pathApi = hostPath();
+  return pathApi.join(pathApi.dirname(sessionFilePath), pathApi.basename(sessionFilePath, ".jsonl"));
 }
 
 /** Subagent transcript path for a roster id within a parent session. */
 export function subagentTranscriptPath(sessionFilePath: string, subagentId: string): string {
-  return join(siblingDirForSession(sessionFilePath), `${subagentId}.jsonl`);
+  return hostPath().join(siblingDirForSession(sessionFilePath), `${subagentId}.jsonl`);
 }
 
 /**
@@ -34,27 +42,27 @@ export function subagentTranscriptPath(sessionFilePath: string, subagentId: stri
  * the candidate's REAL path must land directly inside the REAL artifacts dir
  * and be a regular file. Returns the real path (readable target) or null.
  */
-export function resolveSubagentArtifact(
+export async function resolveSubagentArtifact(
   sessionFilePath: string,
   subagentId: string,
   extension: ".jsonl" | ".md",
-): string | null {
+  host: Host = currentHost(),
+): Promise<string | null> {
+  const pathApi = host.pathApi;
+  const dir = siblingDirForSession(sessionFilePath);
+  const candidate = pathApi.join(dir, `${subagentId}${extension}`);
+  // Both realpaths are independent; resolving them together halves the
+  // round trips on a remote host.
   let realDir: string;
-  try {
-    realDir = realpathSync(siblingDirForSession(sessionFilePath));
-  } catch {
-    return null;
-  }
-  const candidate = join(realDir, `${subagentId}${extension}`);
   let realCandidate: string;
   try {
-    realCandidate = realpathSync(candidate);
+    [realDir, realCandidate] = await Promise.all([host.fs.realpath(dir), host.fs.realpath(candidate)]);
   } catch {
     return null;
   }
-  if (dirname(realCandidate) !== realDir) return null;
+  if (pathApi.dirname(realCandidate) !== realDir) return null;
   try {
-    if (!statSync(realCandidate).isFile()) return null;
+    if (!(await host.fs.stat(realCandidate)).isFile()) return null;
   } catch {
     return null;
   }
@@ -98,10 +106,10 @@ function progressUpsertBlocked(existing: SubagentHistoryEntry): boolean {
  * toolResults, merging `progress` (live-snapshot fields) with `results`
  * (settled per-subagent telemetry), then resolves sibling transcript files.
  */
-export function extractSubagentHistory(sessionFilePath: string): SubagentHistoryEntry[] {
+export async function extractSubagentHistory(sessionFilePath: string, host: Host = currentHost()): Promise<SubagentHistoryEntry[]> {
   let entries: SessionEntry[];
   try {
-    entries = getSessionEntries(sessionFilePath);
+    entries = await getSessionEntries(sessionFilePath, host);
   } catch {
     return [];
   }
@@ -277,22 +285,24 @@ export function extractSubagentHistory(sessionFilePath: string): SubagentHistory
       }
     }
   }
-  // Resolve sibling transcript files and detached markers.
+  // Resolve sibling transcript files and detached markers. One directory
+  // listing answers every "does <id>.jsonl exist" question (a per-agent
+  // exists() probe would be one ssh round trip each on a remote host).
   const dir = siblingDirForSession(sessionFilePath);
+  const transcripts = await listTranscriptNames(dir, host);
   const roster = [...byId.values()];
   for (const entry of roster) {
     // The client cannot derive this: neither a live snapshot nor a partial
     // history fetch reveals which call came first.
     entry.batchSeq = batchSeqById.get(entry.id) ?? 0;
     if (detachedIds.has(entry.id)) entry.detached = true;
-    if (!SUBAGENT_ID_RE.test(entry.id)) continue;
-    const candidate = join(dir, `${entry.id}.jsonl`);
     // Guard against crafted ids probing outside sibling dir (e.g. "../../");
     // route already validates via SUBAGENT_ID_RE + realpath, but roster path is
     // derived from untrusted session content.
-    const available = existsSync(candidate);
-    if (available) {
-      entry.sessionFile = candidate;
+    if (!SUBAGENT_ID_RE.test(entry.id)) continue;
+    const fileName = `${entry.id}.jsonl`;
+    if (transcripts.has(fileName)) {
+      entry.sessionFile = host.pathApi.join(dir, fileName);
       entry.transcriptAvailable = true;
     }
   }
@@ -301,6 +311,18 @@ export function extractSubagentHistory(sessionFilePath: string): SubagentHistory
     || a.index - b.index
     || a.id.localeCompare(b.id)
   );
+}
+
+/** Regular `.jsonl` files directly inside the artifacts dir (empty when the
+ * directory does not exist yet). Symlinked transcripts are listed too — the
+ * route confines them through resolveSubagentArtifact before reading. */
+async function listTranscriptNames(dir: string, host: Host): Promise<Set<string>> {
+  try {
+    const entries = await host.fs.readdir(dir);
+    return new Set(entries.filter((entry) => entry.name.endsWith(".jsonl") && (entry.isFile() || entry.targetType === "file")).map((entry) => entry.name));
+  } catch {
+    return new Set();
+  }
 }
 
 /** Cap on transcript bytes materialized for the dialog (files are small). */
@@ -322,11 +344,71 @@ export interface SubagentTranscriptPage {
   totalBytes?: number;
 }
 
+interface ByteWindow {
+  size: number;
+  bytes: Buffer;
+}
+
+// Size line first, then the window itself. `tail -c +N` is 1-based and
+// portable across GNU and BSD; `head -c` stops at EOF, so a window past the
+// end is simply empty.
+const REMOTE_WINDOW_SCRIPT = [
+  'f="$1"; from="$2"; len="$3"',
+  '[ -f "$f" ] || exit 2',
+  'sz=$(wc -c < "$f" 2>/dev/null | tr -d " ") || exit 2',
+  'printf "%s\n" "$sz"',
+  '[ "$len" -gt 0 ] || exit 0',
+  'tail -c +$((from + 1)) -- "$f" | head -c "$len"',
+].join("\n");
+
+/**
+ * Positional read of `[from, from + length)` plus the file size, in ONE round
+ * trip on a remote host. The HostFs interface has no positional read (prefix
+ * and suffix windows only), so the local host uses a file handle directly:
+ * re-reading from byte 0 on every page would make a pagination walk O(n²).
+ * Returns null when the file is missing or unreadable.
+ */
+async function readByteWindow(filePath: string, from: number, length: number, host: Host): Promise<ByteWindow | null> {
+  if (!host.isLocal) {
+    let stdout: Buffer;
+    try {
+      ({ stdout } = await host.executor.exec(["sh", "-c", REMOTE_WINDOW_SCRIPT, "sh", filePath, String(from), String(length)], {
+        maxBuffer: length + 64,
+        timeoutMs: 5 * 60_000,
+      }));
+    } catch {
+      return null;
+    }
+    const newline = stdout.indexOf(0x0a);
+    if (newline === -1) return null;
+    const size = Number.parseInt(stdout.subarray(0, newline).toString("utf8"), 10);
+    if (!Number.isFinite(size)) return null;
+    return { size, bytes: stdout.subarray(newline + 1) };
+  }
+  let handle: Awaited<ReturnType<typeof open>>;
+  try {
+    handle = await open(filePath, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const size = (await handle.stat()).size;
+    const windowBytes = Math.max(0, Math.min(length, size - from));
+    const buffer = Buffer.alloc(windowBytes);
+    const bytesRead = windowBytes > 0 ? (await handle.read(buffer, 0, windowBytes, from)).bytesRead : 0;
+    return { size, bytes: buffer.subarray(0, bytesRead) };
+  } catch {
+    return null;
+  } finally {
+    await handle.close();
+  }
+}
+
 /**
  * Byte-window transcript paging mirroring omp's readRpcSubagentTranscript:
  * parse complete lines from `fromByte`, return UI messages + nextByte.
  */
-export function readSubagentTranscriptPage(sessionFilePath: string, fromByte = 0): SubagentTranscriptPage {
+export async function readSubagentTranscriptPage(sessionFilePath: string, fromByte = 0, host: Host = currentHost()): Promise<SubagentTranscriptPage> {
   const empty: SubagentTranscriptPage = {
     sessionFile: sessionFilePath,
     fromByte: typeof fromByte === "number" && Number.isFinite(fromByte) ? Math.max(0, Math.trunc(fromByte)) : 0,
@@ -334,41 +416,28 @@ export function readSubagentTranscriptPage(sessionFilePath: string, fromByte = 0
     reset: false,
     messages: [],
   };
-  let size: number;
-  try {
-    size = statSync(sessionFilePath).size;
-  } catch {
-    return empty;
-  }
   let startByte = empty.fromByte;
   let reset = false;
+  // Positional read of just this page's window — materializing the whole
+  // file to slice one window made a pagination walk O(n²) in I/O.
+  let window = await readByteWindow(sessionFilePath, startByte, SUBAGENT_TRANSCRIPT_PAGE_BYTES, host);
+  if (!window) return empty;
+  const size = window.size;
   if (startByte > size) {
+    // The client's offset outlived a rewrite/truncation: restart from the top.
     startByte = 0;
     reset = true;
+    window = await readByteWindow(sessionFilePath, 0, SUBAGENT_TRANSCRIPT_PAGE_BYTES, host);
+    if (!window) return { ...empty, fromByte: 0, nextByte: 0, reset };
   }
   if (size > MAX_SUBAGENT_TRANSCRIPT_BYTES) {
     return { ...empty, fromByte: startByte, nextByte: startByte, reset, error: "Subagent transcript exceeds the readable size limit" };
   }
   const endByte = Math.min(size, startByte + SUBAGENT_TRANSCRIPT_PAGE_BYTES);
-  let body: string;
-  try {
-    // Positional read of just this page's window — materializing the whole
-    // file to slice one window made a pagination walk O(n²) in I/O.
-    // Slice the BYTE buffer, not the decoded string: `startByte` is a UTF-8
-    // offset, while string indices are UTF-16 code units — slicing the string
-    // misaligns every later page once non-ASCII text precedes the offset.
-    const fd = openSync(sessionFilePath, "r");
-    try {
-      const windowBytes = endByte - startByte;
-      const buffer = Buffer.alloc(windowBytes);
-      const bytesRead = readSync(fd, buffer, 0, windowBytes, startByte);
-      body = buffer.subarray(0, bytesRead).toString("utf8");
-    } finally {
-      closeSync(fd);
-    }
-  } catch {
-    return { ...empty, fromByte: startByte, nextByte: startByte, reset };
-  }
+  // Slice the BYTE buffer, not the decoded string: `startByte` is a UTF-8
+  // offset, while string indices are UTF-16 code units — slicing the string
+  // misaligns every later page once non-ASCII text precedes the offset.
+  const body = window.bytes.subarray(0, Math.max(0, endByte - startByte)).toString("utf8");
   const lastNewline = body.lastIndexOf("\n");
   const completeText = lastNewline >= 0 ? body.slice(0, lastNewline + 1) : "";
   const entries = completeText.length > 0 ? parseJsonlLenient<SessionEntry>(completeText) : [];
@@ -387,53 +456,43 @@ export function readSubagentTranscriptPage(sessionFilePath: string, fromByte = 0
 export const MAX_SUBAGENT_COMPLETION_BYTES = 1024 * 1024;
 
 /**
- * Read a subagent's final output — the `<id>.md` sibling artifact omp writes
- * when the task settles. Returns null when no output file exists yet (still
- * running, aborted before producing output, or the session predates it).
- * Output files can exceed the transcript cap, so the read is bounded.
- */
-/**
  * Read a subagent's final output artifact (`<id>.md`) from an ALREADY-RESOLVED
  * path (the route confines via resolveSubagentArtifact first — reading the raw
  * derived path here would reopen a symlink swapped after the check). Reads at
- * most MAX_SUBAGENT_COMPLETION_BYTES bytes, trimming a trailing incomplete
- * UTF-8 sequence before decoding.
+ * most MAX_SUBAGENT_COMPLETION_BYTES bytes in one round trip (size + prefix
+ * window), trimming a trailing incomplete UTF-8 sequence before decoding.
+ * Returns null when no output file exists yet (still running, aborted before
+ * producing output, or the session predates it) or it is empty.
  */
-export function readCompletionArtifact(
+export async function readCompletionArtifact(
   outputFile: string,
-): { completion: string; truncated: boolean } | null {
-  let size: number;
+  host: Host = currentHost(),
+): Promise<{ completion: string; truncated: boolean } | null> {
+  let slices: Awaited<ReturnType<Host["fs"]["readSlices"]>>;
   try {
-    size = statSync(outputFile).size;
+    slices = await host.fs.readSlices([outputFile], MAX_SUBAGENT_COMPLETION_BYTES, 0);
   } catch {
     return null;
   }
-  if (size <= 0) return null;
-  const truncated = size > MAX_SUBAGENT_COMPLETION_BYTES;
-  const readBytes = Math.min(size, MAX_SUBAGENT_COMPLETION_BYTES);
-  const fd = openSync(outputFile, "r");
-  try {
-    const buffer = Buffer.alloc(readBytes);
-    const bytesRead = readSync(fd, buffer, 0, readBytes, 0);
-    const slice = buffer.subarray(0, bytesRead);
-    // Trim a trailing INCOMPLETE UTF-8 sequence before decoding. A complete
-    // multibyte char may also end in continuation bytes, so walk back over the
-    // trailing continuations to the lead and keep the char only when its full
-    // width fits inside the buffer.
-    let end = slice.length;
-    let trailing = 0;
-    while (end - trailing > 0 && (slice[end - 1 - trailing] & 0xc0) === 0x80) trailing += 1;
-    const leadPos = end - 1 - trailing;
-    if (leadPos >= 0) {
-      const lead = slice[leadPos];
-      const need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
-      if (leadPos + need > slice.length) end = leadPos;
-    } else {
-      // Continuation bytes with no lead at the tail — garbage.
-      end = 0;
-    }
-    return { completion: slice.subarray(0, end).toString("utf8"), truncated };
-  } finally {
-    closeSync(fd);
+  const slice = slices.get(outputFile);
+  if (!slice || slice.size <= 0) return null;
+  const truncated = slice.size > MAX_SUBAGENT_COMPLETION_BYTES;
+  const buffer = slice.prefix.subarray(0, MAX_SUBAGENT_COMPLETION_BYTES);
+  // Trim a trailing INCOMPLETE UTF-8 sequence before decoding. A complete
+  // multibyte char may also end in continuation bytes, so walk back over the
+  // trailing continuations to the lead and keep the char only when its full
+  // width fits inside the buffer.
+  let end = buffer.length;
+  let trailing = 0;
+  while (end - trailing > 0 && (buffer[end - 1 - trailing] & 0xc0) === 0x80) trailing += 1;
+  const leadPos = end - 1 - trailing;
+  if (leadPos >= 0) {
+    const lead = buffer[leadPos];
+    const need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+    if (leadPos + need > buffer.length) end = leadPos;
+  } else {
+    // Continuation bytes with no lead at the tail — garbage.
+    end = 0;
   }
+  return { completion: buffer.subarray(0, end).toString("utf8"), truncated };
 }

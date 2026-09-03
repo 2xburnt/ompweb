@@ -1,16 +1,18 @@
-import { realpathSync } from "fs";
-import { homedir } from "os";
-import { isAbsolute, resolve } from "path";
 import { NextResponse } from "next/server";
 import { apiErrorResponse } from "@/lib/api-utils";
 import { comparableProjectPath } from "@/lib/comparable-path";
 import { allowFileRoot } from "@/lib/file-access";
+import { currentHost } from "@/lib/hosts/context";
+import type { Host } from "@/lib/hosts/registry";
+import { withHostRoute } from "@/lib/hosts/route";
+import { hostProjectKey } from "@/lib/paths";
 import {
   hideProject,
-  loadProjectRegistry,
   mergeProjects,
+  normalizeProjectCwd,
   ProjectPathError,
-  saveProjectRegistry,
+  readProjectRegistry,
+  saveProjectRegistryOnHost,
   upsertProject,
   updateProjectsPresentation,
   validateProjectPath,
@@ -19,55 +21,70 @@ import { listAllSessions } from "@/lib/session-reader";
 import { resolveProject } from "@/lib/worktree";
 import type { ManagedProject } from "@/lib/types";
 
-// GET /api/projects  →  { projects: ManagedProject[] }
-// Registered (non-hidden) projects plus session-discovered projects, excluding
-// hidden entries. Session-discovered paths get no addedAt; the client orders
-// the merged list by most-recently-added (registration order), then by path —
-// deliberately not by session activity, which would reorder rows on refresh.
-export async function GET() {
+// Every handler here is scoped to one host (`?host=<id>` / x-omp-host, default
+// host otherwise): the registry lives in that host's omp agent dir, session
+// discovery only considers that host's sessions, and every returned project
+// carries the host-scoped `projectKey` the session list uses.
+
+type HostProject = ManagedProject & { projectKey: string; host: string };
+
+function withProjectKey(host: Host, project: ManagedProject): HostProject {
+  return { ...project, projectKey: hostProjectKey(host.id, project.path), host: host.id };
+}
+
+// GET /api/projects[?host=<id>]  →  { projects: HostProject[], host }
+// Registered (non-hidden) projects plus session-discovered projects of the
+// selected host, excluding hidden entries. Session-discovered paths get no
+// addedAt; the client orders the merged list by most-recently-added
+// (registration order), then by path — deliberately not by session activity,
+// which would reorder rows on refresh.
+export const GET = withHostRoute(async () => {
   try {
-    const registry = loadProjectRegistry();
-    const sessions = await listAllSessions();
+    const host = currentHost();
+    const [registry, sessions] = await Promise.all([readProjectRegistry(host), listAllSessions()]);
     const discovered = sessions
+      .filter((s) => s.host === host.id)
       .map((s) => s.projectRoot ?? s.cwd)
       .filter((path): path is string => Boolean(path));
     const projects = mergeProjects(registry, discovered);
     // Keep the in-memory browse allowlist warm for registered projects that
     // have no sessions (the in-memory list does not survive restarts, and an
     // empty managed project derives no root from sessions).
-    for (const project of projects) allowFileRoot(project.path);
-    return NextResponse.json({ projects });
+    for (const project of projects) allowFileRoot(project.path, host);
+    return NextResponse.json({ projects: projects.map((project) => withProjectKey(host, project)), host: host.id });
   } catch (error) {
     return apiErrorResponse(error);
   }
-}
+});
 
-// POST /api/projects  body: { cwd }  →  { project: ManagedProject }
-// Validates the directory, resolves Git worktrees to their main projectRoot,
-// registers and authorizes it, and unhides it if it was previously hidden.
-export async function POST(req: Request) {
+// POST /api/projects[?host=<id>]  body: { cwd }  →  { project: HostProject }
+// Validates the directory on the host, resolves Git worktrees to their main
+// projectRoot, registers and authorizes it, and unhides it if it was
+// previously hidden.
+export const POST = withHostRoute(async (req: Request) => {
   try {
+    const host = currentHost();
     const body = await req.json() as { cwd?: unknown };
     const cwd = typeof body.cwd === "string" ? body.cwd : "";
-    const normalized = validateProjectPath(cwd);
-    const { projectRoot } = await resolveProject(normalized);
+    const normalized = await validateProjectPath(cwd, host);
+    const { projectRoot } = await resolveProject(normalized, host);
 
-    const registry = loadProjectRegistry();
+    const registry = await readProjectRegistry(host);
     const next = upsertProject(registry, projectRoot);
-    saveProjectRegistry(next);
-    allowFileRoot(projectRoot);
+    await saveProjectRegistryOnHost(next, host);
+    allowFileRoot(projectRoot, host);
 
     const entry = next.projects.find((p) => comparableProjectPath(p.path) === comparableProjectPath(projectRoot))!;
-    return NextResponse.json({ project: { path: entry.path, addedAt: entry.addedAt } satisfies ManagedProject });
+    return NextResponse.json({ project: withProjectKey(host, { path: entry.path, addedAt: entry.addedAt }) });
   } catch (error) {
     if (error instanceof ProjectPathError) {
       return NextResponse.json({ error: error.message, code: error.code }, { status: 400 });
     }
     return apiErrorResponse(error);
   }
-}
+});
 
-// PATCH /api/projects
+// PATCH /api/projects[?host=<id>]
 // Single shape: { cwd, alias?, sortOrder? }   Batch shape: { updates: [{ cwd, alias?, sortOrder? }, ...] }
 // Applied atomically in one registry load/save so a drag reorder (one request,
 // many entries) can never interleave with another writer and lose updates.
@@ -76,8 +93,9 @@ export async function POST(req: Request) {
 // same cycle instead of silently no-oping.
 const MAX_PRESENTATION_UPDATES = 500;
 
-export async function PATCH(req: Request) {
+export const PATCH = withHostRoute(async (req: Request) => {
   try {
+    const host = currentHost();
     const body = await req.json() as {
       cwd?: unknown;
       alias?: unknown;
@@ -100,15 +118,27 @@ export async function PATCH(req: Request) {
     // deleted" (allow reorder/alias) from "session-discovered ghost" (must not
     // auto-register a deleted path). validateProjectPath is still required for
     // the latter.
-    const earlyRegistry = loadProjectRegistry();
-    const isAlreadyManaged = (cwd: string): string | null => {
-      // Cheap check without stat: resolve ~ and relative, then compare.
-      // Mirrors validateProjectPath's normalizeCwd + canonicalProjectPath fallback.
-      let probe = cwd.trim();
-      if (probe === "~") probe = homedir();
-      else if (probe.startsWith("~/")) probe = resolve(homedir(), probe.slice(2));
-      else if (!isAbsolute(probe)) probe = resolve(probe);
-      try { probe = realpathSync(probe); } catch { /* deleted dirs fall back to resolved */ }
+    const earlyRegistry = await readProjectRegistry(host);
+    // Cheap probe without stat: resolve ~ and relative, then compare. Mirrors
+    // validateProjectPath's normalizeProjectCwd + canonicalProjectPath
+    // fallback. The local machine resolves symlinks (one batch of parallel
+    // syscalls); a remote path is used as-is — its registry entries were
+    // written from git-resolved roots, so no per-path round trip is needed.
+    const probes = await Promise.all(rawUpdates.map(async (item) => {
+      const entry = item as { cwd?: unknown };
+      const cwd = typeof entry.cwd === "string" ? entry.cwd.trim() : "";
+      if (!cwd) return null;
+      const probe = normalizeProjectCwd(cwd);
+      if (!host.isLocal) return probe;
+      try {
+        return await host.fs.realpath(probe);
+      } catch {
+        return probe; // deleted dirs fall back to the resolved form
+      }
+    }));
+    const isAlreadyManaged = (index: number): string | null => {
+      const probe = probes[index];
+      if (!probe) return null;
       const key = comparableProjectPath(probe);
       const match = earlyRegistry.projects.find((p) => comparableProjectPath(p.path) === key);
       return match ? match.path : null;
@@ -116,7 +146,7 @@ export async function PATCH(req: Request) {
 
     const parsed: Array<{ path: string; alias?: string | null; sortOrder?: number | null }> = [];
     const skipped: Array<{ cwd: string; code: string; error: string }> = [];
-    for (const item of rawUpdates) {
+    for (const [index, item] of rawUpdates.entries()) {
       const entry = item as { cwd?: unknown; alias?: unknown; sortOrder?: unknown };
       const cwd = typeof entry.cwd === "string" ? entry.cwd.trim() : "";
       if (!cwd) return NextResponse.json({ error: "Path is required", code: "path_required" }, { status: 400 });
@@ -131,14 +161,14 @@ export async function PATCH(req: Request) {
       // on disk) must not abort the entire batch — skip it instead.
       // Already-managed projects bypass the check so a user's explicitly added
       // workspace stays reorderable/renamable even after its directory is removed.
-      const managedPath = isAlreadyManaged(cwd);
+      const managedPath = isAlreadyManaged(index);
       if (managedPath) {
         parsed.push({ path: managedPath, alias, sortOrder });
         continue;
       }
       let normalized: string;
       try {
-        normalized = validateProjectPath(cwd);
+        normalized = await validateProjectPath(cwd, host);
       } catch (error) {
         if (error instanceof ProjectPathError) {
           if (rawUpdates.length > 1) {
@@ -151,7 +181,7 @@ export async function PATCH(req: Request) {
       }
       let projectRoot: string;
       try {
-        ({ projectRoot } = await resolveProject(normalized));
+        ({ projectRoot } = await resolveProject(normalized, host));
       } catch (error) {
         if (rawUpdates.length > 1) {
           const message = error instanceof Error ? error.message : String(error);
@@ -182,7 +212,7 @@ export async function PATCH(req: Request) {
       } : update);
     }
 
-    let registry = loadProjectRegistry();
+    let registry = await readProjectRegistry(host);
     const newRoots: string[] = [];
     for (const update of merged.values()) {
       const key = comparableProjectPath(update.path);
@@ -198,35 +228,36 @@ export async function PATCH(req: Request) {
       return !entry?.hidden;
     });
     const next = updateProjectsPresentation(registry, updates);
-    saveProjectRegistry(next);
+    await saveProjectRegistryOnHost(next, host);
     // Only after a successful save: a failed write must not leave an orphaned
     // in-memory browse authorization behind.
-    for (const root of newRoots) allowFileRoot(root);
+    for (const root of newRoots) allowFileRoot(root, host);
 
     const updatedKeys = new Set(updates.map((update) => comparableProjectPath(update.path)));
     const projects = next.projects
       .filter((entry) => updatedKeys.has(comparableProjectPath(entry.path)))
-      .map((entry) => ({ path: entry.path, addedAt: entry.addedAt, hidden: entry.hidden, alias: entry.alias, sortOrder: entry.sortOrder }));
-    return NextResponse.json({ projects });
+      .map((entry) => ({ ...withProjectKey(host, { path: entry.path, addedAt: entry.addedAt, alias: entry.alias, sortOrder: entry.sortOrder }), hidden: entry.hidden }));
+    return NextResponse.json({ projects, host: host.id });
   } catch (error) { return apiErrorResponse(error); }
-}
+});
 
-// DELETE /api/projects  body: { cwd }  →  { success: true }
+// DELETE /api/projects[?host=<id>]  body: { cwd }  →  { success: true }
 // Hides the project from the sidebar without touching its directory or
 // sessions. Re-adding the directory (POST) restores it.
-export async function DELETE(req: Request) {
+export const DELETE = withHostRoute(async (req: Request) => {
   try {
+    const host = currentHost();
     const body = await req.json() as { cwd?: unknown };
     const cwd = typeof body.cwd === "string" ? body.cwd.trim() : "";
     if (!cwd) {
       return NextResponse.json({ error: "Path is required", code: "path_required" }, { status: 400 });
     }
     // Canonicalize worktree paths so hiding a worktree hides its whole project.
-    const { projectRoot } = await resolveProject(cwd);
-    const registry = loadProjectRegistry();
-    saveProjectRegistry(hideProject(registry, projectRoot));
+    const { projectRoot } = await resolveProject(cwd, host);
+    const registry = await readProjectRegistry(host);
+    await saveProjectRegistryOnHost(hideProject(registry, projectRoot), host);
     return NextResponse.json({ success: true });
   } catch (error) {
     return apiErrorResponse(error);
   }
-}
+});

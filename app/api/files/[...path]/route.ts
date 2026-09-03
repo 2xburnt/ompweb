@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
+import type { ChildProcessWithoutNullStreams } from "child_process";
+// Local-only: fs.watch keeps the inotify/FSEvents-based watcher for the local
+// machine; remote hosts are polled through the host fs (see pollRemoteFile).
+import { watch as fsWatch, type FSWatcher } from "fs";
 import { apiErrorResponse } from "@/lib/api-utils";
 import { getContentDisposition } from "@/lib/content-disposition";
-import fs from "fs";
-import path from "path";
 import {
   getAllowedFileRoots,
   isExistingFilePathAllowed,
@@ -29,6 +31,11 @@ import {
   validateUploadFileNames,
 } from "@/lib/file-upload";
 import { parseFormDataWithinLimit, parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
+import { currentHost } from "@/lib/hosts/context";
+import type { FileStat } from "@/lib/hosts/executor";
+import type { Host } from "@/lib/hosts/registry";
+import { withHostRoute } from "@/lib/hosts/route";
+import { hostPath } from "@/lib/omp/paths";
 
 const IGNORED_NAMES = new Set([
   "node_modules", ".git", ".next", "dist", "build", "__pycache__",
@@ -46,6 +53,10 @@ const MAX_UPLOAD_TOTAL_BYTES = 100 * 1024 * 1024;
 // Multipart boundaries and headers are not file bytes, but must be bounded too.
 const MAX_UPLOAD_REQUEST_BYTES = MAX_UPLOAD_TOTAL_BYTES + 1024 * 1024;
 const MAX_UPLOAD_CHECK_REQUEST_BYTES = 1024 * 1024;
+/** Remote `watch`: stat poll interval and the bound after which the stream
+ * closes (EventSource reconnects, so a long-open viewer keeps working). */
+const REMOTE_WATCH_POLL_MS = 2_000;
+const REMOTE_WATCH_MAX_MS = 10 * 60_000;
 
 const EXT_TO_LANGUAGE: Record<string, string> = {
   ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript",
@@ -63,7 +74,7 @@ const EXT_TO_LANGUAGE: Record<string, string> = {
 };
 
 function getLanguage(filePath: string): string {
-  const base = path.basename(filePath).toLowerCase();
+  const base = hostPath().basename(filePath).toLowerCase();
   // Special full-name matches
   if (base === "dockerfile" || base.startsWith("dockerfile.")) return "dockerfile";
   if (base === ".env" || base.startsWith(".env.")) return "bash";
@@ -83,18 +94,18 @@ function parseFileRequestType(value: string): FileRequestType | null {
   return FILE_REQUEST_TYPE_SET.has(value) ? (value as FileRequestType) : null;
 }
 
-async function getUploadDirectory(segments: string[]): Promise<
+async function getUploadDirectory(segments: string[], host: Host): Promise<
   { directory: string } | { response: NextResponse }
 > {
   const directory = filePathFromSegments(segments);
-  const allowedRoots = await getAllowedFileRoots();
+  const allowedRoots = await getAllowedFileRoots(host);
   if (!isFilePathAllowed(directory, allowedRoots)) {
     return { response: NextResponse.json({ error: "Access denied", code: "access_denied" }, { status: 403 }) };
   }
 
-  let stat: fs.Stats;
+  let stat: FileStat;
   try {
-    stat = fs.statSync(directory);
+    stat = await host.fs.stat(directory);
   } catch {
     return { response: NextResponse.json({ error: "Upload directory not found", code: "upload_directory_not_found" }, { status: 404 }) };
   }
@@ -102,18 +113,16 @@ async function getUploadDirectory(segments: string[]): Promise<
     return { response: NextResponse.json({ error: "Upload target is not a directory", code: "upload_target_not_directory" }, { status: 400 }) };
   }
 
-  // A browsable directory can be a symlink. Resolve both sides before writes
-  // so a symlink inside an allowed root cannot redirect uploads outside it.
-  const realDirectory = fs.realpathSync(directory);
-  const realRoots = new Set<string>();
-  for (const root of allowedRoots) {
-    try {
-      realRoots.add(fs.realpathSync(root));
-    } catch {
-      // Ignore stale session roots that no longer exist.
-    }
+  // A browsable directory can be a symlink. Resolve both sides on the host
+  // before writes so a symlink inside an allowed root cannot redirect uploads
+  // outside it.
+  let realDirectory: string;
+  try {
+    realDirectory = await host.fs.realpath(directory);
+  } catch {
+    return { response: NextResponse.json({ error: "Upload directory not found", code: "upload_directory_not_found" }, { status: 404 }) };
   }
-  if (!isFilePathAllowed(realDirectory, realRoots)) {
+  if (!(await isExistingFilePathAllowed(realDirectory, allowedRoots, host))) {
     return { response: NextResponse.json({ error: "Access denied", code: "access_denied" }, { status: 403 }) };
   }
 
@@ -125,13 +134,15 @@ function parseUploadFileNames(value: unknown): string[] | null {
   return value;
 }
 
-export async function POST(
+// POST /api/files/<dir>?type=upload-check|upload[&conflict=error|overwrite|skip][&host=<id>]
+export const POST = withHostRoute(async (
   request: NextRequest,
-  { params }: { params: Promise<{ path: string[] }> }
-) {
+  { params }: { params: Promise<{ path: string[] }> },
+) => {
   try {
+    const host = currentHost();
     const { path: segments } = await params;
-    const uploadDirectory = await getUploadDirectory(segments);
+    const uploadDirectory = await getUploadDirectory(segments, host);
     if ("response" in uploadDirectory) return uploadDirectory.response;
     const { directory } = uploadDirectory;
     const type = request.nextUrl.searchParams.get("type") ?? "upload";
@@ -148,11 +159,11 @@ export async function POST(
       if (!fileNames) {
         return NextResponse.json({ error: "fileNames must be an array of strings", code: "invalid_file_names" }, { status: 400 });
       }
-      const validationError = validateUploadFileNames(fileNames);
+      const validationError = validateUploadFileNames(fileNames, host);
       if (validationError) {
         return NextResponse.json({ error: validationError }, { status: 400 });
       }
-      return NextResponse.json(inspectUploadTargets(directory, fileNames));
+      return NextResponse.json(await inspectUploadTargets(directory, fileNames, host));
     }
 
     if (type !== "upload") {
@@ -181,12 +192,13 @@ export async function POST(
       return NextResponse.json({ error: "Uploads must total 100MB or less", code: "upload_total_too_large" }, { status: 413 });
     }
     const fileNames = files.map((file) => file.name);
-    const validationError = validateUploadFileNames(fileNames);
+    const validationError = validateUploadFileNames(fileNames, host);
     if (validationError) {
       return NextResponse.json({ error: validationError }, { status: 400 });
     }
 
-    const inspection = inspectUploadTargets(directory, fileNames);
+    // One pass over every target (a single round trip on a remote host).
+    const inspection = await inspectUploadTargets(directory, fileNames, host);
     if (strategy === "error" && inspection.conflicts.length > 0) {
       return NextResponse.json({
         error: "One or more files already exist",
@@ -206,7 +218,7 @@ export async function POST(
     };
 
     for (const file of files) {
-      const destination = path.join(directory, file.name);
+      const destination = host.pathApi.join(directory, file.name);
       if (conflictSet.has(file.name) && strategy === "skip") {
         skipped.push(file.name);
         continue;
@@ -224,17 +236,11 @@ export async function POST(
         continue;
       }
 
-      if (conflictSet.has(file.name)) {
-        try {
-          fs.unlinkSync(destination);
-        } catch (error) {
-          recordError(file, error);
-          continue;
-        }
-      }
-
       try {
-        fs.writeFileSync(destination, bytes, { flag: "wx" });
+        // host.fs.writeFile is temp-file + rename on every executor: an
+        // overwrite never leaves a half-written file behind, and a new file
+        // appears all at once (no separate unlink step needed).
+        await host.fs.writeFile(destination, bytes);
         uploaded.push(file.name);
       } catch (error) {
         recordError(file, error);
@@ -248,106 +254,286 @@ export async function POST(
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
   }
+});
+
+interface ByteRange {
+  start: number;
+  end: number;
 }
 
-function createFileBodyStream(filePath: string, range?: { start: number; end: number }): ReadableStream<Uint8Array> {
-  const fileStream = fs.createReadStream(filePath, range);
+/** Parse a single-range `Range` header against a known size; null = 416. */
+function resolveByteRange(rangeHeader: string, size: number): ByteRange | null {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
+  if (!match) return null;
+  let start = match[1] ? Number(match[1]) : 0;
+  let end = match[2] ? Number(match[2]) : size - 1;
+  if (!match[1] && match[2]) {
+    const suffixLength = Number(match[2]);
+    start = Math.max(size - suffixLength, 0);
+    end = size - 1;
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || start >= size) return null;
+  return { start, end: Math.min(end, size - 1) };
+}
+
+/** Terminate a streaming child. Local POSIX children run in their own process
+ * group (LocalExecutor.spawn detaches them), so the whole pipeline goes. */
+function killChild(host: Host, child: ChildProcessWithoutNullStreams | null): void {
+  if (!child || child.pid === undefined) return;
+  try {
+    if (host.isLocal && process.platform !== "win32") process.kill(-child.pid, "SIGTERM");
+    else child.kill("SIGTERM");
+  } catch {
+    try { child.kill("SIGKILL"); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * Stream a file (or a byte range of it) from the host without ever holding
+ * it in memory: `cat` for the full body, `tail | head` for a range so the
+ * skipped prefix never crosses the wire. The local Windows machine has no
+ * `sh`, so it uses `cat` and drops the prefix in-stream (local disk only).
+ * Backpressure: the child's stdout is paused while the response queue is full.
+ */
+function createHostFileStream(host: Host, filePath: string, range?: ByteRange): ReadableStream<Uint8Array> {
+  let child: ChildProcessWithoutNullStreams | null = null;
   let closed = false;
+  let skip = 0;
+  let remaining = range ? range.end - range.start + 1 : Number.POSITIVE_INFINITY;
+  const canUseShell = !(host.isLocal && process.platform === "win32");
 
   return new ReadableStream<Uint8Array>({
     start(controller) {
-      fileStream.on("data", (chunk: Buffer) => {
-        if (closed) return;
-        try {
-          controller.enqueue(new Uint8Array(chunk));
-        } catch {
-          closed = true;
-          fileStream.destroy();
-        }
-      });
-      fileStream.once("end", () => {
+      const finish = (error?: Error) => {
         if (closed) return;
         closed = true;
         try {
-          controller.close();
+          if (error) controller.error(error);
+          else controller.close();
         } catch {
           // The browser may cancel media probes before the file stream ends.
         }
-      });
-      fileStream.once("error", (error) => {
-        if (closed) return;
-        closed = true;
-        try {
-          controller.error(error);
-        } catch {
-          // The response was already abandoned by the client.
+      };
+      try {
+        if (range && canUseShell) {
+          child = host.executor.spawn([
+            "sh", "-c", 'tail -c +"$2" -- "$1" | head -c "$3"',
+            "sh", filePath, String(range.start + 1), String(remaining),
+          ]);
+        } else {
+          if (range) skip = range.start;
+          child = host.executor.spawn(["cat", "--", filePath]);
         }
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
+      const proc = child;
+      proc.stdin.on("error", () => { /* not used */ });
+      proc.stdin.end();
+      proc.stderr.on("data", () => { /* drained; exit code carries the failure */ });
+      proc.stdout.on("data", (chunk: Buffer) => {
+        if (closed) return;
+        let data = chunk;
+        if (skip > 0) {
+          if (data.length <= skip) {
+            skip -= data.length;
+            return;
+          }
+          data = data.subarray(skip);
+          skip = 0;
+        }
+        if (data.length > remaining) data = data.subarray(0, remaining);
+        remaining -= data.length;
+        if (data.length > 0) {
+          try {
+            controller.enqueue(new Uint8Array(data));
+          } catch {
+            closed = true;
+            killChild(host, proc);
+            return;
+          }
+        }
+        if (remaining <= 0) {
+          finish();
+          killChild(host, proc);
+          return;
+        }
+        if (controller.desiredSize !== null && controller.desiredSize <= 0) proc.stdout.pause();
       });
+      proc.once("error", (error) => finish(error));
+      proc.once("close", (code) => {
+        if (closed) return;
+        if (code === 0 || remaining <= 0) finish();
+        else finish(new Error(`file stream for ${filePath} exited with ${code ?? "signal"}`));
+      });
+    },
+    pull() {
+      child?.stdout.resume();
     },
     cancel() {
       closed = true;
-      fileStream.destroy();
+      killChild(host, child);
     },
   });
 }
 
-function streamFile(filePath: string, stat: fs.Stats, contentType: string, rangeHeader: string | null, asDownload = false): Response {
-  const headers = {
+function fileHeaders(filePath: string, contentType: string, asDownload: boolean): Record<string, string> {
+  return {
     "Content-Type": contentType,
     "Cache-Control": "no-cache",
     "Accept-Ranges": "bytes",
-    "Content-Disposition": getContentDisposition(path.basename(filePath), !asDownload, "download"),
-    // Shared by the full-body, 206, and 416 paths below.
+    "Content-Disposition": getContentDisposition(hostPath().basename(filePath), !asDownload, "download"),
+    // Shared by the full-body, 206, and 416 paths.
     ...getStreamSecurityHeaders(contentType),
   };
+}
 
+/** Range-aware response whose body is produced lazily for the chosen range. */
+function serveRanged(
+  filePath: string,
+  size: number,
+  contentType: string,
+  rangeHeader: string | null,
+  asDownload: boolean,
+  body: (range?: ByteRange) => BodyInit,
+): Response {
+  const headers = fileHeaders(filePath, contentType, asDownload);
   if (!rangeHeader) {
-    return new Response(createFileBodyStream(filePath), {
-      headers: {
-        ...headers,
-        "Content-Length": String(stat.size),
-      },
-    });
+    return new Response(body(), { headers: { ...headers, "Content-Length": String(size) } });
   }
-
-  const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
-  if (!match) {
-    return new Response(null, {
-      status: 416,
-      headers: {
-        ...headers,
-        "Content-Range": `bytes */${stat.size}`,
-      },
-    });
+  const range = resolveByteRange(rangeHeader, size);
+  if (!range) {
+    return new Response(null, { status: 416, headers: { ...headers, "Content-Range": `bytes */${size}` } });
   }
-
-  let start = match[1] ? Number(match[1]) : 0;
-  let end = match[2] ? Number(match[2]) : stat.size - 1;
-  if (!match[1] && match[2]) {
-    const suffixLength = Number(match[2]);
-    start = Math.max(stat.size - suffixLength, 0);
-    end = stat.size - 1;
-  }
-
-  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || start >= stat.size) {
-    return new Response(null, {
-      status: 416,
-      headers: {
-        ...headers,
-        "Content-Range": `bytes */${stat.size}`,
-      },
-    });
-  }
-
-  end = Math.min(end, stat.size - 1);
-  const chunkSize = end - start + 1;
-  return new Response(createFileBodyStream(filePath, { start, end }), {
+  const chunkSize = range.end - range.start + 1;
+  return new Response(body(range), {
     status: 206,
     headers: {
       ...headers,
       "Content-Length": String(chunkSize),
-      "Content-Range": `bytes ${start}-${end}/${stat.size}`,
+      "Content-Range": `bytes ${range.start}-${range.end}/${size}`,
     },
+  });
+}
+
+/** Large/unbounded content (audio, PDF, downloads): streamed from the host. */
+function streamFile(host: Host, filePath: string, stat: FileStat, contentType: string, rangeHeader: string | null, asDownload = false): Response {
+  return serveRanged(filePath, stat.size, contentType, rangeHeader, asDownload, (range) => createHostFileStream(host, filePath, range));
+}
+
+/** Bounded content already read through the host fs (images). */
+function serveBuffer(filePath: string, bytes: Buffer, contentType: string, rangeHeader: string | null): Response {
+  return serveRanged(filePath, bytes.length, contentType, rangeHeader, false, (range) =>
+    new Uint8Array(range ? bytes.subarray(range.start, range.end + 1) : bytes));
+}
+
+type SseSend = (eventName: string, data: Record<string, unknown>) => void;
+
+function sseResponse(start: (send: SseSend, close: () => void) => void, cancel: () => void): Response {
+  const stream = new ReadableStream({
+    start(controller) {
+      let closed = false;
+      const send: SseSend = (eventName, data) => {
+        if (closed) return;
+        const payload = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
+        try {
+          controller.enqueue(new TextEncoder().encode(payload));
+        } catch {
+          closed = true; // client disconnected
+        }
+      };
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        try { controller.close(); } catch { /* ignore */ }
+      };
+      start(send, close);
+    },
+    cancel,
+  });
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}
+
+/** Local host: native fs.watch, with the change de-duplicated by mtime/size. */
+function watchLocalFile(host: Host, filePath: string, initial: FileStat): Response {
+  let watcher: FSWatcher | null = null;
+  let lastMtimeMs = initial.mtimeMs;
+  let lastSize = initial.size;
+  return sseResponse((send, close) => {
+    // Send initial ping so client knows connection is live
+    send("connected", { filePath, host: host.id, mode: "watch" });
+    try {
+      watcher = fsWatch(filePath, () => {
+        host.fs.stat(filePath).then((s) => {
+          // Some platforms emit watch events for file reads/attribute
+          // access. Ignore those or the client's refresh read loops.
+          if (s.mtimeMs === lastMtimeMs && s.size === lastSize) return;
+          lastMtimeMs = s.mtimeMs;
+          lastSize = s.size;
+          send("change", { mtime: new Date(s.mtimeMs).toISOString(), size: s.size });
+        }, () => {
+          send("change", { mtime: new Date().toISOString(), size: 0 });
+        });
+      });
+      watcher.on("error", () => close());
+    } catch {
+      send("error", { message: "Failed to watch file" });
+      close();
+    }
+  }, () => {
+    try { watcher?.close(); } catch { /* ignore */ }
+  });
+}
+
+/** Remote host: no inotify across ssh, so the file is polled with one stat
+ * round trip per interval and the same SSE events are emitted. Remote mtimes
+ * are whole seconds; a same-second rewrite of identical size is not
+ * detected. The stream closes after REMOTE_WATCH_MAX_MS (EventSource
+ * reconnects), which bounds idle polling of abandoned viewers. */
+function pollRemoteFile(host: Host, filePath: string, initial: FileStat): Response {
+  let timer: NodeJS.Timeout | null = null;
+  let stopped = false;
+  let lastMtimeMs = initial.mtimeMs;
+  let lastSize = initial.size;
+  let missing = false;
+  const startedAt = Date.now();
+  return sseResponse((send, close) => {
+    send("connected", { filePath, host: host.id, mode: "poll", intervalMs: REMOTE_WATCH_POLL_MS });
+    const tick = async () => {
+      if (stopped) return;
+      if (Date.now() - startedAt >= REMOTE_WATCH_MAX_MS) {
+        stopped = true;
+        close();
+        return;
+      }
+      try {
+        const s = await host.fs.stat(filePath);
+        missing = false;
+        if (s.mtimeMs !== lastMtimeMs || s.size !== lastSize) {
+          lastMtimeMs = s.mtimeMs;
+          lastSize = s.size;
+          send("change", { mtime: new Date(s.mtimeMs).toISOString(), size: s.size });
+        }
+      } catch {
+        if (!missing) {
+          missing = true;
+          send("change", { mtime: new Date().toISOString(), size: 0 });
+        }
+      }
+      if (!stopped) timer = setTimeout(tick, REMOTE_WATCH_POLL_MS);
+    };
+    timer = setTimeout(tick, REMOTE_WATCH_POLL_MS);
+  }, () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
   });
 }
 
@@ -409,11 +595,13 @@ ${bodyHtml}
 </html>`;
 }
 
-export async function GET(
+// GET /api/files/<path>?type=list|read|download|meta|preview|watch[&sessionId=][&host=<id>]
+export const GET = withHostRoute(async (
   request: NextRequest,
-  { params }: { params: Promise<{ path: string[] }> }
-) {
+  { params }: { params: Promise<{ path: string[] }> },
+) => {
   try {
+    const host = currentHost();
     const { path: segments } = await params;
     const filePath = filePathFromSegments(segments);
     const rawType = request.nextUrl.searchParams.get("type") ?? "list";
@@ -423,7 +611,7 @@ export async function GET(
     }
     const sessionId = request.nextUrl.searchParams.get("sessionId");
 
-    const allowedRoots = await getAllowedFileRoots();
+    const allowedRoots = await getAllowedFileRoots(host);
     const allowedByRoot = isFilePathAllowed(filePath, allowedRoots);
     const allowedBySessionReference =
       !allowedByRoot &&
@@ -433,14 +621,14 @@ export async function GET(
       return NextResponse.json({ error: "Access denied", code: "access_denied" }, { status: 403 });
     }
 
-    let stat: fs.Stats;
+    let stat: FileStat;
     try {
-      stat = fs.statSync(filePath);
+      stat = await host.fs.stat(filePath);
     } catch {
       return NextResponse.json({ error: "Not found", code: "file_not_found" }, { status: 404 });
     }
 
-    if (!allowedBySessionReference && !isExistingFilePathAllowed(filePath, allowedRoots)) {
+    if (!allowedBySessionReference && !(await isExistingFilePathAllowed(filePath, allowedRoots, host))) {
       return NextResponse.json({ error: "Access denied", code: "access_denied" }, { status: 403 });
     }
 
@@ -453,20 +641,21 @@ export async function GET(
         if (stat.size > IMAGE_PREVIEW_MAX_BYTES) {
           return NextResponse.json({ error: "Image too large (>10MB)", code: "image_too_large" }, { status: 413 });
         }
-        return streamFile(filePath, stat, imageMime, request.headers.get("range"));
+        const bytes = await host.fs.readFile(filePath, { maxBytes: IMAGE_PREVIEW_MAX_BYTES });
+        return serveBuffer(filePath, bytes, imageMime, request.headers.get("range"));
       }
       const audioMime = getAudioMime(filePath);
       if (audioMime) {
-        return streamFile(filePath, stat, audioMime, request.headers.get("range"));
+        return streamFile(host, filePath, stat, audioMime, request.headers.get("range"));
       }
       const documentMime = getDocumentMime(filePath);
       if (documentMime) {
-        return streamFile(filePath, stat, documentMime, request.headers.get("range"));
+        return streamFile(host, filePath, stat, documentMime, request.headers.get("range"));
       }
       if (stat.size > TEXT_PREVIEW_MAX_BYTES) {
         return NextResponse.json({ error: "File too large for preview (>256KB)", code: "file_too_large_preview" }, { status: 413 });
       }
-      const content = fs.readFileSync(filePath, "utf-8");
+      const content = (await host.fs.readFile(filePath, { maxBytes: TEXT_PREVIEW_MAX_BYTES })).toString("utf-8");
       const language = getLanguage(filePath);
       return NextResponse.json({ content, language, size: stat.size });
     }
@@ -476,7 +665,7 @@ export async function GET(
         return NextResponse.json({ error: "Not a file", code: "not_a_file" }, { status: 400 });
       }
       const mime = getImageMime(filePath) || getAudioMime(filePath) || getDocumentMime(filePath) || "application/octet-stream";
-      return streamFile(filePath, stat, mime, request.headers.get("range"), true);
+      return streamFile(host, filePath, stat, mime, request.headers.get("range"), true);
     }
 
     if (type === "meta") {
@@ -505,15 +694,16 @@ export async function GET(
         return NextResponse.json({ error: "DOCX too large for preview (>10MB)", code: "docx_too_large" }, { status: 413 });
       }
 
+      const bytes = await host.fs.readFile(filePath, { maxBytes: DOCX_PREVIEW_MAX_BYTES });
       const mammoth = await import("mammoth");
       const result = await mammoth.convertToHtml(
-        { path: filePath },
+        { buffer: bytes },
         {
           externalFileAccess: false,
           convertImage: mammoth.images.dataUri,
         }
       );
-      const html = wrapDocxPreviewHtml(result.value, path.basename(filePath));
+      const html = wrapDocxPreviewHtml(result.value, hostPath().basename(filePath));
       return new Response(html, {
         headers: {
           "Content-Type": "text/html; charset=utf-8",
@@ -529,55 +719,7 @@ export async function GET(
       if (!stat.isFile()) {
         return NextResponse.json({ error: "Not a file", code: "not_a_file" }, { status: 400 });
       }
-      let watcher: fs.FSWatcher | null = null;
-      let lastMtimeMs = stat.mtimeMs;
-      let lastSize = stat.size;
-      const stream = new ReadableStream({
-        start(controller) {
-          const send = (eventName: string, data: Record<string, unknown>) => {
-            const payload = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
-            try {
-              controller.enqueue(new TextEncoder().encode(payload));
-            } catch {
-              // client disconnected
-            }
-          };
-          // Send initial ping so client knows connection is live
-          send("connected", { filePath });
-          try {
-            watcher = fs.watch(filePath, () => {
-              try {
-                const s = fs.statSync(filePath);
-                // Some platforms emit watch events for file reads/attribute
-                // access. Ignore those or the client's refresh read loops.
-                if (s.mtimeMs === lastMtimeMs && s.size === lastSize) return;
-                lastMtimeMs = s.mtimeMs;
-                lastSize = s.size;
-                send("change", { mtime: s.mtime.toISOString(), size: s.size });
-              } catch {
-                send("change", { mtime: new Date().toISOString(), size: 0 });
-              }
-            });
-            watcher.on("error", () => {
-              try { controller.close(); } catch { /* ignore */ }
-            });
-          } catch {
-            send("error", { message: "Failed to watch file" });
-            controller.close();
-          }
-        },
-        cancel() {
-          try { watcher?.close(); } catch { /* ignore */ }
-        },
-      });
-      return new Response(stream, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache, no-transform",
-          Connection: "keep-alive",
-          "X-Accel-Buffering": "no",
-        },
-      });
+      return host.isLocal ? watchLocalFile(host, filePath, stat) : pollRemoteFile(host, filePath, stat);
     }
 
     // type === "list"
@@ -585,17 +727,16 @@ export async function GET(
       return NextResponse.json({ error: "Not a directory", code: "not_a_directory" }, { status: 400 });
     }
 
-    // Avoid per-entry stat calls for normal files and directories. Symlinks and
-    // filesystems without directory type information use the stat fallback.
-    const readDirectorySync = Reflect.get(fs, "readdirSync") as typeof fs.readdirSync;
-    const dirents = readDirectorySync(filePath, { withFileTypes: true });
+    // One readdir round trip: host entries carry their type (and the target
+    // type of symlinks), so no per-entry stat is needed.
+    const dirents = await host.fs.readdir(filePath);
     const entries = dirents
       .filter((d) => !IGNORED_NAMES.has(d.name) && !IGNORED_SUFFIXES.some((s) => d.name.endsWith(s)))
       .flatMap((d) => {
-        const isDir = resolveDirentIsDirectory(d, path.join(filePath, d.name));
+        const isDir = resolveDirentIsDirectory(d);
         return isDir === null
           ? []
-          : [{ name: d.name, isDir, size: 0, modified: "" }];
+          : [{ name: d.name, isDir, size: isDir ? 0 : d.size, modified: d.mtimeMs ? new Date(d.mtimeMs).toISOString() : "" }];
       })
       .sort((a, b) => {
         // Dirs first, then files, both alphabetically
@@ -603,8 +744,8 @@ export async function GET(
         return a.name.localeCompare(b.name);
       });
 
-    return NextResponse.json({ entries, path: filePath });
+    return NextResponse.json({ entries, path: filePath, host: host.id });
   } catch (error) {
     return apiErrorResponse(error);
   }
-}
+});

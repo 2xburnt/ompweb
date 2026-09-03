@@ -2,11 +2,12 @@ import { NextResponse } from "next/server";
 import { loadSessionFile } from "@/lib/omp/session-files";
 import { buildSessionContext } from "@/lib/session-reader";
 import { apiErrorResponse, resolveSessionPathOr404 } from "@/lib/api-utils";
+import { withSessionRoute } from "@/lib/hosts/route";
 
-export async function GET(
+export const GET = withSessionRoute(async (
   req: Request,
   { params }: { params: Promise<{ id: string }> }
-) {
+) => {
   const { id } = await params;
   const url = new URL(req.url);
   const leafId = url.searchParams.get("leafId") ?? undefined;
@@ -20,7 +21,7 @@ export async function GET(
     if ("response" in resolved) return resolved.response;
     const filePath = resolved.filePath;
 
-    const { header, entries, error: loadError } = loadSessionFile(filePath, {
+    const { header, entries, error: loadError } = await loadSessionFile(filePath, {
       resolveBlobs: true,
       skipToolResultImages: deferToolResultImages,
     });
@@ -43,4 +44,4 @@ export async function GET(
   } catch (error) {
     return apiErrorResponse(error);
   }
-}
+});

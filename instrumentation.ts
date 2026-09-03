@@ -7,38 +7,50 @@ export async function register(): Promise<void> {
   const { configureHttpDispatcher } = await import("@/lib/http-dispatcher");
   configureHttpDispatcher();
 
-  // Startup diagnostics: agent dir. Kept to one line so it greps cleanly;
-  // failures here must never block boot.
+  // Startup diagnostics: configured hosts. Kept to one line each so they grep
+  // cleanly; failures here must never block boot.
   try {
-    const { getAgentDir } = await import("@/lib/session-reader");
+    const { listHosts, getDefaultHostId } = await import("@/lib/hosts/registry");
+    const { getHostsFilePath } = await import("@/lib/hosts/config");
+    const hosts = listHosts({ includeDisabled: true });
     console.log(
-      `[omp-web] starting (agent-dir ${getAgentDir()})`,
+      `[omp-web] starting (hosts ${hosts.map((host) => `${host.id}${host.enabled ? "" : " (disabled)"}`).join(", ")}; default ${getDefaultHostId()}; config ${getHostsFilePath()})`,
     );
-  } catch {
-    // Diagnostics are best-effort.
+  } catch (error) {
+    console.warn(`[omp-web] host registry failed to load: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  // Warm the shared utility omp process so the first models/auth request does
-  // not pay the multi-second cold spawn (measured 1.2-4s on a real install).
-  // Fire-and-forget: register() must not block boot, and a missing omp binary
-  // is reported per-request by the routes — log once here and move on.
-  // The shared process registers its own SIGINT/SIGTERM/exit disposal hook on
-  // first use (lib/omp/rpc-utility.ts), as the session registry does.
+  // Probe every enabled host in the background so the first page load already
+  // knows which machines are reachable, then warm the utility omp process on
+  // each so the first models/auth request does not pay the multi-second cold
+  // spawn (measured 1.2-4s on a real install). Fire-and-forget: register()
+  // must not block boot, and a missing omp binary is reported per-request by
+  // the routes — log once here and move on. The shared processes register
+  // their own SIGINT/SIGTERM/exit disposal hook on first use
+  // (lib/omp/rpc-utility.ts), as the session registry does.
   void (async () => {
-    try {
-      const { runUtilityCommand } = await import("@/lib/omp/rpc-utility");
-      await runUtilityCommand({ type: "get_state" });
-      const { getOmpVersion } = await import("@/lib/omp/omp-cli");
-      const version = await getOmpVersion();
-      console.log(`[omp-web] omp utility ready (${version ?? "version unknown"})`);
-    } catch (error) {
-      const { resolveOmpBin } = await import("@/lib/omp/omp-cli");
-      const bin = resolveOmpBin();
-      const detail = error instanceof Error ? error.message : String(error);
-      const hint = bin
-        ? `resolved ${bin}; repair with: omp update (or: bun install -g @oh-my-pi/pi-coding-agent@latest)`
-        : "omp binary not found; install oh-my-pi or set OMP_WEB_OMP_BIN";
-      console.warn(`[omp-web] omp utility warm-up failed (routes will retry on demand): ${detail} — ${hint}`);
-    }
+    const { listHosts } = await import("@/lib/hosts/registry");
+    const { withHost } = await import("@/lib/hosts/context");
+    await Promise.allSettled(listHosts().map(async (host) => {
+      try {
+        await host.ready();
+        console.log(`[omp-web] host ${host.id} ready (${host.executor.label}; omp ${host.ompVersion ?? "not found"}; agent-dir ${withHost(host, () => host.isLocal ? "local" : host.agentDir)})`);
+      } catch (error) {
+        console.warn(`[omp-web] host ${host.id} unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+      if (!host.ompBin) {
+        console.warn(`[omp-web] host ${host.id}: omp binary not found; install oh-my-pi there or set the host's ompBin`);
+        return;
+      }
+      try {
+        const { runUtilityCommand } = await import("@/lib/omp/rpc-utility");
+        await withHost(host, () => runUtilityCommand({ type: "get_state" }, 60_000, host));
+        console.log(`[omp-web] host ${host.id}: omp utility ready`);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(`[omp-web] host ${host.id}: omp utility warm-up failed (routes will retry on demand): ${detail}`);
+      }
+    }));
   })();
 }

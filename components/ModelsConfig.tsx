@@ -1,9 +1,13 @@
 "use client";
 
+import { hostFetch, useHosts, withHostParam } from "@/lib/hosts/client";
+import { MachineScopeNote } from "./MachineScopeNote";
+
 import { useState, useEffect, useCallback, useRef, type CSSProperties } from "react";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useI18n } from "@/lib/i18n";
 import { isSafeExternalUrl } from "@/lib/safe-url";
+import { composerModelsStorageKey } from "@/lib/composer-prefs";
 import { omitUntouchedModelDrafts } from "@/lib/models-config-drafts";
 import { formatApiError } from "@/lib/i18n/api-error";
 import {
@@ -162,17 +166,25 @@ type RetrySettings = {
 
 function RetryFallbackDetail({ models }: { models: RuntimeModelEntry[] }) {
   const { t } = useI18n();
+  // Retry/fallback lives in the selected machine's omp settings.
+  const { hostId } = useHosts();
+  const hostRef = useRef<string | null>(hostId);
+  hostRef.current = hostId;
   const [settings, setSettings] = useState<RetrySettings | null>(null);
   const [role, setRole] = useState("default");
   const [candidate, setCandidate] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch("/api/omp-settings")
+    let cancelled = false;
+    setSettings(null);
+    setError(null);
+    hostFetch("/api/omp-settings", undefined, hostId ?? undefined)
       .then((response) => response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`)))
-      .then((data: { settings?: RetrySettings }) => setSettings(data.settings ?? {}))
-      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
-  }, []);
+      .then((data: { settings?: RetrySettings }) => { if (!cancelled) setSettings(data.settings ?? {}); })
+      .catch((reason) => { if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason)); });
+    return () => { cancelled = true; };
+  }, [hostId]);
 
   // Serialize full-snapshot saves: each call writes the whole settings object,
   // so overlapping PUTs can land out of order and clobber newer changes. Keep
@@ -181,6 +193,7 @@ function RetryFallbackDetail({ models }: { models: RuntimeModelEntry[] }) {
   const latestRef = useRef<RetrySettings | null>(null);
   const drainingRef = useRef(false);
   const save = (next: RetrySettings) => {
+    const targetHost = hostRef.current;
     setSettings(next);
     setError(null);
     latestRef.current = next;
@@ -189,15 +202,18 @@ function RetryFallbackDetail({ models }: { models: RuntimeModelEntry[] }) {
     void (async () => {
       try {
         while (latestRef.current !== null) {
+          // Queued writes belong to the machine they were made on.
+          if (hostRef.current !== targetHost) break;
           const snapshot = latestRef.current;
           latestRef.current = null;
           try {
-            const response = await fetch("/api/omp-settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settings: snapshot }) });
+            const response = await hostFetch("/api/omp-settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settings: snapshot }) }, targetHost ?? undefined);
             const data = await response.json() as { settings?: RetrySettings; error?: string };
             if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+            if (hostRef.current !== targetHost) break;
             if (latestRef.current === null) setSettings(data.settings ?? snapshot);
           } catch (reason) {
-            setError(reason instanceof Error ? reason.message : String(reason));
+            if (hostRef.current === targetHost) setError(reason instanceof Error ? reason.message : String(reason));
             break;
           }
         }
@@ -246,16 +262,24 @@ function RetryFallbackDetail({ models }: { models: RuntimeModelEntry[] }) {
 
 function NativeRegistryDetail({ models, connectedProviders, onChanged }: { models: RuntimeModelEntry[]; connectedProviders: ConnectedProvider[]; onChanged: () => Promise<void> }) {
   const { t } = useI18n();
+  // The model registry is the selected machine's omp settings file.
+  const { hostId } = useHosts();
+  const hostRef = useRef<string | null>(hostId);
+  hostRef.current = hostId;
   const [settings, setSettings] = useState<NativeRegistrySettings | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    fetch("/api/omp-settings")
+    let cancelled = false;
+    setSettings(null);
+    setError(null);
+    hostFetch("/api/omp-settings", undefined, hostId ?? undefined)
       .then((response) => response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`)))
-      .then((data: { settings?: NativeRegistrySettings }) => setSettings(data.settings ?? {}))
-      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
-  }, []);
+      .then((data: { settings?: NativeRegistrySettings }) => { if (!cancelled) setSettings(data.settings ?? {}); })
+      .catch((reason) => { if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason)); });
+    return () => { cancelled = true; };
+  }, [hostId]);
 
   // Serialize full-snapshot saves: each call PUTs the whole settings object and
   // a rapid sequence of provider/model toggles must not let an older snapshot
@@ -264,6 +288,7 @@ function NativeRegistryDetail({ models, connectedProviders, onChanged }: { model
   const latestRef = useRef<NativeRegistrySettings | null>(null);
   const drainingRef = useRef(false);
   const save = (next: NativeRegistrySettings) => {
+    const targetHost = hostRef.current;
     setSettings(next);
     setSaving(true);
     setError(null);
@@ -273,16 +298,19 @@ function NativeRegistryDetail({ models, connectedProviders, onChanged }: { model
     void (async () => {
       try {
         while (latestRef.current !== null) {
+          // Queued writes belong to the machine they were made on.
+          if (hostRef.current !== targetHost) break;
           const snapshot = latestRef.current;
           latestRef.current = null;
           try {
-            const response = await fetch("/api/omp-settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settings: snapshot }) });
+            const response = await hostFetch("/api/omp-settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settings: snapshot }) }, targetHost ?? undefined);
             const data = await response.json() as { settings?: NativeRegistrySettings; error?: string };
             if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+            if (hostRef.current !== targetHost) break;
             if (latestRef.current === null) setSettings(data.settings ?? snapshot);
             await onChanged();
           } catch (reason) {
-            setError(reason instanceof Error ? reason.message : String(reason));
+            if (hostRef.current === targetHost) setError(reason instanceof Error ? reason.message : String(reason));
             break;
           }
         }
@@ -331,29 +359,37 @@ function NativeRegistryDetail({ models, connectedProviders, onChanged }: { model
   </div>;
 }
 
-const COMPOSER_MODELS_STORAGE_KEY = "omp-composer-models";
+
 const NATIVE_MODEL_ROLES = ["default", "smol", "slow", "vision", "plan", "designer", "commit", "tiny", "task", "advisor"];
 
 function ModelRolesDetail({ models }: { models: RuntimeModelEntry[] }) {
   const { t } = useI18n();
+  // Role → model mappings are per machine.
+  const { hostId } = useHosts();
   const [roles, setRoles] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch("/api/model-roles")
+    let cancelled = false;
+    setRoles({});
+    setLoading(true);
+    setError(null);
+    hostFetch("/api/model-roles", undefined, hostId ?? undefined)
       .then((response) => response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`)))
-      .then((data: { roles?: Record<string, string> }) => setRoles(data.roles ?? {}))
-      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
-      .finally(() => setLoading(false));
-  }, []);
+      .then((data: { roles?: Record<string, string> }) => { if (!cancelled) setRoles(data.roles ?? {}); })
+      .catch((reason) => { if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason)); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [hostId]);
 
   const save = async () => {
+    const targetHost = hostId;
     setSaving(true);
     setError(null);
     try {
-      const response = await fetch("/api/model-roles", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ roles }) });
+      const response = await hostFetch("/api/model-roles", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ roles }) }, targetHost ?? undefined);
       const data = await response.json() as { error?: string };
       if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
       toast.success(t("modelsConfig.rolesSaved"));
@@ -922,6 +958,8 @@ function ModelDetail({
   onDelete: () => void;
 }) {
   const { t } = useI18n();
+  // The probe runs on the selected machine (its network, its credentials).
+  const { hostId } = useHosts();
   const [testState, setTestState] = useState<ModelTestState>({ phase: "idle" });
   const [removeOpen, setRemoveOpen] = useState(false);
   const set = <K extends keyof ModelEntry>(k: K, v: ModelEntry[K]) => onChange({ ...model, [k]: v });
@@ -947,17 +985,17 @@ function ModelDetail({
 
   useEffect(() => {
     setTestState({ phase: "idle" });
-  }, [providerName, provider.baseUrl, provider.api, provider.apiKey, model.id, model.api]);
+  }, [hostId, providerName, provider.baseUrl, provider.api, provider.apiKey, model.id, model.api]);
 
   const handleTest = useCallback(async () => {
     if (!model.id.trim() || testState.phase === "testing") return;
     setTestState({ phase: "testing" });
     try {
-      const res = await fetch("/api/models-config/test", {
+      const res = await hostFetch("/api/models-config/test", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ providerName, provider, model }),
-      });
+      }, hostId ?? undefined);
       const d = await res.json() as {
         ok?: boolean;
         error?: string;
@@ -984,7 +1022,7 @@ function ModelDetail({
     } catch (e) {
       setTestState({ phase: "error", message: e instanceof Error ? e.message : String(e) });
     }
-  }, [model, provider, providerName, testState.phase]);
+  }, [hostId, model, provider, providerName, testState.phase]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
@@ -1222,6 +1260,9 @@ function ModelDetail({
 
 function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefresh: () => void }) {
   const { t, tn } = useI18n();
+  // Credentials are stored on the machine: the SSE login stream and every
+  // follow-up POST stay pinned to the machine the flow started on.
+  const { hostId } = useHosts();
   const [loginState, setLoginState] = useState<OAuthLoginState>({ phase: "idle" });
   const [inputValue, setInputValue] = useState("");
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -1233,13 +1274,13 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
     }
   }, [loginState.phase]);
 
-  // Reset state when provider changes
+  // Reset state when the provider — or the machine it belongs to — changes
   useEffect(() => {
     setLoginState({ phase: "idle" });
     setInputValue("");
     eventSourceRef.current?.close();
     eventSourceRef.current = null;
-  }, [provider.id]);
+  }, [provider.id, hostId]);
 
   useEffect(() => {
     return () => { eventSourceRef.current?.close(); };
@@ -1250,7 +1291,7 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
     setLoginState({ phase: "connecting" });
     setInputValue("");
 
-    const es = new EventSource(`/api/auth/login/${encodeURIComponent(provider.id)}`);
+    const es = new EventSource(withHostParam(`/api/auth/login/${encodeURIComponent(provider.id)}`, hostId ?? undefined));
     eventSourceRef.current = es;
 
     es.onmessage = (e) => {
@@ -1300,11 +1341,11 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
       es.close();
       setLoginState((prev) => prev.phase === "success" ? prev : { phase: "error", message: t("modelsConfig.connectionLost") });
     };
-  }, [provider.id, onRefresh, t]);
+  }, [provider.id, hostId, onRefresh, t]);
 
   const handleLogout = useCallback(async () => {
     try {
-      const res = await fetch(`/api/auth/logout/${encodeURIComponent(provider.id)}`, { method: "POST" });
+      const res = await hostFetch(`/api/auth/logout/${encodeURIComponent(provider.id)}`, { method: "POST" }, hostId ?? undefined);
       const d = await res.json().catch(() => ({})) as { error?: string; code?: string };
       if (!res.ok || d.error) {
         // omp has no logout RPC/CLI surface; the route returns 501 with guidance.
@@ -1316,17 +1357,17 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
     } catch (e) {
       setLoginState({ phase: "error", message: e instanceof Error ? e.message : String(e) });
     }
-  }, [provider.id, onRefresh]);
+  }, [provider.id, hostId, onRefresh]);
 
   const submitCode = useCallback(async (token: string, code: string) => {
     if (!code.trim()) return;
     setLoginState({ phase: "progress", message: t("modelsConfig.verifying") });
     try {
-      const res = await fetch(`/api/auth/login/${encodeURIComponent(provider.id)}`, {
+      const res = await hostFetch(`/api/auth/login/${encodeURIComponent(provider.id)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token, code: code.trim() }),
-      });
+      }, hostId ?? undefined);
       if (!res.ok) {
         const d = await res.json().catch(() => ({})) as { error?: string; code?: string };
         setLoginState({ phase: "error", message: d.error || d.code ? formatApiError(d) : t("modelsConfig.serverError", { status: res.status }) });
@@ -1337,16 +1378,16 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
     } catch (e) {
       setLoginState({ phase: "error", message: e instanceof Error ? e.message : t("modelsConfig.networkError") });
     }
-  }, [provider.id, t]);
+  }, [provider.id, hostId, t]);
 
   const submitSelection = useCallback(async (token: string, value: string) => {
     setLoginState({ phase: "progress", message: t("modelsConfig.continuing") });
     try {
-      const res = await fetch(`/api/auth/login/${encodeURIComponent(provider.id)}`, {
+      const res = await hostFetch(`/api/auth/login/${encodeURIComponent(provider.id)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token, code: value }),
-      });
+      }, hostId ?? undefined);
       if (!res.ok) {
         const d = await res.json().catch(() => ({})) as { error?: string; code?: string };
         setLoginState({ phase: "error", message: d.error || d.code ? formatApiError(d) : t("modelsConfig.serverError", { status: res.status }) });
@@ -1354,7 +1395,7 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
     } catch (e) {
       setLoginState({ phase: "error", message: e instanceof Error ? e.message : t("modelsConfig.networkError") });
     }
-  }, [provider.id, t]);
+  }, [provider.id, hostId, t]);
 
   const isWorking = loginState.phase === "connecting" || loginState.phase === "progress" ||
     loginState.phase === "auth" || loginState.phase === "device_code" ||
@@ -1710,6 +1751,12 @@ function AddProviderPicker({
 // ── Main component ────────────────────────────────────────────────────────────
 
 export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }: { onClose: () => void; onSelectTab?: (tab: SettingsTab) => void; onSaved?: () => void; embedded?: boolean }) {
+  // Every panel below edits ONE machine's omp installation; re-run the loads
+  // when the selected machine changes so the form never shows another
+  // machine's providers, models or roles.
+  const { hostId: settingsHostId } = useHosts();
+  const settingsHostRef = useRef<string | null>(settingsHostId);
+  settingsHostRef.current = settingsHostId;
   const { t, tn } = useI18n();
   const isMobile = useIsMobile();
   const [config, setConfig] = useState<ModelsFileData>({ providers: {} });
@@ -1733,44 +1780,56 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
   // is never overwritten with nothing.
   const [parseError, setParseError] = useState<{ message: string; path?: string } | null>(null);
 
+  // Every loader is pinned to the machine it was started for; a response that
+  // arrives after the machine changed is dropped instead of overwriting the
+  // newly selected machine's data.
   const loadOAuthProviders = useCallback(() => {
-    fetch("/api/auth/providers")
+    const targetHost = settingsHostId;
+    hostFetch("/api/auth/providers", undefined, targetHost ?? undefined)
       .then((r) => r.json())
       .then((d: { providers?: OAuthProvider[] }) => {
+        if (settingsHostRef.current !== targetHost) return;
         if (Array.isArray(d.providers)) setOauthProviders(d.providers);
       })
       .catch(() => {});
-  }, []);
+  }, [settingsHostId]);
 
   const loadApiKeyProviders = useCallback(() => {
-    fetch("/api/auth/all-providers")
+    const targetHost = settingsHostId;
+    hostFetch("/api/auth/all-providers", undefined, targetHost ?? undefined)
       .then((r) => r.json())
       .then((d: { providers?: ApiKeyProvider[] }) => {
+        if (settingsHostRef.current !== targetHost) return;
         if (Array.isArray(d.providers)) setApiKeyProviders(d.providers);
       })
       .catch(() => {});
-  }, []);
+  }, [settingsHostId]);
 
   const loadRuntimeModels = useCallback(async () => {
+    const targetHost = settingsHostId;
     setRuntimeModelsLoading(true);
     try {
-      const response = await fetch("/api/models", { cache: "no-store" });
+      const response = await hostFetch("/api/models", { cache: "no-store" }, targetHost ?? undefined);
       const data = response.ok ? await response.json() as { modelList?: RuntimeModelEntry[]; connectedProviders?: ConnectedProvider[] } : null;
+      if (settingsHostRef.current !== targetHost) return;
       setRuntimeModels(data?.modelList ?? []);
       setConnectedProviders(data?.connectedProviders ?? []);
     } catch {
+      if (settingsHostRef.current !== targetHost) return;
       setRuntimeModels([]);
       setConnectedProviders([]);
     } finally {
-      setRuntimeModelsLoading(false);
+      if (settingsHostRef.current === targetHost) setRuntimeModelsLoading(false);
     }
-  }, []);
+  }, [settingsHostId]);
 
   const loadConfig = useCallback(() => {
+    const targetHost = settingsHostId;
     setLoading(true);
-    fetch("/api/models-config")
+    hostFetch("/api/models-config", undefined, targetHost ?? undefined)
       .then((r) => r.json())
       .then((d: ModelsFileData & { parseError?: string; code?: string; path?: string }) => {
+        if (settingsHostRef.current !== targetHost) return;
         if (d.parseError) {
           setParseError({ message: d.parseError, path: d.path });
           setConfig({ providers: {} });
@@ -1783,35 +1842,51 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
         const keys = Object.keys(normalized.providers ?? {});
         if (keys.length > 0) setSelection({ type: "provider", name: keys[0] });
       })
-      .catch(() => setConfig({ providers: {} }))
-      .finally(() => setLoading(false));
-  }, []);
+      .catch(() => { if (settingsHostRef.current === targetHost) setConfig({ providers: {} }); })
+      .finally(() => { if (settingsHostRef.current === targetHost) setLoading(false); });
+  }, [settingsHostId]);
 
+  // Machine switch: clear the previous machine's providers, accounts and
+  // runtime models before the reloads land, so no stale row lingers on screen
+  // (and none of it can be saved back to the machine now selected).
   useEffect(() => {
+    setConfig({ providers: {} });
+    setSelection(null);
+    setParseError(null);
+    setOauthProviders([]);
+    setApiKeyProviders([]);
+    setRuntimeModels([]);
+    setConnectedProviders([]);
+    setSaveError(null);
+    setSavedOk(false);
     loadConfig();
     loadOAuthProviders();
     loadApiKeyProviders();
     loadRuntimeModels();
   }, [loadConfig, loadOAuthProviders, loadApiKeyProviders, loadRuntimeModels]);
 
+  // The pinned composer models belong to the machine being edited: reload the
+  // set when the machine changes, and never write one machine's ids under
+  // another's key.
   useEffect(() => {
+    setVisibleModelKeys(null);
     try {
-      const stored = JSON.parse(localStorage.getItem(COMPOSER_MODELS_STORAGE_KEY) ?? "null");
+      const stored = JSON.parse(localStorage.getItem(composerModelsStorageKey(settingsHostId)) ?? "null");
       if (Array.isArray(stored)) setVisibleModelKeys(new Set(stored.filter((item): item is string => typeof item === "string")));
     } catch {
       // Invalid UI-only preferences fall back to showing all native runtime models.
     }
-  }, []);
+  }, [settingsHostId]);
 
   useEffect(() => {
     if (visibleModelKeys === null) return;
     try {
-      localStorage.setItem(COMPOSER_MODELS_STORAGE_KEY, JSON.stringify([...visibleModelKeys]));
+      localStorage.setItem(composerModelsStorageKey(settingsHostId), JSON.stringify([...visibleModelKeys]));
       window.dispatchEvent(new Event("omp-composer-models-change"));
     } catch {
       // Storage is optional UI state; a disabled or full store must not break settings.
     }
-  }, [visibleModelKeys]);
+  }, [settingsHostId, visibleModelKeys]);
 
   const setComposerModelVisible = useCallback((model: RuntimeModelEntry, visible: boolean) => {
     setVisibleModelKeys((current) => {
@@ -1836,7 +1911,7 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
 
 
   const enableConnectedProvider = useCallback(async (provider: string) => {
-    const response = await fetch("/api/providers/enable", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider }) });
+    const response = await hostFetch("/api/providers/enable", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider }) }, settingsHostRef.current ?? undefined);
     const data = await response.json() as { error?: string };
     if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
     await loadRuntimeModels();
@@ -1938,11 +2013,12 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
     setSavedOk(false);
     try {
       const saveableConfig = omitUntouchedModelDrafts(config);
-      const res = await fetch("/api/models-config", {
+      // Write back to the machine the form was loaded from.
+      const res = await hostFetch("/api/models-config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(saveableConfig),
-      });
+      }, settingsHostRef.current ?? undefined);
       const d = await res.json() as { success?: boolean; error?: string; code?: string };
       if (!res.ok || d.error) {
         const msg = d.error || d.code ? formatApiError(d) : `HTTP ${res.status}`;
@@ -2111,6 +2187,11 @@ export function ModelsConfig({ onClose, onSelectTab, onSaved, embedded = false }
           <button onClick={onClose} aria-label={t("modelsConfig.close")} title={t("modelsConfig.close")} className="ui-focus-ring" style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", fontSize: 20, lineHeight: 1, padding: "4px 8px", minWidth: 28, minHeight: 28, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "var(--radius-control)" }}>×</button>
         </div>)}
         {!embedded && onSelectTab && <SettingsTabs active="models" onSelect={onSelectTab} />}
+
+        {/* Machine this models.yml / provider set belongs to */}
+        <div style={{ display: "flex", padding: embedded ? "14px 20px 0" : "12px 18px 0", flexShrink: 0 }}>
+          <MachineScopeNote />
+        </div>
 
         {/* Body */}
         {parseError ? (

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef, useEffect, useLayoutEffect } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect, useLayoutEffect } from "react";
 import dynamic from "next/dynamic";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useGlobalKeyboardShortcuts } from "@/hooks/useKeyboardShortcuts";
@@ -11,7 +11,7 @@ import { ChatWindow } from "./ChatWindow";
 import { TabBar, type Tab } from "./TabBar";
 import { BranchNavigator } from "./BranchNavigator";
 import { LanguageSwitcher } from "./LanguageSwitcher";
-import { Check, CircleCheck, Folder, Gauge, History, Menu, Moon, PanelLeft, Sun, Terminal, Wand2, Zap } from "lucide-react";
+import { Check, CircleCheck, Folder, Gauge, History, Menu, Moon, PanelLeft, Server, Sun, Terminal, Wand2, Zap } from "lucide-react";
 import { useTheme } from "@/hooks/useTheme";
 import { formatCompactNumber, formatPercent, getCacheHitRate } from "@/lib/format";
 import { translate, useI18n } from "@/lib/i18n";
@@ -21,6 +21,7 @@ import { copyText } from "@/lib/clipboard";
 import { getFileName } from "@/lib/file-paths";
 import { buildAtMentionText, buildFileAtMentionsText, buildFileLineMentionText } from "@/lib/file-fuzzy";
 import { getInitialNavigation } from "@/lib/initial-navigation";
+import { getCurrentHostId, hostFetch, hostNameOf, setCurrentHostId, useHosts } from "@/lib/hosts/client";
 import { comparableProjectPath } from "@/lib/comparable-path";
 import { showCompletionNotification } from "@/lib/browser-notifications";
 function projectLabel(projectPath: string): string {
@@ -213,7 +214,7 @@ type ProviderUsageState = {
   error: boolean;
 };
 
-function useProviderUsage(query: string | null, refreshMs?: number): ProviderUsageState {
+function useProviderUsage(query: string | null, refreshMs?: number, hostId: string | null = null): ProviderUsageState {
   const [state, setState] = useState<ProviderUsageState>({ snapshot: null, loading: false, error: false });
   useEffect(() => {
     if (query === null) {
@@ -224,7 +225,8 @@ function useProviderUsage(query: string | null, refreshMs?: number): ProviderUsa
     setState({ snapshot: null, loading: true, error: false });
     const load = async () => {
       try {
-        const response = await fetch(`/api/provider-usage${query ? `?${query}` : ""}`, { signal: controller.signal });
+        // Provider limits are read from the selected machine's omp.
+        const response = await hostFetch(`/api/provider-usage${query ? `?${query}` : ""}`, { signal: controller.signal }, hostId);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const snapshot = await response.json() as ProviderUsageSnapshot;
         if (!controller.signal.aborted) setState({ snapshot, loading: false, error: false });
@@ -238,7 +240,7 @@ function useProviderUsage(query: string | null, refreshMs?: number): ProviderUsa
       controller.abort();
       if (interval !== undefined) window.clearInterval(interval);
     };
-  }, [query, refreshMs]);
+  }, [query, refreshMs, hostId]);
   return state;
 }
 
@@ -246,9 +248,28 @@ function useProviderUsage(query: string | null, refreshMs?: number): ProviderUsa
 export function AppShell() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const [initialNavigation] = useState(() => getInitialNavigation(searchParams));
+  const [initialNavigation] = useState(() => {
+    const navigation = getInitialNavigation(searchParams);
+    // A `?cwd=&host=` deep link names the machine: select it before the
+    // sidebar's first host-scoped fetch. Runs once, before any store
+    // subscriber exists, so publishing here cannot interrupt another render.
+    if (navigation.host) setCurrentHostId(navigation.host);
+    return navigation;
+  });
   const { isDark, preference, toggleTheme } = useTheme();
   const { t, locale } = useI18n();
+  const { hosts, hostId } = useHosts();
+  const enabledHostCount = hosts.filter((host) => host.enabled).length;
+  // File tabs only need to name their machine once there is more than one.
+  const multipleMachines = enabledHostCount > 1;
+  const hostNamesById = useMemo(
+    () => Object.fromEntries(hosts.map((host) => [host.id, host.name])),
+    [hosts],
+  );
+  // Read inside the omp update check so a background host-list refresh (probe
+  // results, version fill-in) cannot re-trigger the check itself.
+  const hostsRef = useRef(hosts);
+  hostsRef.current = hosts;
   const isMobile = useIsMobile();
   const [selectedSession, setSelectedSession] = useState<SessionInfo | null>(null);
   // When user clicks +, we only store the cwd — no fake session id
@@ -394,21 +415,32 @@ export function AppShell() {
       active.blur();
     }
   }, [sidebarOpen, mobileSidebarReady]);
+  // omp is installed on each machine separately: re-check when the selected
+  // machine changes and drop the previous machine's result so the badge and the
+  // toast never advertise an update for a machine that is no longer selected.
+  // (The ompweb app update below is about this hub itself and stays global.)
+  useEffect(() => {
+    setOmpUpdateAvailable(false);
+    toast.close("omp-update-available");
+  }, [hostId]);
   useEffect(() => {
     const controller = new AbortController();
-    void fetch("/api/omp-update", {
+    void hostFetch("/api/omp-update", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "check" }),
       signal: controller.signal,
-    })
+    }, hostId ?? undefined)
       .then((response) => response.ok ? response.json() : null)
       .then((data: { currentVersion?: string | null; availableVersion?: string | null; updateAvailable?: boolean; updateCommand?: string } | null) => {
         setOmpUpdateAvailable(Boolean(data?.updateAvailable));
         if (!data?.updateAvailable || !data.availableVersion) return;
         const cmd = data.updateCommand || "omp update";
+        // Read the name late: the host list often finishes loading while the
+        // check is in flight, so the toast can name the machine, not its id.
+        const machine = hostNameOf(hostsRef.current, hostId);
         toast.info(
-          translate("appShell.ompUpdateAvailable"),
+          machine ? translate("appShell.ompUpdateAvailableOn", { machine }) : translate("appShell.ompUpdateAvailable"),
           <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
             <div>{translate("appShell.updateVersion", { current: data.currentVersion ?? "?", available: data.availableVersion })}</div>
             <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
@@ -443,7 +475,7 @@ export function AppShell() {
       })
       .catch(() => {});
     return () => controller.abort();
-  }, [updateCheckKey]);
+  }, [updateCheckKey, hostId]);
   useEffect(() => {
     const recheck = () => {
       if (document.visibilityState !== "visible") return;
@@ -810,7 +842,7 @@ export function AppShell() {
     ? new URLSearchParams({ provider: activeProvider, ...(activeModelId ? { model: activeModelId } : {}) }).toString()
     : null;
   const { snapshot: providerUsage, loading: providerUsageLoading, error: providerUsageError } =
-    useProviderUsage(providerUsageQuery, 5 * 60_000);
+    useProviderUsage(providerUsageQuery, 5 * 60_000, hostId);
 
 
   useEffect(() => {
@@ -837,7 +869,7 @@ export function AppShell() {
     setActiveTopPanel((cur) => cur === panel ? null : panel);
   }, [isMobile]);
   const { snapshot: allProviderUsage, loading: allProviderUsageLoading, error: allProviderUsageError } =
-    useProviderUsage(activeTopPanel === "usage" ? "" : null, 5 * 60_000);
+    useProviderUsage(activeTopPanel === "usage" ? "" : null, 5 * 60_000, hostId);
 
   useEffect(() => {
     if (!providerUsageVisible && activeTopPanel === "usage") setActiveTopPanel(null);
@@ -1004,12 +1036,13 @@ export function AppShell() {
     setInitialCwdStatus("validating");
     setInitialCwdError(null);
 
-    void fetch("/api/cwd/validate", {
+    // Validate on the machine the link names (the store already selected it).
+    void hostFetch("/api/cwd/validate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ cwd: requestedCwd }),
       signal: controller.signal,
-    })
+    }, initialNavigation.host ?? undefined)
       .then(async (response) => {
         const data = await response.json().catch(() => ({})) as { cwd?: string; error?: string; code?: string };
         if (!response.ok || !data.cwd) {
@@ -1030,7 +1063,7 @@ export function AppShell() {
     return () => controller.abort();
   }, [initialNavigation]);
 
-  const handleCwdChange = useCallback((cwd: string | null, projectRoot?: string | null) => {
+  const handleCwdChange = useCallback((cwd: string | null, projectRoot?: string | null, cwdHostId?: string | null) => {
     setActiveCwd(cwd);
     // Skip if cwd is null (initial mount) or during the initial URL restore.
     if (!cwd) return;
@@ -1047,7 +1080,9 @@ export function AppShell() {
     // sidebar's resolved project root.
     const newProject = projectRoot ?? cwd;
     const sessionProject = selectedSession ? (selectedSession.projectRoot ?? selectedSession.cwd) : null;
-    if (sessionProject && comparableProjectPath(sessionProject) === comparableProjectPath(newProject)) {
+    // The same path on another machine is another project.
+    const sameMachine = !selectedSession?.host || !cwdHostId || selectedSession.host === cwdHostId;
+    if (sameMachine && sessionProject && comparableProjectPath(sessionProject) === comparableProjectPath(newProject)) {
       return;
     }
     // Close any session that belongs to a different project — it no longer
@@ -1071,6 +1106,8 @@ export function AppShell() {
     // re-select, notification click) must not bump sessionKey: that remounts
     // ChatWindow, reconnects SSE, and drops the mid-run streaming view.
     if (!isRestore && session.id === selectedSession?.id) return;
+    // Host-scoped calls (files, worktrees, models…) follow the session's machine.
+    if (session.host) setCurrentHostId(session.host);
     setNewSessionCwd(null);
     setSelectedSession(session);
     setSessionKey((k) => k + 1);
@@ -1292,11 +1329,14 @@ export function AppShell() {
     });
   }, [fileTabs]);
 
-  const handleOpenFile = useCallback((filePath: string, fileName: string, sourceSessionId?: string | null) => {
-    const tabId = `file:${filePath}`;
+  // A file is identified by (machine, path): the same path on another machine
+  // is a different file, so it gets its own tab and its own requests.
+  const handleOpenFile = useCallback((filePath: string, fileName: string, sourceSessionId?: string | null, fileHostId?: string | null) => {
+    const tabHostId = fileHostId ?? getCurrentHostId();
+    const tabId = `file:${tabHostId ?? "?"}:${filePath}`;
     setFileTabs((prev) => {
       const existing = prev.find((t) => t.id === tabId);
-      if (!existing) return [...prev, { id: tabId, label: fileName, filePath, sourceSessionId }];
+      if (!existing) return [...prev, { id: tabId, label: fileName, filePath, hostId: tabHostId, sourceSessionId }];
       if (!sourceSessionId || existing.sourceSessionId === sourceSessionId) return prev;
       return prev.map((t) => t.id === tabId ? { ...t, sourceSessionId } : t);
     });
@@ -1306,9 +1346,15 @@ export function AppShell() {
     if (isMobile) setSidebarOpen(false);
   }, [isMobile]);
 
+  /** Files browsed in the sidebar belong to the machine being browsed. */
+  const handleOpenExplorerFile = useCallback((filePath: string, fileName: string) => {
+    handleOpenFile(filePath, fileName, null, hostId);
+  }, [handleOpenFile, hostId]);
+
+  /** A file linked from a transcript belongs to that session's machine. */
   const handleOpenLinkedFile = useCallback((filePath: string) => {
-    handleOpenFile(filePath, getFileName(filePath), selectedSession?.id ?? null);
-  }, [handleOpenFile, selectedSession?.id]);
+    handleOpenFile(filePath, getFileName(filePath), selectedSession?.id ?? null, selectedSession?.host ?? hostId);
+  }, [handleOpenFile, hostId, selectedSession?.host, selectedSession?.id]);
 
   const handleViewFullHistory = useCallback(() => {
     if (!selectedSession) return;
@@ -1351,7 +1397,7 @@ export function AppShell() {
             handleNewSession(`palette-${Date.now()}`, activeCwd);
             return;
           }
-          void fetch("/api/default-cwd", { method: "POST" })
+          void hostFetch("/api/default-cwd", { method: "POST" })
             .then(async (response) => {
               const data = (await response.json().catch(() => ({}))) as { cwd?: string };
               if (!response.ok || !data.cwd) throw new Error(`HTTP ${response.status}`);
@@ -1373,7 +1419,7 @@ export function AppShell() {
         onSessionDeleted={handleSessionDeleted}
         selectedCwd={selectedSession?.cwd ?? newSessionCwd ?? null}
         onCwdChange={handleCwdChange}
-        onOpenFile={handleOpenFile}
+        onOpenFile={handleOpenExplorerFile}
         explorerRefreshKey={explorerRefreshKey}
         onExplorerRefresh={handleExplorerRefresh}
         explorerRefreshing={explorerRefreshing}
@@ -1381,6 +1427,7 @@ export function AppShell() {
         onAtMention={handleAtMention}
         onAtMentions={handleAtMentions}
         onOpenSettings={() => setSettingsTab("general")}
+        onManageMachines={() => setSettingsTab("machines")}
         onOpenArchive={() => setArchiveBrowserOpen(true)}
         updateAvailable={Boolean(appUpdate?.updateAvailable) || ompUpdateAvailable}
       />
@@ -1603,6 +1650,8 @@ export function AppShell() {
           {/* Center Zone: Workspace & Session Breadcrumb + Auto-name action */}
           {showChat && (() => {
             const effectiveProject = selectedSession?.projectRoot ?? selectedSession?.cwd ?? activeCwd ?? "";
+            // Machine chip only when several machines are enabled.
+            const machineLabel = enabledHostCount > 1 ? hostNameOf(hosts, selectedSession?.host ?? hostId) : "";
             const sessionTitle = selectedSession?.name || selectedSession?.firstMessage || t("appShell.newSession");
             const hasMessages = Boolean(
               selectedSession
@@ -1661,6 +1710,18 @@ export function AppShell() {
                     flexShrink: 1,
                   }}
                 >
+                  {machineLabel ? (
+                    <>
+                      <Server size={12} strokeWidth={1.8} style={{ opacity: 0.6, flexShrink: 0 }} aria-hidden="true" />
+                      <span
+                        style={{ fontWeight: 600, color: "var(--text-muted)", flexShrink: 0, maxWidth: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                        title={t("hosts.sidebar.badge", { name: machineLabel })}
+                      >
+                        {machineLabel}
+                      </span>
+                      <span style={{ color: "var(--text-dim)", flexShrink: 0, opacity: 0.5 }}>/</span>
+                    </>
+                  ) : null}
                   {effectiveProject ? (
                     <>
                       <Folder size={12} strokeWidth={1.8} style={{ opacity: 0.6, flexShrink: 0 }} aria-hidden="true" />
@@ -2368,6 +2429,7 @@ export function AppShell() {
           <div style={{ flex: 1, overflow: "hidden" }}>
             <TabBar
               tabs={fileTabs}
+              hostNames={multipleMachines ? hostNamesById : undefined}
               activeTabId={activeFileTabId ?? ""}
               onSelectTab={setActiveFileTabId}
               onCloseTab={handleCloseFileTab}
@@ -2383,6 +2445,7 @@ export function AppShell() {
               <FileViewer
                 filePath={tab.filePath}
                 cwd={activeCwd ?? undefined}
+                hostId={tab.hostId}
                 sourceSessionId={tab.sourceSessionId}
                 gitRefreshKey={explorerRefreshKey}
                 onMentionLines={tab.id === activeFileTabId && rightPanelOpen ? handleFileLineMention : undefined}
@@ -2390,6 +2453,7 @@ export function AppShell() {
                   filePath,
                   getFileName(filePath),
                   tab.sourceSessionId,
+                  tab.hostId,
                 )}
               />
             </div>

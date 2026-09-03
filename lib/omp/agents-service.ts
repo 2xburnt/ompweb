@@ -1,11 +1,10 @@
-import { execFileSync } from "child_process";
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "fs";
-import { homedir } from "os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { currentHost, withHost } from "../hosts/context";
+import type { Host } from "../hosts/registry";
 import { isRecord } from "../type-guards";
+import { isMissingFileError, readTextFile, runHostScript, scanTextFiles } from "./host-io";
 import { resolveOmpBin } from "./omp-cli";
-import { getAgentsBundledCacheDir, getProjectAgentsDir, getUserAgentsDir } from "./paths";
+import { getAgentsBundledCacheDir, getUserAgentsDir, hostHomedir, resolveProjectAgentsDir } from "./paths";
 
 export type AgentSource = "bundled" | "user" | "project";
 export type AgentInfo = {
@@ -51,7 +50,7 @@ export const THINKING_LEVELS = new Set(["auto", "off", "minimal", "low", "medium
 export const MAX_AGENT_BYTES = 512 * 1024;
 
 declare global {
-  var __ompBundledAgentsCache: { path: string; checkedAt: number } | undefined;
+  var __ompBundledAgentsCache: Map<string, { path: string; checkedAt: number }> | undefined;
 }
 
 export function parseAgentFrontmatter(content: string): ParsedAgentFrontmatter {
@@ -70,17 +69,24 @@ export function parseAgentFrontmatter(content: string): ParsedAgentFrontmatter {
 
 type AgentScanRoot = { dir: string; source: AgentSource; scope: "user" | "project" | "bundled" };
 
-export function buildAgentScanRoots(cwd?: string): AgentScanRoot[] {
+/** Where omp's bundled agents are unpacked for inspection: a temp directory on
+ * the host that runs omp (its bundled set depends on the installed version). */
+export function getBundledAgentsCacheDir(host: Host = currentHost()): string {
+  if (host.isLocal) return getAgentsBundledCacheDir();
+  return host.pathApi.join(host.tmp ?? "/tmp", "omp-web-bundled-agents");
+}
+
+export async function buildAgentScanRoots(cwd?: string, host: Host = currentHost()): Promise<AgentScanRoot[]> {
   const roots: AgentScanRoot[] = [
-    { dir: getAgentsBundledCacheDir(), source: "bundled", scope: "bundled" },
+    { dir: getBundledAgentsCacheDir(host), source: "bundled", scope: "bundled" },
   ];
-  if (cwd) roots.push({ dir: getProjectAgentsDir(cwd), source: "project", scope: "project" });
-  roots.push({ dir: getUserAgentsDir(), source: "user", scope: "user" });
+  if (cwd) roots.push({ dir: await withHost(host, () => resolveProjectAgentsDir(cwd)), source: "project", scope: "project" });
+  roots.push({ dir: withHost(host, () => getUserAgentsDir()), source: "user", scope: "user" });
   return roots;
 }
 
-export function getAgentScanRootDirs(cwd?: string): string[] {
-  return buildAgentScanRoots(cwd).map((root) => root.dir);
+export async function getAgentScanRootDirs(cwd?: string, host: Host = currentHost()): Promise<string[]> {
+  return (await buildAgentScanRoots(cwd, host)).map((root) => root.dir);
 }
 
 function asStringArray(value: unknown, field: string): string[] | undefined {
@@ -130,74 +136,84 @@ function validateFrontmatter(frontmatter: Record<string, unknown>, filename?: st
   return errors;
 }
 
-function infoFromContent(content: string, filePath: string, source: AgentSource, scope: AgentInfo["scope"], fallbackName?: string): AgentInfo {
+function infoFromContent(host: Host, content: string, filePath: string, source: AgentSource, scope: AgentInfo["scope"], fallbackName?: string): AgentInfo {
   const { frontmatter, body } = parseAgentFrontmatter(content);
   const normalized = normalizeFrontmatter(frontmatter);
-  const errors = validateFrontmatter(frontmatter, basename(filePath));
-  return { ...normalized, name: normalized.name || fallbackName || basename(filePath, ".md"), body, filePath, source, scope, valid: errors.length === 0, rawFrontmatter: frontmatter };
+  const fileName = host.pathApi.basename(filePath);
+  const errors = validateFrontmatter(frontmatter, fileName);
+  return { ...normalized, name: normalized.name || fallbackName || fileName.replace(/\.md$/i, ""), body, filePath, source, scope, valid: errors.length === 0, rawFrontmatter: frontmatter };
 }
 
-async function scanRoot(root: AgentScanRoot, diagnostics: AgentDiagnostic[]): Promise<AgentInfo[]> {
-  try {
-    if (lstatSync(root.dir).isSymbolicLink()) {
-      diagnostics.push({ type: "warning", message: "Skipped symbolic-link agents directory", path: root.dir });
-      return [];
-    }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") diagnostics.push({ type: "warning", message: `Failed to inspect agents directory: ${String(error)}`, path: root.dir });
-  }
-  let entries;
-  try { entries = readdirSync(root.dir, { withFileTypes: true }); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") diagnostics.push({ type: "warning", message: `Failed to read agents directory: ${String(error)}`, path: root.dir }); return []; }
+/** Read every agent file under every root — one round trip on a remote host. */
+async function scanRoots(host: Host, roots: AgentScanRoot[], diagnostics: AgentDiagnostic[]): Promise<AgentInfo[]> {
+  const scan = await scanTextFiles(host, roots.map((root) => root.dir), "markdown-files", MAX_AGENT_BYTES);
+  for (const dir of scan.symlinkRoots) diagnostics.push({ type: "warning", message: "Skipped symbolic-link agents directory", path: dir });
+  for (const dir of scan.unreadableRoots) diagnostics.push({ type: "warning", message: "Failed to read agents directory", path: dir });
+  for (const filePath of scan.unreadableFiles) diagnostics.push({ type: "warning", message: "Failed to read agent file", path: filePath });
   const agents: AgentInfo[] = [];
-  for (const entry of entries) {
-    if (entry.name.startsWith(".") || !entry.name.toLowerCase().endsWith(".md") || !entry.isFile()) continue;
-    const filePath = join(root.dir, entry.name);
-    try {
-      if (statSync(filePath).size > MAX_AGENT_BYTES) { diagnostics.push({ type: "warning", message: "Agent file is too large to inspect", path: filePath }); continue; }
-      const content = readFileSync(filePath, "utf8");
-      const info = infoFromContent(content, filePath, root.source, root.scope, basename(entry.name, ".md"));
-      if (!info.valid) diagnostics.push({ type: "warning", message: `Invalid agent ${info.name}: ${validateFrontmatter(info.rawFrontmatter ?? {}).join(", ")}`, path: filePath });
+  for (const root of roots) {
+    const files = scan.files.filter((file) => file.root === root.dir).sort((a, b) => a.path.localeCompare(b.path));
+    for (const file of files) {
+      if (file.truncated) {
+        diagnostics.push({ type: "warning", message: "Agent file is too large to inspect", path: file.path });
+        continue;
+      }
+      const fallbackName = host.pathApi.basename(file.path).replace(/\.md$/i, "");
+      const info = infoFromContent(host, file.content, file.path, root.source, root.scope, fallbackName);
+      if (!info.valid) diagnostics.push({ type: "warning", message: `Invalid agent ${info.name}: ${validateFrontmatter(info.rawFrontmatter ?? {}).join(", ")}`, path: file.path });
       agents.push(info);
-    } catch (error) { diagnostics.push({ type: "warning", message: `Failed to read agent file: ${String(error)}`, path: filePath }); }
+    }
   }
   return agents;
 }
 
-export function unpackBundled(targetDir: string, force = false): { targetDir: string; total: number; written: number; skipped: number } {
-  const safeTargetDir = secureScopeDir(targetDir);
-  const before = new Set(readdirSync(safeTargetDir, { withFileTypes: true }).filter((entry) => entry.name.toLowerCase().endsWith(".md")).map((entry) => entry.name));
-  const bin = resolveOmpBin() ?? "omp";
-  execFileSync(bin, ["agents", "unpack", "--dir", safeTargetDir, "--json", ...(force ? ["--force"] : [])], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-  const after = readdirSync(safeTargetDir, { withFileTypes: true }).filter((entry) => entry.name.toLowerCase().endsWith(".md")).map((entry) => entry.name);
+async function listMarkdownNames(host: Host, dir: string): Promise<string[]> {
+  try {
+    return (await host.fs.readdir(dir)).filter((entry) => entry.name.toLowerCase().endsWith(".md")).map((entry) => entry.name);
+  } catch (error) {
+    if (isMissingFileError(error)) return [];
+    throw error;
+  }
+}
+
+/** `omp agents unpack` on the host: writes the bundled agents into targetDir. */
+export async function unpackBundled(targetDir: string, force = false, host: Host = currentHost()): Promise<{ targetDir: string; total: number; written: number; skipped: number }> {
+  const safeTargetDir = await secureScopeDir(targetDir, host);
+  const before = new Set(await listMarkdownNames(host, safeTargetDir));
+  const bin = resolveOmpBin(host) ?? "omp";
+  await host.executor.exec([bin, "agents", "unpack", "--dir", safeTargetDir, "--json", ...(force ? ["--force"] : [])], {
+    timeoutMs: 2 * 60_000,
+    maxBuffer: 16 * 1024 * 1024,
+    env: { FORCE_COLOR: "0", NO_COLOR: "1" },
+  });
+  const after = await listMarkdownNames(host, safeTargetDir);
   const written = after.filter((name) => !before.has(name)).length;
   return { targetDir, total: after.length, written, skipped: Math.max(0, after.length - written) };
 }
 
-export async function ensureBundledAgentsCache(): Promise<string> {
-  const cacheDir = getAgentsBundledCacheDir();
-  const cached = globalThis.__ompBundledAgentsCache;
+export async function ensureBundledAgentsCache(host: Host = currentHost()): Promise<string> {
+  const cacheDir = getBundledAgentsCacheDir(host);
+  const caches = (globalThis.__ompBundledAgentsCache ??= new Map());
+  const cached = caches.get(host.id);
   if (cached && cached.path === cacheDir && Date.now() - cached.checkedAt < 60_000) return cacheDir;
-  mkdirSync(cacheDir, { recursive: true });
-  const files = readdirSync(cacheDir).filter((name) => name.toLowerCase().endsWith(".md"));
+  await host.fs.mkdir(cacheDir, { recursive: true });
+  const files = await listMarkdownNames(host, cacheDir);
   if (files.length === 0 && (!cached || Date.now() - cached.checkedAt >= 60_000)) {
-    try { unpackBundled(cacheDir, false); } catch { /* discovery reports the missing/failed binary */ }
+    try { await unpackBundled(cacheDir, false, host); } catch { /* discovery reports the missing/failed binary */ }
   }
-  globalThis.__ompBundledAgentsCache = { path: cacheDir, checkedAt: Date.now() };
+  caches.set(host.id, { path: cacheDir, checkedAt: Date.now() });
   return cacheDir;
 }
 
-export async function discoverAgents(cwd?: string): Promise<{ agents: AgentInfo[]; diagnostics: AgentDiagnostic[]; bundledPath?: string }> {
+export async function discoverAgents(cwd?: string, host: Host = currentHost()): Promise<{ agents: AgentInfo[]; diagnostics: AgentDiagnostic[]; bundledPath?: string }> {
   const diagnostics: AgentDiagnostic[] = [];
-  const roots = buildAgentScanRoots(cwd);
-  const bundledPath = await ensureBundledAgentsCache();
-  if (!resolveOmpBin()) diagnostics.push({ type: "error", message: "omp binary is not installed; bundled agents could not be unpacked" });
+  const roots = await buildAgentScanRoots(cwd, host);
+  const bundledPath = await ensureBundledAgentsCache(host);
+  if (!resolveOmpBin(host)) diagnostics.push({ type: "error", message: "omp binary is not installed; bundled agents could not be unpacked" });
   const byName = new Map<string, AgentInfo>();
-  for (const root of roots) {
-    for (const agent of await scanRoot(root, diagnostics)) {
-      const key = process.platform === "win32" ? agent.name.toLowerCase() : agent.name;
-      byName.set(key, agent);
-    }
+  for (const agent of await scanRoots(host, roots, diagnostics)) {
+    const key = host.platform === "win32" ? agent.name.toLowerCase() : agent.name;
+    byName.set(key, agent);
   }
   return { agents: [...byName.values()].sort((a, b) => a.name.localeCompare(b.name)), diagnostics, bundledPath };
 }
@@ -222,74 +238,87 @@ export function serializeAgent(frontmatter: Record<string, unknown>, body: strin
   return `---${eol}${yaml}${eol}---${eol}${body}`;
 }
 
-export function getAgentFilePath(scopeDir: string, name: string): string {
+export function getAgentFilePath(scopeDir: string, name: string, host: Host = currentHost()): string {
   if (!AGENT_NAME_RE.test(name)) throw new Error("invalid agent name");
-  return join(scopeDir, `${name}.md`);
+  return host.pathApi.join(scopeDir, `${name}.md`);
 }
 
-function sameAgentPath(left: string, right: string): boolean {
-  const a = resolve(left);
-  const b = resolve(right);
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
-}
-
-// On a case-insensitive filesystem (macOS APFS default) a case-only rename
-// resolves both names to the same directory entry even though the POSIX
-// string compare differs. realpathSync.native (realpath(3)) returns the
-// on-disk casing — the JS realpathSync preserves input casing — so case
-// aliases compare equal while distinct hardlink entries to the same inode
-// (a real name collision) stay distinct.
-function sameOnDiskEntry(left: string, right: string): boolean {
-  try {
-    return realpathSync.native(left) === realpathSync.native(right);
-  } catch {
-    return false;
-  }
-}
-
-export function validateAgentFileReference(scopeDir: string, name: string): void {
+export async function validateAgentFileReference(scopeDir: string, name: string, host: Host = currentHost()): Promise<void> {
   if (!AGENT_NAME_RE.test(name)) throw new Error(`name must match ${AGENT_NAME_RE.source}`);
-  const filePath = getAgentFilePath(scopeDir, name);
-  if (!existsSync(filePath)) throw new Error("agent file not found");
+  const filePath = getAgentFilePath(scopeDir, name, host);
+  if (!(await host.fs.exists(filePath))) throw new Error("agent file not found");
 }
 
-function secureScopeDir(scopeDir: string): string {
-  const resolved = resolve(scopeDir);
-  let current = resolved;
-  while (true) {
-    try {
-      const stat = lstatSync(current);
-      if (stat.isSymbolicLink()) throw new Error("agent scope path may not contain a symbolic link");
-      if (current === resolved && !stat.isDirectory()) throw new Error("agent scope path is not a directory");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+/** Refuse scope directories that are (or sit below) a symlink, then make sure
+ * the directory exists. Remote hosts do the whole walk in one round trip. */
+async function secureScopeDir(scopeDir: string, host: Host): Promise<string> {
+  const pathApi = host.pathApi;
+  const resolved = pathApi.resolve(scopeDir);
+  if (host.isLocal) {
+    let current = resolved;
+    while (true) {
+      try {
+        const stat = await host.fs.lstat(current);
+        if (stat.isSymbolicLink()) throw new Error("agent scope path may not contain a symbolic link");
+        if (current === resolved && !stat.isDirectory()) throw new Error("agent scope path is not a directory");
+      } catch (error) {
+        if (!isMissingFileError(error)) throw error;
+      }
+      const parent = pathApi.dirname(current);
+      if (parent === current) break;
+      current = parent;
     }
-    const parent = dirname(current);
-    if (parent === current) break;
-    current = parent;
+    await host.fs.mkdir(resolved, { recursive: true });
+  } else {
+    const script = [
+      'p="$1"',
+      "while :; do",
+      '  if [ -L "$p" ]; then echo symlink; exit 0; fi',
+      '  if [ "$p" = "$1" ] && [ -e "$p" ] && ! [ -d "$p" ]; then echo notdir; exit 0; fi',
+      '  q=$(dirname -- "$p"); [ "$q" = "$p" ] && break; p="$q"',
+      "done",
+      'mkdir -p -- "$1" || { echo mkdirfail; exit 0; }',
+      "echo ok",
+    ].join("\n");
+    const { stdout } = await runHostScript(host, script, [resolved]);
+    const verdict = stdout.toString("utf8").trim();
+    if (verdict === "symlink") throw new Error("agent scope path may not contain a symbolic link");
+    if (verdict === "notdir") throw new Error("agent scope path is not a directory");
+    if (verdict !== "ok") throw new Error(`could not create agent scope directory ${resolved}`);
   }
-  mkdirSync(resolved, { recursive: true });
-  const stat = lstatSync(resolved);
+  const stat = await host.fs.lstat(resolved);
   if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("agent scope directory is not a regular directory");
   return resolved;
 }
 
-export function writeAgent(scopeDir: string, name: string, payload: AgentPayload, previousName?: string): { path: string } {
+export async function writeAgent(scopeDir: string, name: string, payload: AgentPayload, previousName?: string, host: Host = currentHost()): Promise<{ path: string }> {
   if (!AGENT_NAME_RE.test(name)) throw new Error("invalid agent name");
   validateAgentPayload({ ...payload, name });
-  const dir = secureScopeDir(scopeDir);
-  if (previousName !== undefined) validateAgentFileReference(dir, previousName);
-  const filePath = getAgentFilePath(dir, name);
-  const previousPath = previousName ? getAgentFilePath(dir, previousName) : undefined;
-  if (existsSync(filePath) && lstatSync(filePath).isSymbolicLink()) throw new Error("agent file may not be a symbolic link");
-  const replacesPreviousPath = Boolean(previousPath && (sameAgentPath(filePath, previousPath) || sameOnDiskEntry(filePath, previousPath)));
-  if (existsSync(filePath) && !replacesPreviousPath) throw new Error("agent file already exists");
+  const dir = await secureScopeDir(scopeDir, host);
+  if (previousName !== undefined) await validateAgentFileReference(dir, previousName, host);
+  const pathApi = host.pathApi;
+  const fileName = `${name}.md`;
+  const filePath = pathApi.join(dir, fileName);
+  const previousPath = previousName ? getAgentFilePath(dir, previousName, host) : undefined;
+  const entries = new Map((await host.fs.readdir(dir)).map((entry) => [entry.name, entry]));
+  const exact = entries.get(fileName);
+  if (exact?.isSymbolicLink()) throw new Error("agent file may not be a symbolic link");
+  // On a case-insensitive filesystem (macOS APFS default, Windows) the new
+  // name can resolve to an existing entry that is listed under different
+  // casing. A case-only rename must treat that entry as the file being
+  // replaced, while distinct entries (hardlinks, real collisions) stay
+  // collisions.
+  const targetExists = exact !== undefined || (await host.fs.exists(filePath));
+  const sameName = previousName !== undefined && (host.platform === "win32" ? previousName.toLowerCase() === name.toLowerCase() : previousName === name);
+  const caseAlias = previousName !== undefined && !sameName && previousName.toLowerCase() === name.toLowerCase() && targetExists && exact === undefined;
+  const replacesPreviousPath = previousName !== undefined && (sameName || caseAlias);
+  if (targetExists && !replacesPreviousPath) throw new Error("agent file already exists");
   const preserved: Record<string, unknown> = isRecord(payload.existingFrontmatter) ? { ...payload.existingFrontmatter } : {};
-  if (previousPath && existsSync(previousPath)) {
-    if (lstatSync(previousPath).isSymbolicLink()) throw new Error("agent file may not be a symbolic link");
+  if (previousPath) {
+    if (entries.get(`${previousName}.md`)?.isSymbolicLink()) throw new Error("agent file may not be a symbolic link");
     try {
-      const previousContent = readFileSync(previousPath, "utf8");
-      Object.assign(preserved, parseAgentFrontmatter(previousContent).frontmatter);
+      const previousContent = await readTextFile(host, previousPath, MAX_AGENT_BYTES);
+      if (previousContent !== null) Object.assign(preserved, parseAgentFrontmatter(previousContent).frontmatter);
     } catch {
       // The new form remains writable even if an old file cannot be parsed.
     }
@@ -306,58 +335,59 @@ export function writeAgent(scopeDir: string, name: string, payload: AgentPayload
   const body = typeof payload.body === "string" ? payload.body : "";
   const serialized = serializeAgent(frontmatter, body);
   if (Buffer.byteLength(serialized, "utf8") > MAX_AGENT_BYTES) throw new Error("agent file is too large");
-  const tmpPath = join(dir, `.${name}.${process.pid}.${Date.now()}.tmp`);
-  writeFileSync(tmpPath, serialized, { encoding: "utf8", flag: "wx" });
+  // Renaming over a case-variant keeps the OLD directory entry's casing on a
+  // case-insensitive filesystem, and Windows may refuse to replace an open
+  // file: move the old entry aside first so the new name's casing lands on
+  // disk and the update stays atomic from the caller's view.
   let displacedPath: string | undefined;
+  if ((host.platform === "win32" || caseAlias) && replacesPreviousPath && targetExists) {
+    displacedPath = `${filePath}.${process.pid}.${Date.now()}.old`;
+    await host.fs.rename(filePath, displacedPath);
+  }
   try {
-    // Windows cannot replace an existing file with renameSync, and on a
-    // case-insensitive filesystem (macOS APFS default) renaming over a
-    // case-variant keeps the OLD directory entry's casing. Move the old file
-    // aside first so updates and case-only renames remain atomic from the
-    // caller's view and the new name's casing lands on disk.
-    const caseOnlyReplace = Boolean(previousPath && !sameAgentPath(filePath, previousPath) && sameOnDiskEntry(filePath, previousPath));
-    if ((process.platform === "win32" || caseOnlyReplace) && replacesPreviousPath && existsSync(filePath)) {
-      displacedPath = `${filePath}.${process.pid}.${Date.now()}.old`;
-      renameSync(filePath, displacedPath);
-    }
-    renameSync(tmpPath, filePath);
+    // host.fs.writeFile is atomic (temp file + rename in the target directory).
+    await host.fs.writeFile(filePath, serialized);
   } catch (error) {
-    if (displacedPath && existsSync(displacedPath) && !existsSync(filePath)) renameSync(displacedPath, filePath);
-    if (existsSync(tmpPath)) unlinkSync(tmpPath);
+    if (displacedPath) await host.fs.rename(displacedPath, filePath).catch(() => {});
     throw error;
   }
-  if (displacedPath && existsSync(displacedPath)) unlinkSync(displacedPath);
-  if (previousPath && !replacesPreviousPath && existsSync(previousPath)) {
-    unlinkSync(previousPath);
-  }
+  if (displacedPath) await host.fs.rm(displacedPath, { force: true }).catch(() => {});
+  if (previousPath && !replacesPreviousPath) await host.fs.rm(previousPath, { force: true }).catch(() => {});
   return { path: filePath };
 }
 
-export function deleteAgent(scopeDir: string, name: string): { path: string } {
-  const dir = secureScopeDir(scopeDir);
-  validateAgentFileReference(dir, name);
-  const filePath = getAgentFilePath(dir, name);
-  if (!existsSync(filePath)) throw new Error("agent file not found");
-  if (lstatSync(filePath).isSymbolicLink()) throw new Error("agent file may not be a symbolic link");
-  unlinkSync(filePath);
-  return { path: filePath };
-}
-
-export function resolveAgentsScope(cwd: string | undefined, scope: "user" | "project"): string {
-  return scope === "user" ? getUserAgentsDir() : getProjectAgentsDir(cwd || homedir());
-}
-
-export function readAgentFile(filePath: string): AgentInfo | null {
+export async function deleteAgent(scopeDir: string, name: string, host: Host = currentHost()): Promise<{ path: string }> {
+  const dir = await secureScopeDir(scopeDir, host);
+  await validateAgentFileReference(dir, name, host);
+  const filePath = getAgentFilePath(dir, name, host);
+  let stat;
   try {
-    if (statSync(filePath).size > MAX_AGENT_BYTES) return null;
-    const content = readFileSync(filePath, "utf8");
+    stat = await host.fs.lstat(filePath);
+  } catch (error) {
+    if (isMissingFileError(error)) throw new Error("agent file not found");
+    throw error;
+  }
+  if (stat.isSymbolicLink()) throw new Error("agent file may not be a symbolic link");
+  await host.fs.rm(filePath);
+  return { path: filePath };
+}
+
+export async function resolveAgentsScope(cwd: string | undefined, scope: "user" | "project", host: Host = currentHost()): Promise<string> {
+  return withHost(host, () => scope === "user" ? getUserAgentsDir() : resolveProjectAgentsDir(cwd || hostHomedir()));
+}
+
+export async function readAgentFile(filePath: string, host: Host = currentHost()): Promise<AgentInfo | null> {
+  try {
+    const content = await readTextFile(host, filePath, MAX_AGENT_BYTES);
+    if (content === null) return null;
+    const pathApi = host.pathApi;
     const isWithin = (root: string) => {
-      const rel = relative(resolve(root), resolve(filePath));
-      return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+      const rel = pathApi.relative(pathApi.resolve(root), pathApi.resolve(filePath));
+      return rel === "" || (rel !== ".." && !rel.startsWith(`..${pathApi.sep}`) && !pathApi.isAbsolute(rel));
     };
-    const bundled = isWithin(getAgentsBundledCacheDir());
-    const user = isWithin(getUserAgentsDir());
+    const bundled = isWithin(getBundledAgentsCacheDir(host));
+    const user = isWithin(withHost(host, () => getUserAgentsDir()));
     const source: AgentSource = bundled ? "bundled" : user ? "user" : "project";
-    return infoFromContent(content, filePath, source, source);
+    return infoFromContent(host, content, filePath, source, source);
   } catch { return null; }
 }

@@ -16,6 +16,19 @@ export function projectIdentityKey(projectRoot: string, platform: NodeJS.Platfor
   return normalizeForComparison(projectRoot, platform);
 }
 
+/** Project identity scoped to a host: the same path on two machines is two
+ * projects. Remote hosts are always POSIX; the local host keeps its native rules. */
+export function hostProjectKey(hostId: string, projectRoot: string, platform: NodeJS.Platform = process.platform): string {
+  return `${hostId}:${projectIdentityKey(projectRoot, platform)}`;
+}
+
+/** Split a host-scoped project key back into its parts. */
+export function parseHostProjectKey(key: string): { hostId: string; projectKey: string } {
+  const index = key.indexOf(":");
+  if (index <= 0) return { hostId: "", projectKey: key };
+  return { hostId: key.slice(0, index), projectKey: key.slice(index + 1) };
+}
+
 /** Convert paths emitted by git to the host's native separator style. */
 export function toNativePath(value: string): string {
   if (!value || process.platform !== "win32") return value;

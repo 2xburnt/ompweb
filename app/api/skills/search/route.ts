@@ -1,5 +1,7 @@
-import { NextResponse } from "next/server";
-import { runNpx } from "@/lib/npx";
+import { NextResponse, type NextRequest } from "next/server";
+import { currentHost } from "@/lib/hosts/context";
+import { withHostRoute } from "@/lib/hosts/route";
+import { NpxUnavailableError, runNpx } from "@/lib/npx";
 import type { SkillSearchResult } from "@/lib/api-types";
 
 export const dynamic = "force-dynamic";
@@ -88,7 +90,9 @@ function parseInstallCount(installs: string): number {
 }
 
 // POST /api/skills/search  body: { query: string, limit?: number }
-export async function POST(req: Request) {
+// skills.sh is queried directly; the `npx skills find` fallback runs on the
+// host (and is skipped when npx is not installed there).
+export const POST = withHostRoute(async (req: NextRequest) => {
   try {
     const { query, limit: rawLimit } = await req.json() as { query?: string; limit?: unknown };
     if (!query?.trim()) return NextResponse.json({ error: "query required", code: "query_required" }, { status: 400 });
@@ -100,17 +104,21 @@ export async function POST(req: Request) {
     } catch {
       const { stdout, stderr } = await runNpx(["skills", "find", query.trim()], {
         timeout: 20000,
-        env: { ...process.env, FORCE_COLOR: "0" },
+        env: { FORCE_COLOR: "0" },
+        host: currentHost(),
       });
 
       const results = parseSearchOutput(stdout + stderr).slice(0, limit);
       return NextResponse.json({ results });
     }
   } catch (e: unknown) {
+    if (e instanceof NpxUnavailableError) {
+      return NextResponse.json({ error: e.message, code: e.code, host: e.hostId }, { status: 501 });
+    }
     const err = e as { stdout?: string; stderr?: string; message?: string };
     const raw = (err.stdout ?? "") + (err.stderr ?? "");
     const results = raw ? parseSearchOutput(raw) : [];
     if (results.length > 0) return NextResponse.json({ results });
     return NextResponse.json({ error: err.message ?? String(e) }, { status: 500 });
   }
-}
+});

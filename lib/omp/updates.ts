@@ -1,5 +1,6 @@
-import { execFile } from "child_process";
-import { resolveOmpBin } from "./omp-cli";
+import { currentHost } from "../hosts/context";
+import { getHost, type Host } from "../hosts/registry";
+import { invalidateOmpCliCache, resolveOmpBin } from "./omp-cli";
 
 export interface OmpUpdateStatus {
   currentVersion: string | null;
@@ -13,26 +14,39 @@ export const OMP_UPDATE_CHECK_TTL_MS = 60 * 60 * 1000;
 
 export const OMP_UPDATE_INSTALL_TIMEOUT_MS = 5 * 60 * 1000;
 
-/** Run a bare `omp update` to install the latest OMP CLI. Install durability
+/** Run a bare `omp update` on the host to install the latest OMP CLI, then
+ * drop the cached binary probe and restart the host's live omp children so
+ * they pick up the new executable. Install durability for the local machine
  * (lease/status/retry) lives in lib/self-update.ts; this is the raw command. */
-export function runOmpUpdateInstall(timeoutMs = OMP_UPDATE_INSTALL_TIMEOUT_MS): Promise<string> {
-  return runOmpUpdate([], timeoutMs);
+export async function runOmpUpdateInstall(timeoutMs = OMP_UPDATE_INSTALL_TIMEOUT_MS, host: Host = currentHost()): Promise<string> {
+  const output = await runOmpUpdate([], timeoutMs, host);
+  invalidateOmpCliCache(host);
+  // Loaded lazily: rpc-manager pulls in the whole session stack, which the
+  // update check (and its tests) do not need.
+  const { restartAllRpcSessions } = await import("../rpc-manager");
+  await restartAllRpcSessions(host.id);
+  return output;
 }
 
-export function runOmpUpdate(args: string[], timeoutMs = OMP_UPDATE_CHECK_TIMEOUT_MS): Promise<string> {
-  const bin = resolveOmpBin();
-  if (!bin) return Promise.reject(new Error("omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN."));
-  const { promise, resolve, reject } = Promise.withResolvers<string>();
-  execFile(bin, ["update", ...args], {
-    timeout: timeoutMs,
+export async function runOmpUpdate(args: string[], timeoutMs = OMP_UPDATE_CHECK_TIMEOUT_MS, host: Host = currentHost()): Promise<string> {
+  const bin = resolveOmpBin(host);
+  if (!bin) {
+    throw new Error(host.isLocal
+      ? "omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN."
+      : `omp binary not found on host "${host.id}". Install oh-my-pi there or set the host's ompBin.`);
+  }
+  const result = await host.executor.exec([bin, "update", ...args], {
+    timeoutMs,
     maxBuffer: 1024 * 1024,
-    env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" },
-    windowsHide: true,
-  }, (error, stdout, stderr) => {
-    if (error) reject(new Error((stderr || stdout || error.message).trim().slice(-1000)));
-    else resolve(`${stdout}\n${stderr}`.trim());
+    env: { FORCE_COLOR: "0", NO_COLOR: "1" },
+    allowFailure: true,
   });
-  return promise;
+  const stdout = result.stdout.toString("utf8");
+  const stderr = result.stderr;
+  if (result.code !== 0) {
+    throw new Error((stderr || stdout || `omp update exited with ${result.signal ?? result.code ?? "unknown"}`).trim().slice(-1000));
+  }
+  return `${stdout}\n${stderr}`.trim();
 }
 
 export function parseOmpUpdateStatus(output: string): OmpUpdateStatus {
@@ -78,9 +92,19 @@ export function createCachedOmpUpdateCheck(
   };
 }
 
-const defaultCachedOmpUpdateCheck = createCachedOmpUpdateCheck();
+// One cached checker per host: each machine has its own omp install.
+const cachedChecks = new Map<string, ReturnType<typeof createCachedOmpUpdateCheck>>();
 
-export async function checkOmpUpdate(force = false): Promise<OmpUpdateStatus> {
-  return defaultCachedOmpUpdateCheck(force);
+function cachedCheckFor(host: Host): ReturnType<typeof createCachedOmpUpdateCheck> {
+  let check = cachedChecks.get(host.id);
+  if (!check) {
+    // Resolve the live Host on every run: hosts.json edits rebuild Host objects.
+    check = createCachedOmpUpdateCheck(() => runOmpUpdate(["--check"], OMP_UPDATE_CHECK_TIMEOUT_MS, getHost(host.id) ?? host));
+    cachedChecks.set(host.id, check);
+  }
+  return check;
 }
 
+export async function checkOmpUpdate(force = false, host: Host = currentHost()): Promise<OmpUpdateStatus> {
+  return cachedCheckFor(host)(force);
+}

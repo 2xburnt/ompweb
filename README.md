@@ -26,8 +26,8 @@ A clean, modern web UI for the [oh-my-pi (omp)](https://github.com/can1357/oh-my
 
 ## Requirements
 
-- [omp](https://github.com/can1357/oh-my-pi) installed and available on your `PATH` (or specified via `OMP_WEB_OMP_BIN`)
-- Node.js `>= 22.19.0`
+- Node.js `>= 22.19.0` on the machine that serves the web UI
+- [omp](https://github.com/can1357/oh-my-pi) on every machine you want to drive: on the serving machine itself (on `PATH` or via `OMP_WEB_OMP_BIN`) and/or on remote machines reachable over SSH (see [Machines](#machines-remote-first))
 
 ## Quick Start
 
@@ -112,6 +112,60 @@ Logs go to `~/Library/Logs/ompweb/ompweb.log` and the plist lives at
 `~/Library/LaunchAgents/com.kahme247.ompweb.plist` (mode 600; a configured
 password is stored there in plain text).
 
+## Machines (remote-first)
+
+ompweb is a hub for the machines that run `omp`. Every machine is a **host**: the
+computer serving the UI is the `local` host, and any other computer you can
+reach over SSH is an `ssh` host. Sessions, projects, files, git, settings,
+models, skills and plugins are all read from and written to the machine that
+owns them — nothing is mirrored or cached on disk on the hub, so a small hub
+(a mini PC, a VM) can front machines with large session histories.
+
+Remote machines need only `omp` and a POSIX shell with the usual coreutils
+(`find`, `stat`, `head`, `tail`, `gzip`, `git` for repository features). No
+Node.js or Bun is required there. The hub keeps one multiplexed OpenSSH
+connection per machine (`ControlMaster`), so commands cost a round trip, not a
+handshake. Authentication is whatever your `~/.ssh/config` provides (keys, an
+agent such as 1Password's, jump hosts); connections are non-interactive
+(`BatchMode=yes`), so password prompts are not supported.
+
+Machines are configured in `~/.omp-web/hosts.json` (override the directory
+with `OMP_WEB_HOME` or the file with `OMP_WEB_HOSTS_FILE`) and managed from
+**Settings → Machines** in the UI. Example:
+
+```json
+{
+  "version": 1,
+  "defaultHost": "workstation",
+  "hosts": [
+    { "id": "workstation", "name": "Workstation", "kind": "ssh", "enabled": true,
+      "ssh": { "host": "workstation.example", "user": "you", "port": 22 },
+      "ompBin": "omp", "agentDir": "~/.omp/agent", "defaultCwd": "~/work" },
+    { "id": "local", "name": "This machine", "kind": "local", "enabled": true }
+  ]
+}
+```
+
+- `ssh.host` may be an alias from `~/.ssh/config` (a Tailscale MagicDNS name works well).
+- `ompBin` and `agentDir` are optional; `omp` is looked up on the machine's `PATH` (plus `~/.local/bin`, `~/.bun/bin`, `/usr/local/bin`, `/opt/homebrew/bin`) and the agent dir defaults to `~/.omp/agent` there.
+- Disable the `local` host (`"enabled": false`) for a pure hub that only fronts remote machines.
+- A missing `hosts.json` means the classic single-machine setup: just the local host.
+
+Every host-scoped API route accepts `?host=<id>` (or an `x-omp-host` header);
+session routes derive the machine from the session id.
+
+### Updating a git checkout
+
+When ompweb runs from a git checkout (this repository), the in-app update
+check compares your branch with its tracked remote (`git fetch`) instead of
+the npm registry, shows the pending commits, and "Update and restart" runs
+`git pull --ff-only && npm ci && npm run build` before restarting. The npm
+package is never installed over a checkout. Under systemd, add
+`Environment=OMP_WEB_SERVICE=<unit>.service` to the unit so the updater can
+stop and start the service; the worker runs in a transient `systemd-run` unit
+and restores the previous build if a step fails. A checkout with uncommitted
+changes refuses to update until they are committed or stashed.
+
 ## Features
 
 - **Interactive Chat**: Real-time streaming conversation with your local `omp` agent — tool calls, thinking levels, token counts, cost, context gauge, queue controls, and interrupt & retry.
@@ -136,7 +190,9 @@ password is stored there in plain text).
 | `OMP_WEB_PASSWORD` | Optional password for web login | _None (auth disabled)_ |
 | `OMP_WEB_NO_OPEN` | Set to `1` to prevent auto-opening browser | `0` |
 | `OMP_WEB_OMP_BIN` | Path to `omp` binary if not on `PATH` | _auto-detected_ |
-| `PI_CODING_AGENT_DIR` | Custom omp agent directory | `~/.omp/agent` |
+| `PI_CODING_AGENT_DIR` | Custom omp agent directory (local host) | `~/.omp/agent` |
+| `OMP_WEB_HOME` | Directory for ompweb's own state (`hosts.json`, SSH control sockets) | `~/.omp-web` |
+| `OMP_WEB_HOSTS_FILE` | Path to the machines configuration | `$OMP_WEB_HOME/hosts.json` |
 
 ## Development
 

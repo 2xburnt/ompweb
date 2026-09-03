@@ -1,5 +1,8 @@
 "use client";
 
+import { hostFetch, useHosts } from "@/lib/hosts/client";
+import { MachineScopeNote } from "./MachineScopeNote";
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { sendAgentCommand } from "@/lib/agent-client";
 import { useIsMobile } from "@/hooks/useIsMobile";
@@ -627,6 +630,11 @@ export function PluginsConfig({
 }) {
   const isMobile = useIsMobile();
   const { t, tn } = useI18n();
+  // Plugin packages are installed per machine: reload on a machine switch and
+  // pin install/update/remove to the machine that owns the package.
+  const { hostId } = useHosts();
+  const hostRef = useRef<string | null>(hostId);
+  hostRef.current = hostId;
   const [data, setData] = useState<PluginsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -648,11 +656,13 @@ export function PluginsConfig({
   }, [packages]);
 
   const loadPlugins = useCallback(async () => {
+    const targetHost = hostId;
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/plugins?cwd=${encodeURIComponent(cwd)}`);
+      const res = await hostFetch(`/api/plugins?cwd=${encodeURIComponent(cwd)}`, undefined, targetHost ?? undefined);
       const next = (await res.json()) as PluginsResponse & { error?: string; code?: string };
+      if (hostRef.current !== targetHost) return;
       if (!res.ok || next.error) throw new Error(formatApiError(next.error ? next : `HTTP ${res.status}`));
       setData(next);
       setAddMode((current) => next.packages.length === 0 || current);
@@ -661,11 +671,22 @@ export function PluginsConfig({
         return next.packages[0] ? packageKey(next.packages[0]) : null;
       });
     } catch (err) {
+      if (hostRef.current !== targetHost) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (hostRef.current === targetHost) setLoading(false);
     }
-  }, [cwd]);
+  }, [cwd, hostId]);
+
+  // Machine switch: drop the previous machine's packages before reloading so a
+  // stale package can never be enabled, updated or removed on the new machine.
+  useEffect(() => {
+    setData(null);
+    setSelected(null);
+    setError(null);
+    setActionError(null);
+    setActionMessage(null);
+  }, [hostId]);
 
   useEffect(() => {
     void loadPlugins();
@@ -677,11 +698,11 @@ export function PluginsConfig({
     setActionError(null);
     setActionMessage(null);
     try {
-      const res = await fetch("/api/plugins", {
+      const res = await hostFetch("/api/plugins", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action, source: pkg.source, scope: pkg.scope, cwd }),
-      });
+      }, hostId ?? undefined);
       const next = (await res.json()) as PluginsResponse & { error?: string; code?: string };
       if (!res.ok || next.error) throw new Error(formatApiError(next.error ? next : `HTTP ${res.status}`));
       setData(next);
@@ -707,7 +728,7 @@ export function PluginsConfig({
     } finally {
       setBusyKey(null);
     }
-  }, [cwd, t]);
+  }, [cwd, hostId, t]);
 
   const installPlugin = useCallback(async () => {
     const source = installSource.trim();
@@ -717,11 +738,11 @@ export function PluginsConfig({
     setActionError(null);
     setActionMessage(null);
     try {
-      const res = await fetch("/api/plugins", {
+      const res = await hostFetch("/api/plugins", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "install", source, scope: installScope, cwd }),
-      });
+      }, hostId ?? undefined);
       const next = (await res.json()) as PluginsResponse & { error?: string; code?: string };
       if (!res.ok || next.error) throw new Error(formatApiError(next.error ? next : `HTTP ${res.status}`));
       setData(next);
@@ -735,7 +756,7 @@ export function PluginsConfig({
     } finally {
       setBusyKey(null);
     }
-  }, [cwd, installScope, installSource, t]);
+  }, [cwd, hostId, installScope, installSource, t]);
 
   const reloadSession = useCallback(async () => {
     if (!sessionId) return;
@@ -802,6 +823,11 @@ export function PluginsConfig({
           </button>
         </div>)}
         {!embedded && onSelectTab && <SettingsTabs active="plugins" onSelect={onSelectTab} />}
+
+        {/* Machine whose omp installation owns these plugin packages */}
+        <div style={{ display: "flex", padding: embedded ? "14px 20px 0" : "12px 18px 0", flexShrink: 0 }}>
+          <MachineScopeNote />
+        </div>
 
         <div style={{ flex: 1, display: "flex", flexDirection: isMobile ? "column" : "row", overflow: "hidden" }}>
           <div

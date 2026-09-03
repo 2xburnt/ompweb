@@ -6,14 +6,16 @@ import {
   listAllSessions,
 } from "@/lib/session-reader";
 import { resolveSessionPathOr404 } from "@/lib/api-utils";
+import { withSessionRoute } from "@/lib/hosts/route";
 import { getRpcSession } from "@/lib/rpc-manager";
 
 /** POST /api/sessions/[id]/archive — stop the live child, then archive the
- * native OMP JSONL and its sibling artifacts using OMP's gc layout. */
-export async function POST(
+ * native OMP JSONL and its sibling artifacts using OMP's gc layout, on the
+ * host that owns the session (compression runs there; nothing is copied). */
+export const POST = withSessionRoute(async (
   _req: Request,
   { params }: { params: Promise<{ id: string }> },
-) {
+) => {
   const { id } = await params;
   try {
     const resolved = await resolveSessionPathOr404(id);
@@ -33,7 +35,7 @@ export async function POST(
     // OMP owns writes while a child is live; wait for its final flush before
     // moving the file so the archive contains the complete native transcript.
     await getRpcSession(id)?.destroyAndWait?.();
-    const archivedPath = archiveSessionFileWithArtifacts(filePath);
+    const archivedPath = await archiveSessionFileWithArtifacts(filePath);
     invalidateSessionPathCache(id);
     invalidateSessionListCache();
     return NextResponse.json({ ok: true, archived: true, archivedPath });
@@ -41,4 +43,4 @@ export async function POST(
     const message = error instanceof Error ? error.message : String(error);
     return NextResponse.json({ error: message, code: "session_archive_failed" }, { status: 500 });
   }
-}
+});

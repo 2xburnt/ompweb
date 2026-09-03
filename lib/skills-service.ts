@@ -1,10 +1,10 @@
-import { existsSync, promises as fs } from "fs";
-import { homedir } from "os";
-import * as path from "path";
 import { parse as parseYaml } from "yaml";
-import { getAgentDir } from "@/lib/omp/paths";
-import type { SkillInfo } from "@/lib/api-types";
-import { annotateSkillsWithInstallInfo } from "@/lib/skill-lock";
+import type { SkillInfo } from "./api-types";
+import { currentHost, withHost } from "./hosts/context";
+import type { Host } from "./hosts/registry";
+import { runHostScript, scanTextFiles } from "./omp/host-io";
+import { getAgentDir, hostHomedir } from "./omp/paths";
+import { annotateSkillsWithInstallInfo } from "./skill-lock";
 
 /**
  * Pure-Node skill discovery mirroring omp's providers
@@ -12,7 +12,8 @@ import { annotateSkillsWithInstallInfo } from "@/lib/skill-lock";
  * omp-web cannot import the Bun-only SDK, so the scan rules are replicated:
  * each provider contributes <root>/<name>/SKILL.md skills, higher-priority
  * providers win name collisions, and `enabled: false` frontmatter hides a
- * skill entirely.
+ * skill entirely. Everything is read through the host boundary: a remote
+ * host's skill tree is scanned in a single round trip and never copied.
  */
 
 export interface SkillDiagnostic {
@@ -40,6 +41,9 @@ export interface ParsedSkillFrontmatter {
   body: string;
 }
 
+// SKILL.md files are prose; anything past this is not a skill definition.
+const MAX_SKILL_BYTES = 1024 * 1024;
+
 /** Split YAML frontmatter from a markdown document. Returns an empty
  * frontmatter object when no `---` block is present or YAML is invalid. */
 export function parseSkillFrontmatter(content: string): ParsedSkillFrontmatter {
@@ -63,15 +67,32 @@ function isTruthyFlag(value: unknown): boolean {
 
 /** Ancestor directories from cwd up to the git repo root (or $HOME / fs root),
  * closest first — matches omp's project-level walk-up discovery. */
-function getAncestorDirs(cwd: string): string[] {
-  const home = homedir();
+async function getAncestorDirs(host: Host, cwd: string, home: string): Promise<string[]> {
+  const pathApi = host.pathApi;
+  const start = pathApi.resolve(cwd);
+  if (!host.isLocal) {
+    // One round trip for the whole walk; NUL-separated so odd names survive.
+    const script = [
+      'cur="$1"; home="$2"',
+      "while :; do",
+      '  printf "%s\\0" "$cur"',
+      '  [ -e "$cur/.git" ] && break',
+      '  [ "$cur" = "$home" ] && break',
+      '  parent=$(dirname -- "$cur"); [ "$parent" = "$cur" ] && break; cur="$parent"',
+      "done",
+      "exit 0",
+    ].join("\n");
+    const { stdout } = await runHostScript(host, script, [start, home]);
+    const dirs = stdout.toString("utf8").split("\0").filter(Boolean);
+    return dirs.length > 0 ? dirs : [start];
+  }
   const dirs: string[] = [];
-  let current = path.resolve(cwd);
+  let current = start;
   while (true) {
     dirs.push(current);
-    if (existsSync(path.join(current, ".git"))) break;
+    if (await host.fs.exists(pathApi.join(current, ".git"))) break;
     if (current === home) break;
-    const parent = path.dirname(current);
+    const parent = pathApi.dirname(current);
     if (parent === current) break;
     current = parent;
   }
@@ -80,44 +101,47 @@ function getAncestorDirs(cwd: string): string[] {
 
 /** Scan roots in omp's provider priority order (highest first): .omp (100),
  * .claude (80), .agent/.agents + .codex + .github (70), managed skills (5). */
-function buildScanRoots(cwd: string): SkillScanRoot[] {
-  const home = homedir();
-  const agentDir = getAgentDir();
-  const ancestors = getAncestorDirs(cwd);
+async function buildScanRoots(host: Host, cwd: string): Promise<SkillScanRoot[]> {
+  const pathApi = host.pathApi;
+  const home = withHost(host, () => hostHomedir());
+  const agentDir = withHost(host, () => getAgentDir());
+  const ancestors = await getAncestorDirs(host, cwd, home);
   const projectAncestors = ancestors.filter((dir) => dir !== home);
   const roots: SkillScanRoot[] = [];
 
   // builtin (.omp): project walk-up first (closest first), then user dir.
   for (const dir of projectAncestors) {
-    roots.push({ dir: path.join(dir, ".omp", "skills"), source: ".omp", scope: "project", requireDescription: true });
+    roots.push({ dir: pathApi.join(dir, ".omp", "skills"), source: ".omp", scope: "project", requireDescription: true });
   }
-  roots.push({ dir: path.join(agentDir, "skills"), source: ".omp", scope: "user", requireDescription: true });
+  roots.push({ dir: pathApi.join(agentDir, "skills"), source: ".omp", scope: "user", requireDescription: true });
 
   // claude compat: user ~/.claude/skills + project .claude/skills walk-up.
-  const claudeHome = process.env.CLAUDE_CONFIG_DIR || path.join(home, ".claude");
-  roots.push({ dir: path.join(claudeHome, "skills"), source: ".claude", scope: "user" });
+  // CLAUDE_CONFIG_DIR is this process's environment, so it only describes the
+  // local machine.
+  const claudeHome = (host.isLocal && process.env.CLAUDE_CONFIG_DIR) || pathApi.join(home, ".claude");
+  roots.push({ dir: pathApi.join(claudeHome, "skills"), source: ".claude", scope: "user" });
   for (const dir of projectAncestors) {
-    roots.push({ dir: path.join(dir, ".claude", "skills"), source: ".claude", scope: "project" });
+    roots.push({ dir: pathApi.join(dir, ".claude", "skills"), source: ".claude", scope: "project" });
   }
 
   // agent dirs compat (.agent/.agents): project walk-up + user home.
   for (const dir of projectAncestors) {
-    roots.push({ dir: path.join(dir, ".agent", "skills"), source: ".agents", scope: "project" });
-    roots.push({ dir: path.join(dir, ".agents", "skills"), source: ".agents", scope: "project" });
+    roots.push({ dir: pathApi.join(dir, ".agent", "skills"), source: ".agents", scope: "project" });
+    roots.push({ dir: pathApi.join(dir, ".agents", "skills"), source: ".agents", scope: "project" });
   }
-  roots.push({ dir: path.join(home, ".agent", "skills"), source: ".agents", scope: "user" });
-  roots.push({ dir: path.join(home, ".agents", "skills"), source: ".agents", scope: "user" });
+  roots.push({ dir: pathApi.join(home, ".agent", "skills"), source: ".agents", scope: "user" });
+  roots.push({ dir: pathApi.join(home, ".agents", "skills"), source: ".agents", scope: "user" });
 
   // codex compat: user ~/.codex/skills + project .codex/skills.
-  roots.push({ dir: path.join(home, ".codex", "skills"), source: ".codex", scope: "user" });
-  roots.push({ dir: path.join(cwd, ".codex", "skills"), source: ".codex", scope: "project" });
+  roots.push({ dir: pathApi.join(home, ".codex", "skills"), source: ".codex", scope: "user" });
+  roots.push({ dir: pathApi.join(cwd, ".codex", "skills"), source: ".codex", scope: "project" });
 
   // github compat: <repoRoot>/.github/skills.
   const repoRoot = ancestors[ancestors.length - 1];
-  roots.push({ dir: path.join(repoRoot, ".github", "skills"), source: ".github", scope: "project", requireDescription: true });
+  roots.push({ dir: pathApi.join(repoRoot, ".github", "skills"), source: ".github", scope: "project", requireDescription: true });
 
   // managed auto-learn skills (lowest priority).
-  roots.push({ dir: path.join(agentDir, "managed-skills"), source: "managed", scope: "user", requireDescription: true });
+  roots.push({ dir: pathApi.join(agentDir, "managed-skills"), source: "managed", scope: "user", requireDescription: true });
 
   return roots;
 }
@@ -126,8 +150,9 @@ function buildScanRoots(cwd: string): SkillScanRoot[] {
  * skill path (single source of truth with buildScanRoots — a narrower list
  * would reject skills the app itself discovered and installed). Without a cwd
  * only the cwd-independent user-scope roots are returned. */
-export function getSkillScanRootDirs(cwd?: string): string[] {
-  return buildScanRoots(cwd ?? homedir()).map((root) => root.dir);
+export async function getSkillScanRootDirs(cwd?: string, host: Host = currentHost()): Promise<string[]> {
+  const roots = await buildScanRoots(host, cwd ?? withHost(host, () => hostHomedir()));
+  return roots.map((root) => root.dir);
 }
 
 const DISABLE_INVOCATION_KEYS = ["disable-model-invocation", "disableModelInvocation", "hide"] as const;
@@ -182,65 +207,40 @@ export function setDisableModelInvocation(content: string, disable: boolean): st
   return block + content.slice(match[0].length);
 }
 
-async function scanRoot(root: SkillScanRoot, diagnostics: SkillDiagnostic[]): Promise<SkillInfo[]> {
-  let entries;
-  try {
-    // `root.dir` is user-controlled and can be outside the app. Keep this
-    // runtime discovery opaque to Next's NFT tracer so builds never glob the
-    // user's profile (or protected Windows junctions).
-    const readDirectory = Reflect.get(fs, "readdir") as typeof fs.readdir;
-    entries = await readDirectory(root.dir, { withFileTypes: true });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-      diagnostics.push({
-        type: "warning",
-        message: `Failed to read skills directory: ${String(error)}`,
-        path: root.dir,
-      });
-    }
-    return [];
-  }
-
-  const skills: SkillInfo[] = [];
-  await Promise.all(entries.map(async (entry) => {
-    if (entry.name.startsWith(".")) return;
-    if (!entry.isDirectory() && !entry.isSymbolicLink()) return;
-    const skillPath = path.join(root.dir, entry.name, "SKILL.md");
-    let content: string;
-    try {
-      content = await fs.readFile(skillPath, "utf8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        diagnostics.push({ type: "warning", message: "Failed to read skill file", path: skillPath });
-      }
-      return;
-    }
-    const { frontmatter } = parseSkillFrontmatter(content);
-    if (frontmatter.enabled === false) return;
-    const description = typeof frontmatter.description === "string" ? frontmatter.description : "";
-    if (root.requireDescription && !description) return;
-    const rawName = frontmatter.name;
-    const name = typeof rawName === "string" && rawName.trim() ? rawName.trim() : entry.name;
-    skills.push({
-      name,
-      description,
-      filePath: skillPath,
-      baseDir: path.join(root.dir, entry.name),
-      disableModelInvocation: readDisableModelInvocation(frontmatter),
-      sourceInfo: { source: root.source, scope: root.scope },
-    });
-  }));
-  return skills;
-}
-
 /** Discover skills for a cwd the way omp does. Name collisions resolve to the
  * highest-priority provider (scan-root order); result is sorted by name. */
-export async function discoverSkills(cwd: string): Promise<SkillsWithDiagnostics> {
+export async function discoverSkills(cwd: string, host: Host = currentHost()): Promise<SkillsWithDiagnostics> {
   const diagnostics: SkillDiagnostic[] = [];
+  const roots = await buildScanRoots(host, cwd);
+  const scan = await scanTextFiles(host, roots.map((root) => root.dir), "skill-dirs", MAX_SKILL_BYTES);
+  for (const dir of scan.unreadableRoots) diagnostics.push({ type: "warning", message: "Failed to read skills directory", path: dir });
+  for (const filePath of scan.unreadableFiles) diagnostics.push({ type: "warning", message: "Failed to read skill file", path: filePath });
+  const pathApi = host.pathApi;
   const byName = new Map<string, SkillInfo>();
-  for (const root of buildScanRoots(cwd)) {
-    for (const skill of await scanRoot(root, diagnostics)) {
-      if (!byName.has(skill.name)) byName.set(skill.name, skill);
+  for (const root of roots) {
+    for (const file of scan.files) {
+      if (file.root !== root.dir) continue;
+      if (file.truncated) {
+        diagnostics.push({ type: "warning", message: "Skill file is too large to inspect", path: file.path });
+        continue;
+      }
+      const { frontmatter } = parseSkillFrontmatter(file.content);
+      if (frontmatter.enabled === false) continue;
+      const description = typeof frontmatter.description === "string" ? frontmatter.description : "";
+      if (root.requireDescription && !description) continue;
+      const baseDir = pathApi.dirname(file.path);
+      const entryName = pathApi.basename(baseDir);
+      const rawName = frontmatter.name;
+      const name = typeof rawName === "string" && rawName.trim() ? rawName.trim() : entryName;
+      if (byName.has(name)) continue;
+      byName.set(name, {
+        name,
+        description,
+        filePath: file.path,
+        baseDir,
+        disableModelInvocation: readDisableModelInvocation(frontmatter),
+        sourceInfo: { source: root.source, scope: root.scope },
+      });
     }
   }
   const skills = [...byName.values()].sort((a, b) => {
@@ -250,10 +250,10 @@ export async function discoverSkills(cwd: string): Promise<SkillsWithDiagnostics
   return { skills, diagnostics };
 }
 
-export async function loadSkillsWithInstallInfo(cwd: string) {
-  const { skills, diagnostics } = await discoverSkills(cwd);
+export async function loadSkillsWithInstallInfo(cwd: string, host: Host = currentHost()) {
+  const { skills, diagnostics } = await discoverSkills(cwd, host);
   return {
-    skills: annotateSkillsWithInstallInfo(skills, { cwd, agentDir: getAgentDir() }),
+    skills: await annotateSkillsWithInstallInfo(skills, { cwd, agentDir: withHost(host, () => getAgentDir()) }, host),
     diagnostics,
   };
 }

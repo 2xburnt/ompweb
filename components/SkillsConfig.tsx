@@ -1,5 +1,8 @@
 "use client";
 
+import { hostFetch, useHosts } from "@/lib/hosts/client";
+import { MachineScopeNote } from "./MachineScopeNote";
+
 import { Fragment, useState, useEffect, useCallback, useRef } from "react";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useI18n } from "@/lib/i18n";
@@ -374,6 +377,7 @@ function AddSkillPanel({
   onInstalled: () => void;
 }) {
   const { t } = useI18n();
+  const { hostId } = useHosts();
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SkillSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
@@ -396,11 +400,11 @@ function AddSkillPanel({
     setSearchError(null);
     setResults([]);
     try {
-      const res = await fetch("/api/skills/search", {
+      const res = await hostFetch("/api/skills/search", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: q.trim() }),
-      });
+      }, hostId ?? undefined);
       const d = (await res.json()) as {
         results?: SkillSearchResult[];
         error?: string;
@@ -417,18 +421,18 @@ function AddSkillPanel({
     } finally {
       setSearching(false);
     }
-  }, [t]);
+  }, [hostId, t]);
 
   const install = useCallback(
     async (pkg: string) => {
       setInstalling(pkg);
       setInstallError(null);
       try {
-        const res = await fetch("/api/skills/install", {
+        const res = await hostFetch("/api/skills/install", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ package: pkg, scope, cwd }),
-        });
+        }, hostId ?? undefined);
         const d = (await res.json()) as { success?: boolean; error?: string; code?: string };
         if (!res.ok || d.error) {
           setInstallError(formatApiError(d.error ? d : `HTTP ${res.status}`));
@@ -444,7 +448,7 @@ function AddSkillPanel({
         setInstalling(null);
       }
     },
-    [onInstalled, scope, cwd],
+    [onInstalled, scope, cwd, hostId],
   );
 
   const installPath =
@@ -724,6 +728,11 @@ export function SkillsConfig({
 }) {
   const isMobile = useIsMobile();
   const { t, tn } = useI18n();
+  // Skills are installed per machine: reload the list when the machine changes
+  // and keep every check/update/toggle on the machine that owns the skill.
+  const { hostId } = useHosts();
+  const hostRef = useRef<string | null>(hostId);
+  hostRef.current = hostId;
   const [skills, setSkills] = useState<Skill[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -738,29 +747,39 @@ export function SkillsConfig({
   const [updateError, setUpdateError] = useState<string | null>(null);
 
   const loadSkills = useCallback(async () => {
+    const targetHost = hostId;
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/skills?cwd=${encodeURIComponent(cwd)}`);
+      const res = await hostFetch(`/api/skills?cwd=${encodeURIComponent(cwd)}`, undefined, targetHost ?? undefined);
       const d = (await res.json()) as { skills?: Skill[]; error?: string; code?: string };
+      if (hostRef.current !== targetHost) return [];
       if (!res.ok || d.error) throw new Error(formatApiError(d.error ? d : `HTTP ${res.status}`));
       const list = d.skills ?? [];
       setSkills(list);
-      if (list.length > 0 && !selected) setSelected(list[0].filePath);
+      // Keep the open skill when it survives the reload, otherwise fall back to
+      // the first one — a path from another machine must never stay selected.
+      setSelected((current) => (current && list.some((skill) => skill.filePath === current) ? current : list[0]?.filePath ?? null));
       return list;
     } catch (e) {
+      if (hostRef.current !== targetHost) return [];
       setError(String(e));
       return [];
     } finally {
-      setLoading(false);
+      if (hostRef.current === targetHost) setLoading(false);
     }
-  }, [cwd, selected]);
+  }, [cwd, hostId]);
 
+  // Workspace or machine change: drop the previous machine's skills (and its
+  // update results) before the reload lands.
   useEffect(() => {
+    setSkills([]);
+    setSelected(null);
     setUpdateStatuses({});
     setUpdateError(null);
+    setError(null);
     void loadSkills();
-  }, [cwd]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [cwd, hostId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const checkForUpdates = useCallback(async (skill?: Skill) => {
     const targets = skill
@@ -775,7 +794,7 @@ export function SkillsConfig({
     setCheckingUpdates((current) => new Set([...current, ...keys]));
     if (!skill) setCheckingAll(true);
     try {
-      const res = await fetch("/api/skills/check", {
+      const res = await hostFetch("/api/skills/check", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -783,7 +802,7 @@ export function SkillsConfig({
           package: skill?.install?.package,
           scope: skill?.install?.scope,
         }),
-      });
+      }, hostId ?? undefined);
       const data = (await res.json()) as {
         updates?: SkillUpdateResult[];
         error?: string;
@@ -806,7 +825,7 @@ export function SkillsConfig({
       });
       if (!skill) setCheckingAll(false);
     }
-  }, [cwd, skills]);
+  }, [cwd, hostId, skills]);
 
   const updateInstalledSkill = useCallback(async (skill: Skill) => {
     if (!skill.install) return;
@@ -814,7 +833,7 @@ export function SkillsConfig({
     setUpdatingSkill(key);
     setUpdateError(null);
     try {
-      const res = await fetch("/api/skills/update", {
+      const res = await hostFetch("/api/skills/update", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -822,7 +841,7 @@ export function SkillsConfig({
           package: skill.install.package,
           scope: skill.install.scope,
         }),
-      });
+      }, hostId ?? undefined);
       const data = (await res.json()) as {
         success?: boolean;
         skill?: Skill;
@@ -848,21 +867,21 @@ export function SkillsConfig({
     } finally {
       setUpdatingSkill(null);
     }
-  }, [cwd, loadSkills]);
+  }, [cwd, hostId, loadSkills]);
 
   const toggle = useCallback(async (skill: Skill) => {
     const next = !skill.disableModelInvocation;
     setToggling((s) => new Set(s).add(skill.filePath));
     setSaveError(null);
     try {
-      const res = await fetch("/api/skills", {
+      const res = await hostFetch("/api/skills", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           filePath: skill.filePath,
           disableModelInvocation: next,
         }),
-      });
+      }, hostId ?? undefined);
       const d = (await res.json()) as { success?: boolean; error?: string };
       if (!res.ok || d.error) {
         const msg = d.error ?? `HTTP ${res.status}`;
@@ -889,7 +908,7 @@ export function SkillsConfig({
         return n;
       });
     }
-  }, [t]);
+  }, [hostId, t]);
 
   const selectedSkill = skills.find((s) => s.filePath === selected) ?? null;
 
@@ -944,6 +963,11 @@ export function SkillsConfig({
           </button>
         </div>)}
         {!embedded && onSelectTab && <SettingsTabs active="skills" onSelect={onSelectTab} />}
+
+        {/* Machine whose omp installation owns these skills */}
+        <div style={{ display: "flex", padding: embedded ? "14px 20px 0" : "12px 18px 0", flexShrink: 0 }}>
+          <MachineScopeNote />
+        </div>
 
         {/* Body */}
         <div style={{ flex: 1, display: "flex", flexDirection: isMobile ? "column" : "row", overflow: "hidden" }}>

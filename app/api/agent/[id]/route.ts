@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { readSessionHeader } from "@/lib/session-reader";
 import { apiErrorResponse, resolveSessionPathOr404 } from "@/lib/api-utils";
+import { withSessionRoute } from "@/lib/hosts/route";
 import { startRpcSession, getRpcSession, resolveSpawnCwdResult, WebRpcError } from "@/lib/rpc-manager";
 import { RpcCommandError } from "@/lib/omp/rpc-process";
 import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
@@ -24,11 +25,13 @@ function commandErrorResponse(error: unknown) {
   return apiErrorResponse(error);
 }
 
-// POST /api/agent/[id] - Send a command to an existing session
-export async function POST(
+// POST /api/agent/[id] - Send a command to an existing session. Runs in the
+// context of the host that owns the session, so a lazy respawn launches omp
+// on that machine.
+export const POST = withSessionRoute(async (
   req: Request,
   { params }: { params: Promise<{ id: string }> }
-) {
+) => {
   const { id } = await params;
 
   try {
@@ -55,12 +58,15 @@ export async function POST(
       await existing.destroyAndWait();
     }
 
-    const resolved = await resolveSessionPathOr404(id);
+    // About to spawn omp with --resume: the file must be probed now, not
+    // trusted from a recent listing, or a deleted session would silently
+    // become a brand-new one.
+    const resolved = await resolveSessionPathOr404(id, { verify: true });
     if ("response" in resolved) return resolved.response;
     const filePath = resolved.filePath;
 
-    const header = readSessionHeader(filePath);
-    const { cwd } = resolveSpawnCwdResult(header?.cwd);
+    const header = await readSessionHeader(filePath);
+    const { cwd } = await resolveSpawnCwdResult(header?.cwd);
 
     const { session } = await startRpcSession(id, filePath, cwd, undefined, advisor, header?.cwd);
     const result = await session.send(body);
@@ -69,13 +75,14 @@ export async function POST(
   } catch (error) {
     return commandErrorResponse(error);
   }
-}
+});
 
-// GET /api/agent/[id] - Get current agent state
-export async function GET(
+// GET /api/agent/[id] - Get current agent state. Registry-only: no host probe
+// so an unreachable host still answers "not running".
+export const GET = withSessionRoute(async (
   _req: Request,
   { params }: { params: Promise<{ id: string }> }
-) {
+) => {
   const { id } = await params;
 
   try {
@@ -95,4 +102,4 @@ export async function GET(
   } catch (error) {
     return commandErrorResponse(error);
   }
-}
+}, { ready: false });

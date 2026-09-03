@@ -1,4 +1,6 @@
-import { NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
+import { currentHost } from "@/lib/hosts/context";
+import { withHostRoute } from "@/lib/hosts/route";
 import { getProviderUsage } from "@/lib/provider-usage";
 
 export const dynamic = "force-dynamic";
@@ -12,7 +14,8 @@ function readIdentifier(value: string | null): string | undefined {
   return IDENTIFIER_RE.test(trimmed) ? trimmed : undefined;
 }
 
-export async function GET(request: Request) {
+export const GET = withHostRoute(async (request: NextRequest) => {
+  const host = currentHost();
   const searchParams = new URL(request.url).searchParams;
   const rawProvider = searchParams.get("provider");
   const rawModel = searchParams.get("model");
@@ -27,11 +30,11 @@ export async function GET(request: Request) {
   }
 
   try {
-    return NextResponse.json(await getProviderUsage({ provider, modelId }));
+    return NextResponse.json({ ...(await getProviderUsage({ provider, modelId }, host)), host: host.id });
   } catch {
     return NextResponse.json(
-      { error: "Provider usage is currently unavailable", code: "provider_usage_unavailable" },
+      { error: "Provider usage is currently unavailable", code: "provider_usage_unavailable", host: host.id },
       { status: 502 },
     );
   }
-}
+});

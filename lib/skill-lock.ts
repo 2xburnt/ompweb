@@ -1,7 +1,8 @@
-import { existsSync, readFileSync } from "fs";
-import { homedir } from "os";
-import { isAbsolute, join, relative, resolve, sep } from "path";
-import type { SkillInfo, SkillInstallInfo, SkillInstallScope } from "@/lib/api-types";
+import type { SkillInfo, SkillInstallInfo, SkillInstallScope } from "./api-types";
+import { currentHost, withHost } from "./hosts/context";
+import type { Host } from "./hosts/registry";
+import { existingPaths } from "./omp/host-io";
+import { hostHomedir } from "./omp/paths";
 
 interface SkillLockEntry {
   source?: unknown;
@@ -28,28 +29,36 @@ interface AnnotateSkillOptions {
   projectLockPath?: string;
 }
 
-export function getGlobalSkillsLockPath(options: GlobalLockPathOptions = {}): string {
-  const homeDir = options.homeDir ?? homedir();
+// Lock files list installed skills; a larger file is not a lock file.
+const MAX_LOCK_BYTES = 4 * 1024 * 1024;
+
+export function getGlobalSkillsLockPath(options: GlobalLockPathOptions = {}, host: Host = currentHost()): string {
+  const pathApi = host.pathApi;
+  const homeDir = options.homeDir ?? withHost(host, () => hostHomedir());
   // Callers that inject a home directory (tests or alternate installations)
-  // must not accidentally inherit the host process's XDG state directory.
-  const xdgStateHome = options.xdgStateHome ?? (options.homeDir === undefined ? process.env.XDG_STATE_HOME : undefined);
+  // must not accidentally inherit the host process's XDG state directory —
+  // and that environment only describes the local machine anyway.
+  const xdgStateHome = options.xdgStateHome
+    ?? (options.homeDir === undefined && host.isLocal ? process.env.XDG_STATE_HOME : undefined);
   return xdgStateHome
-    ? join(xdgStateHome, "skills", ".skill-lock.json")
-    : join(homeDir, ".agents", ".skill-lock.json");
+    ? pathApi.join(xdgStateHome, "skills", ".skill-lock.json")
+    : pathApi.join(homeDir, ".agents", ".skill-lock.json");
 }
 
-function readSkillLock(path: string): Record<string, SkillLockEntry> {
+function parseSkillLock(text: Buffer | undefined): Record<string, SkillLockEntry> {
+  if (!text) return {};
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as SkillLockFile;
+    const parsed = JSON.parse(text.toString("utf8")) as SkillLockFile;
     return parsed.skills && typeof parsed.skills === "object" ? parsed.skills : {};
   } catch {
     return {};
   }
 }
 
-function isWithin(path: string, root: string): boolean {
-  const rel = relative(resolve(root), resolve(path));
-  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+function isWithin(host: Host, path: string, root: string): boolean {
+  const pathApi = host.pathApi;
+  const rel = pathApi.relative(pathApi.resolve(root), pathApi.resolve(path));
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${pathApi.sep}`) && !pathApi.isAbsolute(rel);
 }
 
 function findLockEntry(
@@ -119,28 +128,33 @@ function getInstallInfo(
   };
 }
 
-export function annotateSkillsWithInstallInfo(
+/** Attach skills.sh lock-file provenance to discovered skills. Both lock files
+ * are read in one round trip and the skill files' existence in another. */
+export async function annotateSkillsWithInstallInfo(
   skills: SkillInfo[],
-  {
-    cwd,
-    agentDir,
-    globalLockPath = getGlobalSkillsLockPath(),
-    projectLockPath = join(cwd, "skills-lock.json"),
-  }: AnnotateSkillOptions,
-): SkillInfo[] {
-  const globalEntries = readSkillLock(globalLockPath);
-  const projectEntries = readSkillLock(projectLockPath);
+  options: AnnotateSkillOptions,
+  host: Host = currentHost(),
+): Promise<SkillInfo[]> {
+  const pathApi = host.pathApi;
+  const { cwd, agentDir } = options;
+  const globalLockPath = options.globalLockPath ?? getGlobalSkillsLockPath({}, host);
+  const projectLockPath = options.projectLockPath ?? pathApi.join(cwd, "skills-lock.json");
+  const locks = await host.fs.readSlices([globalLockPath, projectLockPath], MAX_LOCK_BYTES, 0);
+  const globalEntries = parseSkillLock(locks.get(globalLockPath)?.prefix);
+  const projectEntries = parseSkillLock(locks.get(projectLockPath)?.prefix);
+  const present = await existingPaths(host, skills.map((skill) => skill.filePath));
   // skills.sh installs with --agent universal land in .agents/skills; omp's
   // own dirs remain valid install roots for manually placed skills.
-  const globalSkillsRoots = [join(agentDir, "skills"), join(homedir(), ".agents", "skills")];
-  const projectSkillsRoots = [join(cwd, ".omp", "skills"), join(cwd, ".agents", "skills")];
+  const home = withHost(host, () => hostHomedir());
+  const globalSkillsRoots = [pathApi.join(agentDir, "skills"), pathApi.join(home, ".agents", "skills")];
+  const projectSkillsRoots = [pathApi.join(cwd, ".omp", "skills"), pathApi.join(cwd, ".agents", "skills")];
 
   return skills.map((skill) => {
-    if (!existsSync(skill.filePath)) return skill;
+    if (!present.has(skill.filePath)) return skill;
 
-    const install = globalSkillsRoots.some((root) => isWithin(skill.filePath, root))
+    const install = globalSkillsRoots.some((root) => isWithin(host, skill.filePath, root))
       ? getInstallInfo(globalEntries, skill.name, "global")
-      : projectSkillsRoots.some((root) => isWithin(skill.filePath, root))
+      : projectSkillsRoots.some((root) => isWithin(host, skill.filePath, root))
         ? getInstallInfo(projectEntries, skill.name, "project")
         : undefined;
 

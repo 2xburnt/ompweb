@@ -28,6 +28,7 @@ import {
 import type { GitFileStatus, GitFileStatusKind, GitStatusResponse } from "@/lib/git-types";
 import { MAX_RESULT_LIMIT, type FileIndexEntry } from "@/lib/file-fuzzy";
 import { buildSearchRows } from "@/lib/search-results";
+import { hostFetch } from "@/lib/hosts/client";
 
 interface FileEntry {
   name: string;
@@ -97,7 +98,7 @@ interface PendingConflict {
 
 async function fetchEntries(dirPath: string): Promise<FileNode[]> {
   const encoded = encodeFilePathForApi(dirPath);
-  const res = await fetch(`/api/files/${encoded}?type=list`);
+  const res = await hostFetch(`/api/files/${encoded}?type=list`);
   if (!res.ok) {
     let message = translate("fileExplorer.loadFailed", { status: res.status });
     try {
@@ -121,7 +122,7 @@ async function fetchEntries(dirPath: string): Promise<FileNode[]> {
 
 async function fetchGitStatus(cwd: string): Promise<GitStatusResponse> {
   const params = new URLSearchParams({ cwd });
-  const res = await fetch(`/api/git/status?${params.toString()}`);
+  const res = await hostFetch(`/api/git/status?${params.toString()}`);
   if (!res.ok) throw new Error(translate("fileExplorer.gitStatusFailed", { status: res.status }));
   return res.json() as Promise<GitStatusResponse>;
 }
@@ -647,7 +648,7 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
         kind: "file",
       });
       if (forceRefresh) params.set("refresh", "1");
-      fetch(`/api/file-index?${params.toString()}`, { signal: controller.signal })
+      hostFetch(`/api/file-index?${params.toString()}`, { signal: controller.signal })
         .then((res) => res.ok
           ? res.json() as Promise<{ matches?: FileIndexEntry[]; truncated?: boolean }>
           : Promise.reject(new Error(`HTTP ${res.status}`)))

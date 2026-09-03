@@ -5,6 +5,8 @@ import { createPortal } from "react-dom";
 import { useModalDialog } from "@/hooks/useModalDialog";
 import { useI18n } from "@/lib/i18n";
 import { formatApiError } from "@/lib/i18n/api-error";
+import { hostFetch, useHosts } from "@/lib/hosts/client";
+import { HostStatusDot } from "./MachineSwitcher";
 
 interface DirectoryEntry {
   name: string;
@@ -20,9 +22,10 @@ interface BrowseResponse {
   code?: string;
 }
 
-async function loadDirectories(directory?: string): Promise<BrowseResponse> {
+async function loadDirectories(directory: string | undefined, hostId: string | null): Promise<BrowseResponse> {
   const query = directory ? `?path=${encodeURIComponent(directory)}` : "";
-  const response = await fetch(`/api/cwd/browse${query}`);
+  // Browse the selected machine's filesystem.
+  const response = await hostFetch(`/api/cwd/browse${query}`, undefined, hostId);
   const data = await response.json() as BrowseResponse;
   if (!response.ok || data.error) {
     throw new Error(formatApiError({ ...data, error: data.error ?? `HTTP ${response.status}` }));
@@ -61,6 +64,7 @@ interface Props {
 
 export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Props) {
   const { t } = useI18n();
+  const { hostId, current: currentHost } = useHosts();
   const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
   const [currentPath, setCurrentPath] = useState("");
   const [parentDirectory, setParentDirectory] = useState<string | null>(null);
@@ -78,7 +82,7 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
     setLoading(true);
     setLoadError(null);
     try {
-      const data = await loadDirectories(directory);
+      const data = await loadDirectories(directory, hostId);
       const nextPath = data.path ?? directory ?? "/";
       setCurrentPath(nextPath);
       setParentDirectory(data.parentPath ?? null);
@@ -90,7 +94,7 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [hostId]);
 
   useEffect(() => {
     setPortalTarget(document.body);
@@ -120,6 +124,14 @@ export function DirectoryPicker({ onCancel, onSelect, busy = false, error }: Pro
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0, padding: "12px 18px", borderBottom: "1px solid var(--border)" }}>
           <div style={{ minWidth: 0, flex: 1 }}>
             <div style={{ color: "var(--text)", fontWeight: 700, fontSize: 15 }}>{t("directoryPicker.selectDirectory")}</div>
+            {currentHost && (
+              <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2, color: "var(--text-muted)", fontSize: 11.5 }}>
+                <HostStatusDot host={currentHost} size={6} />
+                <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {t("directoryPicker.onMachine", { machine: currentHost.name })}
+                </span>
+              </div>
+            )}
           </div>
           <button
             type="button"

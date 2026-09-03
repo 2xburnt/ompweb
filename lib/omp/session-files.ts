@@ -1,32 +1,21 @@
 import { randomUUID } from "crypto";
-import type { Dirent } from "fs";
 import {
-  closeSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
-  openSync,
-  readdirSync,
   readFileSync,
-  readSync,
   lstatSync,
   renameSync,
   rmSync,
-  rmdirSync,
-  statSync,
   unlinkSync,
   writeFileSync,
-  writeSync,
 } from "fs";
-import * as fsRuntime from "fs";
 import * as path from "path";
-import { StringDecoder } from "string_decoder";
 import { gunzipSync, gzipSync } from "zlib";
+import { currentHost, withHost } from "../hosts/context";
+import type { FileSlices } from "../hosts/executor";
+import type { Host } from "../hosts/registry";
 import { isRecord } from "../type-guards";
-
-// Keep user-session directory traversal out of Next's static NFT globbing.
-// These paths are resolved and authorized at request time by omp-web.
-const readDirectorySyncRuntime = Reflect.get(fsRuntime, "readdirSync") as typeof readdirSync;
 import type {
   CompactionEntry,
   SessionEntry,
@@ -34,10 +23,15 @@ import type {
   SessionTitleSource,
   SessionTreeNode,
 } from "../types";
-import { getArchivedSessionsDir, getBlobsDir, getSessionsDir } from "./paths";
+import { getArchivedSessionsDir, getBlobsDir, getSessionsDir, hostPath } from "./paths";
 
 /**
- * Pure-Node reader/writer for oh-my-pi's session JSONL files (format v3).
+ * Reader/writer for oh-my-pi's session JSONL files (format v3) on any host.
+ * All I/O goes through the host's filesystem boundary (lib/hosts/executor.ts):
+ * the local machine reads with plain syscalls, a remote machine over its ssh
+ * connection. Reads are bounded windows wherever possible so listing a
+ * machine's sessions never copies whole transcripts across the wire.
+ *
  * Ported from oh-my-pi packages/coding-agent/src/session/ (session-entries,
  * session-title-slot, session-listing, session-loader, session-migrations,
  * blob-store) because the @oh-my-pi packages are Bun-only and cannot run
@@ -151,23 +145,17 @@ export function serializeTitleSlot(update: SessionTitleUpdate): string {
 }
 
 /** Read only the fixed-size head window to detect a physical title slot. */
-export function readTitleSlot(filePath: string): SessionTitleSlot | undefined {
-  let fd: number;
+export async function readTitleSlot(filePath: string, host: Host = currentHost()): Promise<SessionTitleSlot | undefined> {
+  let head: Buffer;
   try {
-    fd = openSync(filePath, "r");
+    head = await host.fs.readHead(filePath, SESSION_TITLE_SLOT_BYTES);
   } catch {
     return undefined;
   }
-  try {
-    const buffer = Buffer.allocUnsafe(SESSION_TITLE_SLOT_BYTES);
-    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
-    const head = buffer.subarray(0, bytesRead).toString("utf8");
-    const newlineIndex = head.indexOf("\n");
-    if (newlineIndex < 0) return undefined;
-    return parseTitleSlotLine(head.slice(0, newlineIndex));
-  } finally {
-    closeSync(fd);
-  }
+  const text = head.toString("utf8");
+  const newlineIndex = text.indexOf("\n");
+  if (newlineIndex < 0) return undefined;
+  return parseTitleSlotLine(text.slice(0, newlineIndex));
 }
 
 // ============================================================================
@@ -258,9 +246,10 @@ function parseBlobRef(data: string): string | null {
   return BLOB_HASH_RE.test(hash) ? hash : null;
 }
 
-function readBlobSync(hash: string): Buffer | null {
+async function readBlob(hash: string, host: Host): Promise<Buffer | null> {
   try {
-    return readFileSync(path.join(getBlobsDir(), hash));
+    const blobPath = withHost(host, () => hostPath().join(getBlobsDir(), hash));
+    return await host.fs.readFile(blobPath);
   } catch {
     return null;
   }
@@ -285,9 +274,9 @@ function degradeMissingBlobImage(block: Record<string, unknown>, hash: string): 
   delete block.source;
 }
 
-function resolveBlobsInValue(value: unknown, key: string | undefined): void {
+async function resolveBlobsInValue(value: unknown, key: string | undefined, host: Host): Promise<void> {
   if (Array.isArray(value)) {
-    for (const item of value) resolveBlobsInValue(item, key);
+    for (const item of value) await resolveBlobsInValue(item, key, host);
     return;
   }
   if (!isRecord(value)) return;
@@ -300,7 +289,7 @@ function resolveBlobsInValue(value: unknown, key: string | undefined): void {
   ) {
     const hash = parseBlobRef(value.data);
     if (!hash) return;
-    const blob = readBlobSync(hash);
+    const blob = await readBlob(hash, host);
     if (blob) record.data = blob.toString("base64");
     else degradeMissingBlobImage(record, hash);
     return;
@@ -312,19 +301,19 @@ function resolveBlobsInValue(value: unknown, key: string | undefined): void {
     isBlobRef(record.result)
   ) {
     const hash = parseBlobRef(record.result);
-    const blob = hash ? readBlobSync(hash) : null;
+    const blob = hash ? await readBlob(hash, host) : null;
     if (blob) record.result = blob.toString("base64");
   }
 
   if (typeof record.image_url === "string" && isBlobRef(record.image_url)) {
     const hash = parseBlobRef(record.image_url);
-    const blob = hash ? readBlobSync(hash) : null;
+    const blob = hash ? await readBlob(hash, host) : null;
     // Externalized data URLs are stored as the raw UTF-8 data-URL string.
     if (blob) record.image_url = blob.toString("utf8");
   }
 
   for (const [childKey, item] of Object.entries(record)) {
-    resolveBlobsInValue(item, childKey);
+    await resolveBlobsInValue(item, childKey, host);
   }
 }
 
@@ -349,7 +338,7 @@ export interface ResolveBlobOptions {
 }
 
 /** Resolve blob references in loaded entries back to inline base64. Mutates in place. */
-export function resolveBlobRefsInEntries(entries: SessionEntry[], options: ResolveBlobOptions = {}): void {
+export async function resolveBlobRefsInEntries(entries: SessionEntry[], options: ResolveBlobOptions = {}, host: Host = currentHost()): Promise<void> {
   for (const entry of entries) {
     if (
       options.skipToolResultImages &&
@@ -359,7 +348,7 @@ export function resolveBlobRefsInEntries(entries: SessionEntry[], options: Resol
       continue;
     }
     if (!containsBlobRef(entry)) continue;
-    resolveBlobsInValue(entry, undefined);
+    await resolveBlobsInValue(entry, undefined, host);
   }
 }
 
@@ -382,8 +371,6 @@ export interface LoadSessionOptions extends ResolveBlobOptions {
   resolveBlobs?: boolean;
 }
 
-const SESSION_READ_CHUNK_BYTES = 1024 * 1024;
-
 /**
  * Ceiling on the on-disk size omp-web will materialize into memory. omp streams
  * sessions, so this is not an omp limit — it is the point past which parsing a
@@ -393,52 +380,12 @@ const SESSION_READ_CHUNK_BYTES = 1024 * 1024;
 export const MAX_SESSION_LOAD_BYTES = 1024 * 1024 * 1024;
 
 /**
- * Read a file line by line over a byte buffer. Unlike readFileSync(path,"utf8")
- * this never materializes the whole file as a single JS string, so sessions
- * past Node's ~512 MiB string cap still open. Lines exclude the newline; the
- * decoder carries multi-byte characters across chunk boundaries.
+ * Read a file line by line on the session's host without materializing the
+ * whole file (a remote file streams through `cat` over ssh). Lines exclude the
+ * newline; multi-byte characters are carried across chunk boundaries.
  */
-export function forEachFileLineSync(filePath: string, onLine: (line: string) => void): void {
-  const fd = openSync(filePath, "r");
-  try {
-    const buffer = Buffer.allocUnsafe(SESSION_READ_CHUNK_BYTES);
-    const decoder = new StringDecoder("utf8");
-    // Fragments of the current unterminated line, joined only when a chunk
-    // actually contains a newline (or EOF completes the file). Appending to a
-    // single `pending` string per 1 MiB chunk copies the whole accumulated
-    // prefix every chunk — quadratic on single-line files (17ms @8MiB → 149ms
-    // @32MiB). With fragments, a newline-free file is joined exactly once at
-    // EOF; a file with newlines joins only the (small) tail since the last
-    // newline, so the total cost stays linear in file size.
-    const fragments: string[] = [];
-    let hasNewline = false;
-    for (;;) {
-      const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
-      if (bytesRead === 0) break;
-      const decoded = decoder.write(buffer.subarray(0, bytesRead));
-      hasNewline = hasNewline || decoded.includes("\n");
-      fragments.push(decoded);
-      if (!hasNewline) continue;
-      // Materialize the accumulated buffer once, emit every completed line,
-      // and keep only the unterminated tail (bounded by the largest line).
-      const joined = fragments.join("");
-      fragments.length = 0;
-      hasNewline = false;
-      let start = 0;
-      let newlineIndex = joined.indexOf("\n", start);
-      while (newlineIndex !== -1) {
-        onLine(joined.slice(start, newlineIndex));
-        start = newlineIndex + 1;
-        newlineIndex = joined.indexOf("\n", start);
-      }
-      if (start < joined.length) fragments.push(joined.slice(start));
-    }
-    const tail = decoder.end();
-    if (tail) fragments.push(tail);
-    if (fragments.length > 0) onLine(fragments.join(""));
-  } finally {
-    closeSync(fd);
-  }
+export function forEachFileLine(filePath: string, onLine: (line: string) => void, host: Host = currentHost()): Promise<void> {
+  return host.fs.forEachLine(filePath, onLine);
 }
 
 /**
@@ -449,10 +396,10 @@ export function forEachFileLineSync(filePath: string, onLine: (line: string) => 
  * hold in memory additionally sets error:"too_large" so routes can say so
  * instead of reporting it as malformed.
  */
-export function loadSessionFile(filePath: string, options: LoadSessionOptions = {}): LoadedSession {
+export async function loadSessionFile(filePath: string, options: LoadSessionOptions = {}, host: Host = currentHost()): Promise<LoadedSession> {
   let size: number;
   try {
-    size = statSync(filePath).size;
+    size = (await host.fs.stat(filePath)).size;
   } catch {
     return { header: null, entries: [], titleSlot: undefined };
   }
@@ -464,7 +411,7 @@ export function loadSessionFile(filePath: string, options: LoadSessionOptions = 
   const records: Record<string, unknown>[] = [];
   let isFirstLine = true;
   try {
-    forEachFileLineSync(filePath, (rawLine) => {
+    await forEachFileLine(filePath, (rawLine) => {
       if (isFirstLine) {
         isFirstLine = false;
         titleSlot = parseTitleSlotLine(rawLine);
@@ -477,7 +424,7 @@ export function loadSessionFile(filePath: string, options: LoadSessionOptions = 
       } catch {
         // Skip malformed line (torn write).
       }
-    });
+    }, host);
   } catch (error) {
     // A single line past the string cap, or an allocation failure part-way in.
     const tooLarge = error instanceof RangeError;
@@ -505,7 +452,7 @@ export function loadSessionFile(filePath: string, options: LoadSessionOptions = 
   }
 
   if (options.resolveBlobs) {
-    resolveBlobRefsInEntries(entries, { skipToolResultImages: options.skipToolResultImages });
+    await resolveBlobRefsInEntries(entries, { skipToolResultImages: options.skipToolResultImages }, host);
   }
 
   return { header, entries, titleSlot };
@@ -516,21 +463,13 @@ export function loadSessionFile(filePath: string, options: LoadSessionOptions = 
  * the second when line 1 is a title slot), capped at 64 KiB. The slot title is
  * folded into the returned header.
  */
-export function readSessionHeaderSync(filePath: string): SessionHeader | null {
+export async function readSessionHeader(filePath: string, host: Host = currentHost()): Promise<SessionHeader | null> {
   const maxHeaderBytes = 64 * 1024 + SESSION_TITLE_SLOT_BYTES;
-  let fd: number;
-  try {
-    fd = openSync(filePath, "r");
-  } catch {
-    return null;
-  }
   let head: string;
   try {
-    const buffer = Buffer.allocUnsafe(maxHeaderBytes);
-    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
-    head = buffer.subarray(0, bytesRead).toString("utf8");
-  } finally {
-    closeSync(fd);
+    head = (await host.fs.readHead(filePath, maxHeaderBytes)).toString("utf8");
+  } catch {
+    return null;
   }
 
   let firstLineEnd = head.indexOf("\n");
@@ -854,40 +793,17 @@ function parseSessionListHeader(
   return undefined;
 }
 
-function readTextSlices(filePath: string, prefixBytes: number, suffixBytes: number): [string, string, number, Date] {
-  const stat = statSync(filePath);
-  const fd = openSync(filePath, "r");
-  try {
-    const prefixLength = Math.min(prefixBytes, stat.size);
-    const prefixBuffer = Buffer.allocUnsafe(prefixLength);
-    const prefixRead = prefixLength > 0 ? readSync(fd, prefixBuffer, 0, prefixLength, 0) : 0;
-    const prefix = prefixBuffer.subarray(0, prefixRead).toString("utf8");
-
-    let suffix = "";
-    if (suffixBytes > 0 && stat.size > 0) {
-      const suffixLength = Math.min(suffixBytes, stat.size);
-      const suffixBuffer = Buffer.allocUnsafe(suffixLength);
-      const suffixRead = readSync(fd, suffixBuffer, 0, suffixLength, stat.size - suffixLength);
-      suffix = suffixBuffer.subarray(0, suffixRead).toString("utf8");
-    }
-    return [prefix, suffix, stat.size, stat.mtime];
-  } finally {
-    closeSync(fd);
-  }
-}
+const SESSION_SLICE_BATCH = 256;
 
 /**
- * Scan a single session file into an OmpSessionInfo using only a 4 KiB prefix
- * window (plus a 32 KiB tail window when `withStatus` is set). Faithful port
- * of omp's scanSessionFile — messageCount is a prefix-derived lower bound.
+ * Build an OmpSessionInfo from a file's prefix window (4 KiB) and tail window
+ * (32 KiB, when `withStatus`). Faithful port of omp's scanSessionFile —
+ * messageCount is a prefix-derived lower bound.
  */
-export function scanSessionInfo(filePath: string, withStatus = true): OmpSessionInfo | undefined {
+export function scanSessionInfoFromSlices(filePath: string, slices: FileSlices, withStatus = true): OmpSessionInfo | undefined {
   try {
-    const [content, suffix, size, mtime] = readTextSlices(
-      filePath,
-      SESSION_LIST_PREFIX_BYTES,
-      withStatus ? SESSION_LIST_SUFFIX_BYTES : 0,
-    );
+    const content = slices.prefix.toString("utf8");
+    const suffix = withStatus ? slices.suffix.toString("utf8") : "";
     const entries = parseJsonlLenient<Record<string, unknown>>(content);
     const header = parseSessionListHeader(content, entries);
     if (!header) return undefined;
@@ -917,9 +833,9 @@ export function scanSessionInfo(filePath: string, withStatus = true): OmpSession
       title: header.title ?? shortSummary,
       parentSessionPath: header.parentSession,
       created: new Date(header.timestamp ?? ""),
-      modified: mtime,
+      modified: new Date(slices.mtimeMs),
       messageCount,
-      size,
+      size: slices.size,
       firstMessage: firstMessage || "(no messages)",
       status: withStatus ? deriveSessionStatus(suffix) : undefined,
     };
@@ -928,11 +844,25 @@ export function scanSessionInfo(filePath: string, withStatus = true): OmpSession
   }
 }
 
-// Memo of per-file scan results keyed by (size, mtimeMs). The session list
-// cache is invalidated after every agent turn/rename/model change, so full
-// rescans are frequent; the memo turns each UNCHANGED file's prefix+suffix
-// window reads into a single stat. (path, size, mtimeMs) covers every session
-// mutation omp-web cares about. Stored on globalThis for hot-reload safety and
+/**
+ * Scan a single session file on its host using only a 4 KiB prefix window
+ * (plus a 32 KiB tail window when `withStatus` is set).
+ */
+export async function scanSessionInfo(filePath: string, withStatus = true, host: Host = currentHost()): Promise<OmpSessionInfo | undefined> {
+  try {
+    const slices = await host.fs.readSlices([filePath], SESSION_LIST_PREFIX_BYTES, withStatus ? SESSION_LIST_SUFFIX_BYTES : 0);
+    const slice = slices.get(filePath);
+    return slice ? scanSessionInfoFromSlices(filePath, slice, withStatus) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Memo of per-file scan results keyed by (host, path) -> (size, mtimeMs). The
+// session list cache is invalidated after every agent turn/rename/model
+// change, so full rescans are frequent; the memo turns each UNCHANGED file
+// into zero reads — the directory walk alone (one round trip per host) tells
+// us which files changed. Stored on globalThis for hot-reload safety and
 // LRU-bounded (Map iteration order doubles as recency order).
 interface SessionScanCacheEntry {
   size: number;
@@ -944,151 +874,95 @@ declare global {
   var __ompSessionScanCache: Map<string, SessionScanCacheEntry> | undefined;
 }
 
-const MAX_SESSION_SCAN_CACHE_ENTRIES = 2048;
+const MAX_SESSION_SCAN_CACHE_ENTRIES = 4096;
 
 function getSessionScanCache(): Map<string, SessionScanCacheEntry> {
   if (!globalThis.__ompSessionScanCache) globalThis.__ompSessionScanCache = new Map();
   return globalThis.__ompSessionScanCache;
 }
 
-/** scanSessionInfo memoized on (path, size, mtimeMs). Callers must treat the
- * returned info as immutable — cache hits share one object. */
-function scanSessionInfoCached(filePath: string): OmpSessionInfo | undefined {
-  let stat: { size: number; mtimeMs: number };
-  try {
-    stat = statSync(filePath);
-  } catch {
-    return undefined;
+function scanCacheKey(host: Host, filePath: string): string {
+  return `${host.id}\0${filePath}`;
+}
+
+function trimScanCache(cache: Map<string, SessionScanCacheEntry>): void {
+  while (cache.size > MAX_SESSION_SCAN_CACHE_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey === undefined) break;
+    cache.delete(oldestKey);
   }
-  const cache = getSessionScanCache();
-  const cached = cache.get(filePath);
-  if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
-    cache.delete(filePath);
-    cache.set(filePath, cached);
-    return cached.info;
-  }
-  if (cached) cache.delete(filePath);
-  const info = scanSessionInfo(filePath, true);
-  // Failed scans are not negatively cached: a transient read error must not
-  // hide a session until its next mtime bump.
-  if (info) {
-    cache.set(filePath, { size: stat.size, mtimeMs: stat.mtimeMs, info });
-    while (cache.size > MAX_SESSION_SCAN_CACHE_ENTRIES) {
-      const oldestKey = cache.keys().next().value;
-      if (oldestKey === undefined) break;
-      cache.delete(oldestKey);
-    }
-  }
-  return info;
 }
 
 /**
- * List all sessions across all project subdirectories (newest first). Only
- * `<sessionsDir>/<projectDir>/*.jsonl` files are scanned — per-session
- * artifacts directories (session file name minus .jsonl) are skipped because
- * the walk only descends one level and only accepts regular files.
+ * List all sessions of the current host across all project subdirectories
+ * (newest first). Only `<sessionsDir>/<projectDir>/*.jsonl` files are scanned —
+ * per-session artifacts directories (session file name minus .jsonl) are
+ * skipped because the walk only accepts regular files at depth two.
  *
- * The directory walk itself is cached on the sessions root's mtimeMs: creating
- * or deleting any session changes that parent directory's mtime, so the cache
- * invalidates for free on every add/remove while turning repeated listing
- * requests (sidebar poll, page loads) into a single stat. Per-file scanning is
- * still memoized by scanSessionInfoCached on (size, mtimeMs).
+ * One directory walk (a single round trip on a remote host) yields every
+ * file's size and mtime; only files whose (size, mtime) changed since the
+ * last scan have their prefix/suffix windows fetched, in batches.
  */
-export async function listAllSessionInfos(): Promise<OmpSessionInfo[]> {
-  const sessionsRoot = getSessionsDir();
-  const files = await listSessionFiles(sessionsRoot);
-
+export async function listAllSessionInfos(host: Host = currentHost()): Promise<OmpSessionInfo[]> {
+  const sessionsRoot = withHost(host, () => getSessionsDir());
+  const files = await listSessionFileStats(sessionsRoot, host);
+  const cache = getSessionScanCache();
   const sessions: OmpSessionInfo[] = [];
+  const misses: string[] = [];
   for (const file of files) {
-    const info = scanSessionInfoCached(file);
-    if (info) sessions.push(info);
+    const key = scanCacheKey(host, file.path);
+    const cached = cache.get(key);
+    if (cached && cached.size === file.size && cached.mtimeMs === file.mtimeMs) {
+      cache.delete(key);
+      cache.set(key, cached);
+      sessions.push(cached.info);
+      continue;
+    }
+    if (cached) cache.delete(key);
+    misses.push(file.path);
   }
+  for (let i = 0; i < misses.length; i += SESSION_SLICE_BATCH) {
+    const batch = misses.slice(i, i + SESSION_SLICE_BATCH);
+    const slices = await host.fs.readSlices(batch, SESSION_LIST_PREFIX_BYTES, SESSION_LIST_SUFFIX_BYTES);
+    for (const filePath of batch) {
+      const slice = slices.get(filePath);
+      if (!slice) continue;
+      const info = scanSessionInfoFromSlices(filePath, slice, true);
+      // Failed scans are not negatively cached: a transient read error must not
+      // hide a session until its next mtime bump.
+      if (!info) continue;
+      cache.set(scanCacheKey(host, filePath), { size: slice.size, mtimeMs: slice.mtimeMs, info });
+      sessions.push(info);
+    }
+  }
+  trimScanCache(cache);
   sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
   return sessions;
 }
 
-interface SessionFileListCacheEntry {
-  rootMtimeMs: number;
-  subMaxMtimeMs: number;
-  files: string[];
-}
-
-declare global {
-  var __ompSessionFileListCache: Map<string, SessionFileListCacheEntry> | undefined;
-}
-
-/** Cached walk of `<sessionsRoot>/<project>/*.jsonl`, keyed on the root's
- * mtimeMs. Adding/removing a session bumps the root's mtime, invalidating
- * automatically — except on filesystems where a write inside a project
- * subdirectory does not touch the parent directory's mtime (Windows/NTFS
- * behaves this way in some configurations). Callers that know a session
- * changed must therefore also call invalidateSessionFileListCache(). */
+/** Retained for callers that still signal list invalidation; the walk is no
+ * longer cached (it is one bounded round trip per host). */
 export function invalidateSessionFileListCache(): void {
-  globalThis.__ompSessionFileListCache?.clear();
+  // no-op
 }
 
-export async function listSessionFiles(sessionsRoot: string): Promise<string[]> {
-  let rootStat: { mtimeMs: number };
+export interface SessionFileStat {
+  path: string;
+  size: number;
+  mtimeMs: number;
+}
+
+/** `<sessionsRoot>/<project>/*.jsonl` with size and mtime, in one walk. */
+export async function listSessionFileStats(sessionsRoot: string, host: Host = currentHost()): Promise<SessionFileStat[]> {
   try {
-    rootStat = statSync(sessionsRoot);
+    return await host.fs.walkFiles(sessionsRoot, { minDepth: 2, maxDepth: 2, suffix: ".jsonl" });
   } catch {
     return [];
   }
-  if (!globalThis.__ompSessionFileListCache) globalThis.__ompSessionFileListCache = new Map();
-  const cache = globalThis.__ompSessionFileListCache;
-  const cached = cache.get(sessionsRoot);
-  if (cached && cached.rootMtimeMs === rootStat.mtimeMs) {
-    // Windows/NTFS: root mtime may not bump when a file is added inside a project subdir.
-    // Validate by sampling subdir mtimes (cheap: stat per project dir, not per file).
-    let stale = false;
-    try {
-      for (const dirent of readDirectorySyncRuntime(sessionsRoot, { withFileTypes: true })) {
-        if (!dirent.isDirectory()) continue;
-        const subPath = path.join(sessionsRoot, dirent.name);
-        const subMtime = statSync(subPath).mtimeMs;
-        if (subMtime > cached.subMaxMtimeMs) { stale = true; break; }
-      }
-    } catch { stale = true; }
-    if (!stale) return cached.files;
-  }
-
-  const files = collectSessionFiles(sessionsRoot);
-  // Remember the root mtime separately from the sampled subdir max: comparing
-  // the combined max against the current root mtime never matches once any
-  // subdir outgrows the root (the normal NTFS steady state), defeating the cache.
-  let subMaxMtimeMs = 0;
-  try {
-    for (const dirent of readDirectorySyncRuntime(sessionsRoot, { withFileTypes: true })) {
-      if (!dirent.isDirectory()) continue;
-      subMaxMtimeMs = Math.max(subMaxMtimeMs, statSync(path.join(sessionsRoot, dirent.name)).mtimeMs);
-    }
-  } catch {}
-  cache.set(sessionsRoot, { rootMtimeMs: rootStat.mtimeMs, subMaxMtimeMs, files });
-  return files;
 }
 
-function collectSessionFiles(sessionsRoot: string): string[] {
-  const files: string[] = [];
-  try {
-    for (const dirent of readDirectorySyncRuntime(sessionsRoot, { withFileTypes: true })) {
-      if (!dirent.isDirectory()) continue;
-      const dirPath = path.join(sessionsRoot, dirent.name);
-      let inner: Dirent[];
-      try {
-        inner = readDirectorySyncRuntime(dirPath, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-      for (const file of inner) {
-        if (file.isFile() && file.name.endsWith(".jsonl")) {
-          files.push(path.join(dirPath, file.name));
-        }
-      }
-    }
-  } catch {
-    return [];
-  }
-  return files;
+export async function listSessionFiles(sessionsRoot: string, host: Host = currentHost()): Promise<string[]> {
+  return (await listSessionFileStats(sessionsRoot, host)).map((file) => file.path);
 }
 
 // ============================================================================
@@ -1115,24 +989,14 @@ export function cleanSessionTitle(raw: string): string {
  * title_change audit entry — omp-web only needs the display title, and a
  * bounded 256-byte write cannot corrupt a file a live omp process may hold.
  */
-export function setSessionTitle(filePath: string, title: string, source: SessionTitleSource): boolean {
+export async function setSessionTitle(filePath: string, title: string, source: SessionTitleSource, host: Host = currentHost()): Promise<boolean> {
   const cleaned = cleanSessionTitle(title);
   if (!cleaned) return false;
   const update: SessionTitleUpdate = { title: cleaned, source, updatedAt: new Date().toISOString() };
 
-  if (readTitleSlot(filePath)) {
+  if (await readTitleSlot(filePath, host)) {
     const slotLine = Buffer.from(serializeTitleSlot(update), "utf8");
-    const fd = openSync(filePath, "r+");
-    try {
-      let offset = 0;
-      while (offset < slotLine.length) {
-        const written = writeSync(fd, slotLine, offset, slotLine.length - offset, offset);
-        if (written === 0) throw new Error("Short write while updating session title slot");
-        offset += written;
-      }
-    } finally {
-      closeSync(fd);
-    }
+    await host.fs.writeAt(filePath, 0, slotLine);
     return true;
   }
 
@@ -1141,14 +1005,14 @@ export function setSessionTitle(filePath: string, title: string, source: Session
   // should never risk OOMing the server, and legacy slot-less files are rare.
   let legacySize: number;
   try {
-    legacySize = statSync(filePath).size;
+    legacySize = (await host.fs.stat(filePath)).size;
   } catch {
     return false;
   }
   if (legacySize > MAX_SESSION_LOAD_BYTES) {
     return false;
   }
-  const content = readFileSync(filePath, "utf8");
+  const content = (await host.fs.readFile(filePath)).toString("utf8");
   const lines = content.split("\n");
   const headerIndex = lines.findIndex((line) => line.trim().length > 0);
   if (headerIndex === -1) throw new Error("Cannot rename an empty session file");
@@ -1164,30 +1028,18 @@ export function setSessionTitle(filePath: string, title: string, source: Session
   lines[headerIndex] = JSON.stringify(header);
   const body = serializeTitleSlot(update) + lines.join("\n");
 
-  writeSessionFileAtomicSync(filePath, body, "title");
+  await writeSessionFileAtomic(filePath, body, host);
   return true;
 }
 
 /**
  * Replace a session file's contents through a temp file in the same directory
- * plus renameSync. writeFileSync truncates before writing, so a crash or ENOSPC
- * mid-write would permanently destroy the session; rename is atomic, leaving
- * either the old or the new file. Mirrors omp's own atomic session rewrite.
+ * plus rename. A truncating write would let a crash or ENOSPC mid-write destroy
+ * the session; rename is atomic, leaving either the old or the new file.
+ * Mirrors omp's own atomic session rewrite.
  */
-export function writeSessionFileAtomicSync(filePath: string, body: string, tag = "rewrite"): void {
-  const dir = path.dirname(filePath);
-  const tempDir = mkdtempSync(path.join(dir, `.omp-web-${tag}-`));
-  const tempPath = path.join(tempDir, path.basename(filePath));
-  try {
-    writeFileSync(tempPath, body, "utf8");
-    renameSync(tempPath, filePath);
-  } finally {
-    try {
-      rmdirSync(tempDir);
-    } catch {
-      rmSync(tempDir, { recursive: true, force: true });
-    }
-  }
+export async function writeSessionFileAtomic(filePath: string, body: string, host: Host = currentHost()): Promise<void> {
+  await host.fs.writeFile(filePath, body);
 }
 
 export interface SessionArchiveRoots {
@@ -1204,7 +1056,40 @@ export interface SessionArchiveRoots {
  * source file remains byte-for-byte unchanged until the compressed destination
  * is durably renamed; failures roll back both moves where possible.
  */
-export function archiveSessionFileWithArtifacts(filePath: string, roots: SessionArchiveRoots = {}): string {
+export async function archiveSessionFileWithArtifacts(filePath: string, roots: SessionArchiveRoots = {}, host: Host = currentHost()): Promise<string> {
+  if (host.isLocal) return archiveSessionFileLocally(filePath, roots);
+  const pathApi = path.posix;
+  const sessionsRoot = pathApi.resolve(roots.sessionsRoot ?? withHost(host, () => getSessionsDir()));
+  const source = pathApi.resolve(filePath);
+  const relative = pathApi.relative(sessionsRoot, source);
+  if (!relative || relative.startsWith("../") || pathApi.isAbsolute(relative) || !relative.endsWith(".jsonl")) {
+    throw new Error("Session path is outside the active OMP sessions directory");
+  }
+  const archiveRoot = pathApi.resolve(roots.archiveRoot ?? withHost(host, () => getArchivedSessionsDir()));
+  const destination = pathApi.join(archiveRoot, `${relative}.gz`);
+  const sourceArtifacts = source.slice(0, -".jsonl".length);
+  const destinationArtifacts = destination.slice(0, -".gz".length);
+  // Compress on the host itself: the transcript never crosses the wire. The
+  // gzip output lands in a temp file next to the destination and is renamed
+  // into place before the source is removed, so a failure leaves the original.
+  const script = [
+    'src="$1"; dst="$2"; srcart="$3"; dstart="$4"',
+    '[ -f "$src" ] || { echo "Session path is not a regular file" >&2; exit 2; }',
+    'if [ -e "$dst" ] || [ -e "${dst%.gz}" ]; then echo "Archived session destination already exists" >&2; exit 3; fi',
+    'if [ -d "$srcart" ] && [ -e "$dstart" ]; then echo "Archived session artifacts destination already exists" >&2; exit 4; fi',
+    'mkdir -p -- "$(dirname -- "$dst")" || exit 1',
+    'tmp="$dst.$$.tmp"',
+    'if ! gzip -9 -c -- "$src" > "$tmp"; then rm -f -- "$tmp"; exit 1; fi',
+    'mv -f -- "$tmp" "$dst" || { rm -f -- "$tmp"; exit 1; }',
+    'rm -f -- "$src" || exit 1',
+    'if [ -d "$srcart" ]; then mkdir -p -- "$(dirname -- "$dstart")" && mv -- "$srcart" "$dstart" || exit 1; fi',
+    'exit 0',
+  ].join("\n");
+  await host.executor.exec(["sh", "-c", script, "sh", source, destination, sourceArtifacts, destinationArtifacts], { timeoutMs: 10 * 60_000 });
+  return destination;
+}
+
+function archiveSessionFileLocally(filePath: string, roots: SessionArchiveRoots = {}): string {
   const sessionsRoot = path.resolve(roots.sessionsRoot ?? getSessionsDir());
   const source = path.resolve(filePath);
   const relative = path.relative(sessionsRoot, source);
@@ -1282,12 +1167,12 @@ export function archiveSessionFileWithArtifacts(filePath: string, roots: Session
  * Delete a session file and its per-session artifacts directory (the sibling
  * directory named after the file minus ".jsonl", holding subagent transcripts).
  */
-export function deleteSessionFileWithArtifacts(filePath: string): void {
-  unlinkSync(filePath);
+export async function deleteSessionFileWithArtifacts(filePath: string, host: Host = currentHost()): Promise<void> {
+  await host.fs.rm(filePath);
   if (!filePath.endsWith(".jsonl")) return;
   const artifactsDir = filePath.slice(0, -".jsonl".length);
   try {
-    rmSync(artifactsDir, { recursive: true, force: true });
+    await host.fs.rm(artifactsDir, { recursive: true, force: true });
   } catch {
     // The session file itself is already gone; artifact cleanup is best-effort.
   }

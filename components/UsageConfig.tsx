@@ -1,5 +1,8 @@
 "use client";
 
+import { hostFetch, useHosts } from "@/lib/hosts/client";
+import { MachineScopeNote } from "./MachineScopeNote";
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertCircle, ChevronDown, Loader2, RefreshCw } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
@@ -36,6 +39,8 @@ function formatCurrency(amount: number): string {
 
 export function UsageConfig() {
   const { t } = useI18n();
+  // Usage is read from the selected machine's omp history.
+  const { hostId } = useHosts();
 
   const [timeRange, setTimeRange] = useState<UsageTimeRange>("30d");
   const [granularity, setGranularity] = useState<UsageGranularity>("daily");
@@ -65,7 +70,7 @@ export function UsageConfig() {
         });
         if (isRefresh) params.set("refresh", "true");
 
-        const res = await fetch(`/api/usage?${params.toString()}`, { signal });
+        const res = await hostFetch(`/api/usage?${params.toString()}`, { signal }, hostId ?? undefined);
         if (!res.ok) {
           throw new Error(`Failed to fetch usage: ${res.statusText}`);
         }
@@ -81,8 +86,15 @@ export function UsageConfig() {
         setRefreshing(false);
       }
     },
-    [timeRange, granularity],
+    [timeRange, granularity, hostId],
   );
+
+  // Machine switch: drop the previous machine's report so its totals are never
+  // shown under another machine's name while the new one loads.
+  useEffect(() => {
+    setReport(null);
+    setError(null);
+  }, [hostId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -242,6 +254,7 @@ export function UsageConfig() {
       >
         <Loader2 size={24} className="animate-spin" style={{ color: "var(--accent)" }} />
         <span style={{ fontSize: 13 }}>{t("usageConfig.loading")}</span>
+        <MachineScopeNote intent="viewing" />
       </div>
     );
   }
@@ -334,6 +347,7 @@ export function UsageConfig() {
           {dateRangeSubtitle && (
             <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 2 }}>{dateRangeSubtitle}</div>
           )}
+          <MachineScopeNote intent="viewing" style={{ marginTop: 6 }} />
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>

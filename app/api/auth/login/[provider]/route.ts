@@ -1,13 +1,18 @@
-import { homedir } from "os";
+import type { NextRequest } from "next/server";
+import { currentHost } from "@/lib/hosts/context";
+import { withHostRoute } from "@/lib/hosts/route";
 import { invalidateModelsCache } from "@/lib/models-cache";
 import { enableProvider } from "@/lib/omp/model-roles";
+import { hostHomedir } from "@/lib/omp/paths";
 import { RpcProcess, type RpcFrame } from "@/lib/omp/rpc-process";
 import { disposeUtilityRpc } from "@/lib/omp/rpc-utility";
 
 export const dynamic = "force-dynamic";
 
 /**
- * Interactive login over a dedicated `omp --mode rpc-ui` process. omp drives
+ * Interactive login over a dedicated `omp --mode rpc-ui` process on the host
+ * that owns the credential store (the browser-side OAuth flow is the same
+ * whichever machine omp runs on). omp drives
  * the flow with extension_ui_request frames: `open_url` carries the OAuth URL,
  * `input` asks for the pasted code/redirect URL, `notify` reports progress.
  * The SSE stream keeps pi-web's event names (auth, prompt_request, progress,
@@ -22,6 +27,7 @@ const HEARTBEAT_MS = 30_000;
 
 interface PendingLogin {
   provider: string;
+  hostId: string;
   submit: (value: string) => void;
 }
 
@@ -37,10 +43,10 @@ function getLoginRegistry(): Map<string, PendingLogin> {
 }
 
 // POST /api/auth/login/[provider] — frontend sends redirect URL or auth code
-export async function POST(
-  req: Request,
+export const POST = withHostRoute(async (
+  req: NextRequest,
   { params }: { params: Promise<{ provider: string }> }
-) {
+) => {
   const { provider } = await params;
   const { token, code } = (await req.json()) as { token?: string; code?: string };
 
@@ -60,15 +66,17 @@ export async function POST(
   }
 
   pending.submit(code);
-  return Response.json({ ok: true, provider });
-}
+  return Response.json({ ok: true, provider, host: pending.hostId });
+}, { ready: false });
 
 // GET /api/auth/login/[provider] — SSE stream for the login flow
-export async function GET(
-  req: Request,
+export const GET = withHostRoute(async (
+  req: NextRequest,
   { params }: { params: Promise<{ provider: string }> }
-) {
+) => {
   const { provider } = await params;
+  const host = currentHost();
+  const loginCwd = host.home ?? hostHomedir();
   const token = `${provider}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const registry = getLoginRegistry();
   const encoder = new TextEncoder();
@@ -134,7 +142,7 @@ export async function GET(
       };
 
       try {
-        proc = new RpcProcess({ cwd: homedir(), extraArgs: LOGIN_EXTRA_ARGS, onFrame: handleFrame });
+        proc = new RpcProcess({ host, cwd: loginCwd, extraArgs: LOGIN_EXTRA_ARGS, onFrame: handleFrame });
       } catch (error) {
         send({ type: "error", message: error instanceof Error ? error.message : String(error) });
         clearInterval(heartbeat);
@@ -146,6 +154,7 @@ export async function GET(
 
       registry.set(token, {
         provider,
+        hostId: host.id,
         submit: (value: string) => {
           if (pendingInputId !== null) {
             const id = pendingInputId;
@@ -168,10 +177,10 @@ export async function GET(
         const ready = await child.waitReady(READY_TIMEOUT_MS);
         await child.negotiateProtocol(ready);
         await child.sendCommand({ type: "login", providerId: provider }, LOGIN_TIMEOUT_MS);
-        enableProvider(provider);
-        invalidateModelsCache();
-        disposeUtilityRpc();
-        send({ type: "success" });
+        await enableProvider(provider, host);
+        invalidateModelsCache(host.id);
+        disposeUtilityRpc(host.id);
+        send({ type: "success", host: host.id });
       } catch (error) {
         if (req.signal.aborted) {
           send({ type: "cancelled" });
@@ -193,4 +202,4 @@ export async function GET(
       Connection: "keep-alive",
     },
   });
-}
+});

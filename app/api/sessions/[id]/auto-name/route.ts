@@ -4,6 +4,7 @@ import { deriveSessionTitleFromFirstMessage, sanitizeSessionTitle } from "@/lib/
 import { getRpcSession } from "@/lib/rpc-manager";
 import { invalidateSessionListCache } from "@/lib/session-reader";
 import { resolveSessionPathOr404 } from "@/lib/api-utils";
+import { withSessionRoute } from "@/lib/hosts/route";
 
 /**
  * POST /api/sessions/[id]/auto-name
@@ -13,10 +14,10 @@ import { resolveSessionPathOr404 } from "@/lib/api-utils";
  * when the session is running, else the persisted title, else a fallback
  * derived from the first user message (persisted so the sidebar updates).
  */
-export async function POST(
+export const POST = withSessionRoute(async (
   _req: Request,
   { params }: { params: Promise<{ id: string }> },
-) {
+) => {
   const { id } = await params;
 
   try {
@@ -43,7 +44,8 @@ export async function POST(
     if ("response" in resolved) return resolved.response;
     const filePath = resolved.filePath;
 
-    const info = scanSessionInfo(filePath, false);
+    // Bounded prefix scan on the session's host (no status tail needed).
+    const info = await scanSessionInfo(filePath, false);
     const storedTitle = sanitizeSessionTitle(info?.title);
     if (storedTitle) {
       return NextResponse.json({ title: storedTitle, usage: null });
@@ -60,7 +62,7 @@ export async function POST(
     // Persist only when no live process owns the file; a running session will
     // title itself and would clobber our write on its next flush anyway.
     if (!running) {
-      setSessionTitle(filePath, derived, "auto");
+      await setSessionTitle(filePath, derived, "auto");
     }
     invalidateSessionListCache();
     return NextResponse.json({ title: derived, usage: null });
@@ -70,4 +72,4 @@ export async function POST(
       { status: 500 },
     );
   }
-}
+});

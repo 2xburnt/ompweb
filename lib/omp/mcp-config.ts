@@ -1,15 +1,16 @@
-import { execFileSync } from "child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "fs";
-import { homedir } from "os";
-import { basename, dirname, join, relative, resolve, sep } from "path";
+import { randomBytes } from "crypto";
 import { stripAnsi } from "../ansi";
-import { getAgentDir } from "./paths";
+import { currentHost, withHost } from "../hosts/context";
+import type { Host } from "../hosts/registry";
 import { isRecord } from "../type-guards";
+import { existingPaths, FileTooLargeError, isExistsError, readTextFile, runHostScript } from "./host-io";
+import { resolveOmpBin } from "./omp-cli";
+import { getAgentDir, hostHomedir } from "./paths";
 
 const MAX_MCP_CONFIG_BYTES = 512 * 1024;
 const MAX_DISCOVERED_MCP_CONFIG_BYTES = 5 * 1024 * 1024;
 const SERVER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-const MCP_FILENAMES = [join(".omp", "mcp.json"), join(".omp", ".mcp.json"), "mcp.json", ".mcp.json"];
+const MCP_FILENAMES: ReadonlyArray<readonly string[]> = [[".omp", "mcp.json"], [".omp", ".mcp.json"], ["mcp.json"], [".mcp.json"]];
 
 export type McpServer = Record<string, unknown>;
 export type McpFile = Record<string, unknown> & { mcpServers?: Record<string, McpServer> };
@@ -37,11 +38,9 @@ function serverEntries(config: McpFile): Array<{ name: string; config: McpServer
     .map(([name, server]) => ({ name, config: server }));
 }
 
-function readMcpUserConfig(path: string): McpUserConfig {
-  if (!existsSync(path)) return { path, servers: [], disabledServers: [] };
+function parseMcpUserConfigText(path: string, text: string): McpUserConfig {
   try {
-    if (statSync(path).size > MAX_DISCOVERED_MCP_CONFIG_BYTES) throw new Error("configuration is too large to inspect");
-    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    const parsed: unknown = JSON.parse(text);
     if (!isRecord(parsed)) throw new Error("configuration must contain a JSON object");
     if (parsed.mcpServers !== undefined && !isRecord(parsed.mcpServers)) throw new Error("mcpServers must be an object");
     return {
@@ -56,15 +55,29 @@ function readMcpUserConfig(path: string): McpUserConfig {
   }
 }
 
+async function readMcpUserConfig(host: Host, path: string): Promise<McpUserConfig> {
+  let text: string | null;
+  try {
+    text = await readTextFile(host, path, MAX_DISCOVERED_MCP_CONFIG_BYTES);
+  } catch (error) {
+    const message = error instanceof FileTooLargeError ? "configuration is too large to inspect" : error instanceof Error ? error.message : String(error);
+    return { path, servers: [], disabledServers: [], error: message };
+  }
+  if (text === null) return { path, servers: [], disabledServers: [] };
+  return parseMcpUserConfigText(path, text);
+}
+
 /** OMP's active user-level server configuration. This is deliberately separate
  * from compatibility providers such as Claude Code, which do not describe the
  * MCP connections owned by OMP. */
-export function readUserMcpConfig(path = join(getAgentDir(), "mcp.json")): McpUserConfig {
-  return readMcpUserConfig(path);
+export function readUserMcpConfig(path?: string, host: Host = currentHost()): Promise<McpUserConfig> {
+  const resolved = path ?? withHost(host, () => host.pathApi.join(getAgentDir(), "mcp.json"));
+  return readMcpUserConfig(host, resolved);
 }
 
-function sourceName(path: string): string {
-  const name = basename(path) === ".claude.json" ? ".claude" : basename(dirname(path));
+function sourceName(host: Host, path: string): string {
+  const pathApi = host.pathApi;
+  const name = pathApi.basename(path) === ".claude.json" ? ".claude" : pathApi.basename(pathApi.dirname(path));
   if (name === ".claude") return "Claude Code";
   if (name === ".codex") return "Codex";
   if (name === ".cursor") return "Cursor";
@@ -72,55 +85,124 @@ function sourceName(path: string): string {
   return name.replace(/^\./, "") || "Configured";
 }
 
-function discoverMcpConfigPaths(root: string): string[] {
-  const paths = new Set<string>([join(root, ".claude.json"), join(root, "mcp.json"), join(root, ".mcp.json")]);
-  try {
-    for (const entry of readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory() || !entry.name.startsWith(".")) continue;
-      const directory = join(root, entry.name);
-      paths.add(join(directory, "mcp.json"));
-      paths.add(join(directory, "config.json"));
-      paths.add(join(directory, "config.toml"));
+const ROOT_LEVEL_CANDIDATES = [".claude.json", "mcp.json", ".mcp.json"] as const;
+const DOT_DIR_CANDIDATES = ["mcp.json", "config.json", "config.toml"] as const;
+
+/** A discovered provider config: `text` is null when the file was too large. */
+type DiscoveredFile = { path: string; text: string | null };
+
+async function discoverMcpConfigFilesLocally(host: Host, roots: readonly string[]): Promise<DiscoveredFile[]> {
+  const pathApi = host.pathApi;
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  for (const root of roots) {
+    const candidates = ROOT_LEVEL_CANDIDATES.map((name) => pathApi.join(root, name));
+    try {
+      const entries = (await host.fs.readdir(root))
+        .filter((entry) => entry.name.startsWith(".") && (entry.isDirectory() || entry.targetType === "dir"))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        for (const name of DOT_DIR_CANDIDATES) candidates.push(pathApi.join(root, entry.name, name));
+      }
+    } catch {
+      // An unavailable workspace simply has no discoverable provider configs.
     }
-  } catch {
-    // An unavailable workspace simply has no discoverable provider configs.
+    for (const candidate of candidates) {
+      if (!seen.has(candidate)) {
+        seen.add(candidate);
+        paths.push(candidate);
+      }
+    }
   }
-  return [...paths].filter(existsSync);
+  const files: DiscoveredFile[] = [];
+  for (const path of paths) {
+    try {
+      const text = await readTextFile(host, path, MAX_DISCOVERED_MCP_CONFIG_BYTES);
+      if (text !== null) files.push({ path, text });
+    } catch (error) {
+      if (error instanceof FileTooLargeError) files.push({ path, text: null });
+      // Unreadable candidates are skipped like missing ones.
+    }
+  }
+  return files;
 }
 
-function readTomlMcpServers(path: string, source: string, disabledNames: Set<string>): McpLiveServer[] {
-  try {
-    if (statSync(path).size > MAX_DISCOVERED_MCP_CONFIG_BYTES) return [];
-    const text = readFileSync(path, "utf8");
-    const sections = [...text.matchAll(/^\s*\[mcp_servers(?:\.([A-Za-z0-9_-]+)|\."([^"]+)")\]\s*$/gm)];
-    return sections.flatMap((section, index) => {
-      const name = section[1] ?? section[2];
-      if (!name || disabledNames.has(name)) return [];
-      const body = text.slice((section.index ?? 0) + section[0].length, sections[index + 1]?.index);
-      return [{ name, source, status: /^\s*enabled\s*=\s*false\s*$/m.test(body) ? "disabled" as const : "configured" as const, type: /^\s*url\s*=/m.test(body) ? "http" : "stdio" }];
-    });
-  } catch {
-    return [];
+/** One round trip: every existing candidate file under every root, framed as
+ * "H <path>\n" + up to MAX+1 bytes + sentinel. */
+async function discoverMcpConfigFilesRemotely(host: Host, roots: readonly string[]): Promise<DiscoveredFile[]> {
+  const sentinel = `--omp-web-${randomBytes(12).toString("hex")}--`;
+  const script = [
+    'S="$1"; MAX="$2"; shift 2',
+    'emit() { [ -f "$1" ] || return 0; printf "H %s\\n" "$1"; head -c "$MAX" -- "$1" 2>/dev/null; printf "%s" "$S"; }',
+    'for root in "$@"; do',
+    '  [ -d "$root" ] || continue',
+    `  ${ROOT_LEVEL_CANDIDATES.map((name) => `emit "$root/${name}"`).join("; ")}`,
+    '  for d in "$root"/.*/; do',
+    '    d="${d%/}"; b="${d##*/}"',
+    '    case "$b" in .|..) continue;; esac',
+    '    [ -d "$d" ] || continue',
+    `    ${DOT_DIR_CANDIDATES.map((name) => `emit "$d/${name}"`).join("; ")}`,
+    "  done",
+    "done",
+    "exit 0",
+  ].join("\n");
+  const { stdout } = await runHostScript(host, script, [sentinel, String(MAX_DISCOVERED_MCP_CONFIG_BYTES + 1), ...roots], {
+    maxBuffer: 64 * 1024 * 1024,
+    timeoutMs: 2 * 60_000,
+  });
+  const sentinelBuffer = Buffer.from(sentinel, "utf8");
+  const files: DiscoveredFile[] = [];
+  const seen = new Set<string>();
+  let offset = 0;
+  while (offset < stdout.length) {
+    const lineEnd = stdout.indexOf(0x0a, offset);
+    if (lineEnd === -1) break;
+    const header = stdout.subarray(offset, lineEnd).toString("utf8");
+    offset = lineEnd + 1;
+    if (!header.startsWith("H ")) break;
+    const bodyEnd = stdout.indexOf(sentinelBuffer, offset);
+    if (bodyEnd === -1) break;
+    const body = stdout.subarray(offset, bodyEnd);
+    offset = bodyEnd + sentinelBuffer.length;
+    const path = header.slice(2);
+    if (seen.has(path)) continue;
+    seen.add(path);
+    files.push({ path, text: body.length > MAX_DISCOVERED_MCP_CONFIG_BYTES ? null : body.toString("utf8") });
   }
+  return files;
+}
+
+function readTomlMcpServers(text: string, source: string, disabledNames: Set<string>): McpLiveServer[] {
+  const sections = [...text.matchAll(/^\s*\[mcp_servers(?:\.([A-Za-z0-9_-]+)|\."([^"]+)")\]\s*$/gm)];
+  return sections.flatMap((section, index) => {
+    const name = section[1] ?? section[2];
+    if (!name || disabledNames.has(name)) return [];
+    const body = text.slice((section.index ?? 0) + section[0].length, sections[index + 1]?.index);
+    return [{ name, source, status: /^\s*enabled\s*=\s*false\s*$/m.test(body) ? "disabled" as const : "configured" as const, type: /^\s*url\s*=/m.test(body) ? "http" : "stdio" }];
+  });
 }
 
 /** Read installed provider configs by MCP schema, never by individual server name. */
-export function readDiscoveredMcpServers(cwd?: string, disabled = [] as string[]): McpLiveServer[] {
+export async function readDiscoveredMcpServers(cwd?: string, disabled = [] as string[], host: Host = currentHost()): Promise<McpLiveServer[]> {
   const disabledNames = new Set(disabled);
-  const paths = new Set(discoverMcpConfigPaths(homedir()));
-  if (cwd) for (const path of discoverMcpConfigPaths(cwd)) paths.add(path);
+  const roots = [withHost(host, () => hostHomedir())];
+  if (cwd && !roots.includes(cwd)) roots.push(cwd);
+  const files = host.isLocal
+    ? await discoverMcpConfigFilesLocally(host, roots)
+    : await discoverMcpConfigFilesRemotely(host, roots);
   const servers: McpLiveServer[] = [];
   const seen = new Set<string>();
-  for (const path of paths) {
-    const source = sourceName(path);
-    if (path.endsWith(".toml")) {
-      for (const server of readTomlMcpServers(path, source, disabledNames)) {
+  for (const file of files) {
+    if (file.text === null) continue;
+    const source = sourceName(host, file.path);
+    if (file.path.endsWith(".toml")) {
+      for (const server of readTomlMcpServers(file.text, source, disabledNames)) {
         const key = `${server.source}:${server.name}`;
         if (!seen.has(key)) { seen.add(key); servers.push(server); }
       }
       continue;
     }
-    const config = readMcpUserConfig(path);
+    const config = parseMcpUserConfigText(file.path, file.text);
     for (const server of config.servers) {
       if (disabledNames.has(server.name)) continue;
       const key = `${source}:${server.name}`;
@@ -171,6 +253,22 @@ export function parseMcpListOutput(output: string): McpLiveServer[] {
   return servers;
 }
 
+/** `omp mcp list` on the host: the CLI view of every configured server. */
+export async function runOmpMcpList(cwd: string | undefined, host: Host = currentHost()): Promise<McpLiveServer[]> {
+  const bin = resolveOmpBin(host);
+  if (!bin) throw new Error(host.isLocal ? "omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN." : `omp binary not found on host "${host.id}"`);
+  const result = await host.executor.exec([bin, "mcp", "list"], {
+    cwd,
+    timeoutMs: 30_000,
+    maxBuffer: 4 * 1024 * 1024,
+    env: { FORCE_COLOR: "0", NO_COLOR: "1" },
+    allowFailure: true,
+  });
+  const stdout = result.stdout.toString("utf8");
+  if (result.code !== 0) throw new Error(stripAnsi(result.stderr || stdout).trim().slice(-600) || `omp mcp list exited with ${result.code}`);
+  return parseMcpListOutput(stdout);
+}
+
 function stringRecord(value: unknown, name: string): void {
   if (!isRecord(value) || Object.values(value).some((item) => typeof item !== "string")) throw new Error(`${name} must map strings to strings`);
 }
@@ -178,39 +276,52 @@ function stringRecord(value: unknown, name: string): void {
 const projectRootCache = new Map<string, { root: string; expiresAt: number }>();
 const PROJECT_ROOT_TTL_MS = 30_000;
 
-function projectRoot(cwd: string): string {
-  const cached = projectRootCache.get(cwd);
+async function projectRoot(host: Host, cwd: string): Promise<string> {
+  const key = `${host.id}\0${cwd}`;
+  const cached = projectRootCache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.root;
+  const pathApi = host.pathApi;
   let root: string;
   try {
-    root = resolve(execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"] }).trim());
+    const result = await host.executor.exec(["git", "-C", cwd, "rev-parse", "--show-toplevel"], { timeoutMs: 15_000, allowFailure: true, env: { LC_ALL: "C" } });
+    const top = result.code === 0 ? result.stdout.toString("utf8").trim() : "";
+    root = top ? pathApi.resolve(top) : pathApi.resolve(cwd);
   } catch {
-    root = resolve(cwd);
+    root = pathApi.resolve(cwd);
   }
   if (projectRootCache.size > 500) projectRootCache.clear();
-  projectRootCache.set(cwd, { root, expiresAt: Date.now() + PROJECT_ROOT_TTL_MS });
+  projectRootCache.set(key, { root, expiresAt: Date.now() + PROJECT_ROOT_TTL_MS });
   return root;
 }
 
-function assertCwdWithinRoot(cwd: string, root: string): void {
-  const path = relative(root, cwd);
-  if (path === ".." || path.startsWith(`..${sep}`)) throw new Error("Project root does not contain workspace");
+function assertCwdWithinRoot(host: Host, cwd: string, root: string): void {
+  const pathApi = host.pathApi;
+  const path = pathApi.relative(root, cwd);
+  if (path === ".." || path.startsWith(`..${pathApi.sep}`)) throw new Error("Project root does not contain workspace");
 }
 
-export function resolveMcpConfig(cwd: string): { root: string; path: string } {
-  const root = projectRoot(cwd);
-  assertCwdWithinRoot(cwd, root);
-  const existing = MCP_FILENAMES.map((filename) => join(root, filename)).find(existsSync);
-  return { root, path: existing ?? join(root, MCP_FILENAMES[0]) };
+export async function resolveMcpConfig(cwd: string, host: Host = currentHost()): Promise<{ root: string; path: string }> {
+  const root = await projectRoot(host, cwd);
+  assertCwdWithinRoot(host, cwd, root);
+  const candidates = MCP_FILENAMES.map((parts) => host.pathApi.join(root, ...parts));
+  const present = await existingPaths(host, candidates);
+  const existing = candidates.find((candidate) => present.has(candidate));
+  return { root, path: existing ?? candidates[0] };
 }
 
-export function readMcpConfig(cwd: string): { root: string; path: string; config: McpFile; exists: boolean } {
-  const resolved = resolveMcpConfig(cwd);
-  if (!existsSync(resolved.path)) return { ...resolved, config: { mcpServers: {} }, exists: false };
-  if (statSync(resolved.path).size > MAX_MCP_CONFIG_BYTES) throw new Error("MCP configuration is too large to edit in omp-web");
+export async function readMcpConfig(cwd: string, host: Host = currentHost()): Promise<{ root: string; path: string; config: McpFile; exists: boolean }> {
+  const resolved = await resolveMcpConfig(cwd, host);
+  let text: string | null;
+  try {
+    text = await readTextFile(host, resolved.path, MAX_MCP_CONFIG_BYTES);
+  } catch (error) {
+    if (error instanceof FileTooLargeError) throw new Error("MCP configuration is too large to edit in omp-web");
+    throw error;
+  }
+  if (text === null) return { ...resolved, config: { mcpServers: {} }, exists: false };
   let config: unknown;
   try {
-    config = JSON.parse(readFileSync(resolved.path, "utf8"));
+    config = JSON.parse(text);
   } catch {
     throw new Error(`${resolved.path} is not valid JSON`);
   }
@@ -249,72 +360,69 @@ export function validateMcpServer(name: unknown, server: unknown): asserts serve
 // Cross-process mutex for MCP config read-modify-write cycles. The dev server
 // (30178) and the installed production app (30177) can edit the same project's
 // mcp.json at the same time; without a lock the later rename would silently
-// overwrite the earlier mutation (add vs delete lost update). A lockfile with
-// exclusive create (`wx`) is atomic on every platform; the holder writes its
-// PID and deletes the file on completion. Stale locks (writer crashed) are
-// broken after a grace period.
+// overwrite the earlier mutation (add vs delete lost update). A lock
+// *directory* is created with a plain (non-recursive) mkdir, which is atomic
+// on every platform and needs nothing beyond HostFs on a remote host; the
+// holder removes it on completion. Stale locks (writer crashed) are broken
+// after a grace period.
 const MCP_LOCK_TIMEOUT_MS = 3_000;
 const MCP_LOCK_STALE_MS = 10_000;
 const MCP_LOCK_RETRY_MS = 25;
 
-function sleepSync(ms: number): void {
-  const sab = new SharedArrayBuffer(4);
-  Atomics.wait(new Int32Array(sab), 0, 0, ms);
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function withMcpConfigLock<T>(configPath: string, fn: () => T): T {
+async function withMcpConfigLock<T>(host: Host, configPath: string, fn: () => Promise<T>): Promise<T> {
   const lockPath = `${configPath}.lock`;
   const deadline = Date.now() + MCP_LOCK_TIMEOUT_MS;
-  // The config file may not exist yet (first write) — the lockfile needs its
+  // The config file may not exist yet (first write) — the lock needs its
   // parent dir to exist before exclusive-create can succeed.
-  mkdirSync(dirname(lockPath), { recursive: true });
+  await host.fs.mkdir(host.pathApi.dirname(lockPath), { recursive: true });
   for (;;) {
-    let fd: number | null = null;
     try {
-      fd = openSync(lockPath, "wx");
+      await host.fs.mkdir(lockPath);
     } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") throw error;
+      if (!isExistsError(error)) throw error;
       // Held by another process — break it if stale, otherwise wait and retry.
       try {
-        if (Date.now() - statSync(lockPath).mtimeMs > MCP_LOCK_STALE_MS) {
-          unlinkSync(lockPath);
+        if (Date.now() - (await host.fs.lstat(lockPath)).mtimeMs > MCP_LOCK_STALE_MS) {
+          await host.fs.rm(lockPath, { recursive: true, force: true });
           continue;
         }
       } catch {
-        // Lock vanished between open and stat — retry immediately.
+        // Lock vanished between mkdir and lstat — retry immediately.
         continue;
       }
       if (Date.now() >= deadline) {
         throw new Error(`Timed out waiting for ${lockPath} (another process holds the MCP config lock)`);
       }
-      sleepSync(MCP_LOCK_RETRY_MS);
+      await sleep(MCP_LOCK_RETRY_MS);
       continue;
     }
     try {
-      writeSync(fd, String(process.pid));
+      return await fn();
     } finally {
-      closeSync(fd);
-    }
-    try {
-      return fn();
-    } finally {
-      try {
-        unlinkSync(lockPath);
-      } catch {
+      await host.fs.rm(lockPath, { recursive: true, force: true }).catch(() => {
         // Already removed (e.g. by cleanup) — the critical section is done.
-      }
+      });
     }
   }
 }
 
-export function writeMcpServer(cwd: string, name: string, server: McpServer, previousName?: string): { path: string } {
+async function writeMcpFile(host: Host, path: string, config: McpFile): Promise<void> {
+  await host.fs.mkdir(host.pathApi.dirname(path), { recursive: true });
+  // Atomic on the host (temp file + rename).
+  await host.fs.writeFile(path, `${JSON.stringify(config, null, 2)}\n`);
+}
+
+export async function writeMcpServer(cwd: string, name: string, server: McpServer, previousName?: string, host: Host = currentHost()): Promise<{ path: string }> {
   validateMcpServer(name, server);
   if (previousName !== undefined && !SERVER_NAME.test(previousName)) throw new Error("Invalid previous server name");
-  const current = readMcpConfig(cwd);
-  return withMcpConfigLock(current.path, () => {
+  const current = await readMcpConfig(cwd, host);
+  return withMcpConfigLock(host, current.path, async () => {
     // Re-read INSIDE the lock so a concurrent writer's mutation is not lost.
-    const locked = readMcpConfig(cwd);
+    const locked = await readMcpConfig(cwd, host);
     const servers = { ...(locked.config.mcpServers ?? {}) };
     // Capture the old entry before deleting it: a rename must retain credentials
     // that the browser intentionally redacts from its payload.
@@ -327,27 +435,20 @@ export function writeMcpServer(cwd: string, name: string, server: McpServer, pre
       ...(previous?.env !== undefined && server.env === undefined ? { env: previous.env } : {}),
       ...(previous?.headers !== undefined && server.headers === undefined ? { headers: previous.headers } : {}),
     };
-    const config: McpFile = { ...locked.config, mcpServers: servers };
-    mkdirSync(dirname(locked.path), { recursive: true });
-    const temp = `${locked.path}.tmp-${process.pid}-${Date.now()}`;
-    writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, "utf8");
-    renameSync(temp, locked.path);
+    await writeMcpFile(host, locked.path, { ...locked.config, mcpServers: servers });
     return { path: locked.path };
   });
 }
 
-export function deleteMcpServer(cwd: string, name: string): { path: string } {
+export async function deleteMcpServer(cwd: string, name: string, host: Host = currentHost()): Promise<{ path: string }> {
   if (!SERVER_NAME.test(name)) throw new Error("Invalid server name");
-  const current = readMcpConfig(cwd);
-  return withMcpConfigLock(current.path, () => {
-    const locked = readMcpConfig(cwd);
+  const current = await readMcpConfig(cwd, host);
+  return withMcpConfigLock(host, current.path, async () => {
+    const locked = await readMcpConfig(cwd, host);
     const servers = { ...(locked.config.mcpServers ?? {}) };
     if (!(name in servers)) throw new Error("MCP server was not found");
     delete servers[name];
-    const config: McpFile = { ...locked.config, mcpServers: servers };
-    const temp = `${locked.path}.tmp-${process.pid}-${Date.now()}`;
-    writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, "utf8");
-    renameSync(temp, locked.path);
+    await writeMcpFile(host, locked.path, { ...locked.config, mcpServers: servers });
     return { path: locked.path };
   });
 }

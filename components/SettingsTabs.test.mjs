@@ -21,3 +21,13 @@ test("horizontal settings tabs expose every category description", () => {
     assert.ok(html.includes(`>${category.description}<`), `description is not visibly rendered for ${category.id}`);
   }
 });
+
+test("settings expose a Machines category between extensions and system", () => {
+  const ids = SETTINGS_CATEGORIES.map((category) => category.id);
+  const machines = ids.indexOf("machines");
+  assert.ok(machines > ids.indexOf("mcp"), "machines follows extensions");
+  assert.ok(machines < ids.indexOf("system"), "machines precedes system");
+  const category = SETTINGS_CATEGORIES[machines];
+  assert.equal(category.label, "Machines");
+  assert.match(category.description, /SSH/);
+});

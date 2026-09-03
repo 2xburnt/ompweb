@@ -1,5 +1,7 @@
-import { NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
 import { apiErrorResponse } from "@/lib/api-utils";
+import { currentHost } from "@/lib/hosts/context";
+import { withHostRoute } from "@/lib/hosts/route";
 import { invalidateModelsCache } from "@/lib/models-cache";
 import { disposeUtilityRpc } from "@/lib/omp/rpc-utility";
 import {
@@ -12,8 +14,9 @@ import {
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
-  const file = readModelsConfigFile();
+export const GET = withHostRoute(async () => {
+  const host = currentHost();
+  const file = await readModelsConfigFile(host);
   if (file.parseError) {
     // The editor must show the failure instead of an empty form — an empty
     // form invites a Save that would wipe the user's real providers.
@@ -22,15 +25,17 @@ export async function GET() {
       parseError: file.parseError,
       path: file.path,
       code: "models_config_unparseable",
+      host: host.id,
     });
   }
-  return NextResponse.json(file.config);
-}
+  return NextResponse.json({ ...file.config, host: host.id });
+});
 
 // PUT /api/models-config[?overwrite=true]
 // Refuses to write while models.yml is unparseable unless ?overwrite=true.
-export async function PUT(req: Request) {
+export const PUT = withHostRoute(async (req: NextRequest) => {
   try {
+    const host = currentHost();
     const overwriteUnparseable = new URL(req.url).searchParams.get("overwrite") === "true";
     const body = await req.json() as ModelsFileConfig;
     try {
@@ -39,7 +44,7 @@ export async function PUT(req: Request) {
       return NextResponse.json({ error: error instanceof Error ? error.message : String(error) }, { status: 400 });
     }
     try {
-      writeModelsConfig(body, { overwriteUnparseable });
+      await writeModelsConfig(body, { overwriteUnparseable }, host);
     } catch (error) {
       if (error instanceof ModelsConfigParseError) {
         return NextResponse.json(
@@ -49,12 +54,12 @@ export async function PUT(req: Request) {
       }
       throw error;
     }
-    invalidateModelsCache();
+    invalidateModelsCache(host.id);
     // The utility process loads models.yml once at startup. A cache flush alone
     // would still query that stale registry after a provider was added.
-    disposeUtilityRpc();
-    return NextResponse.json({ success: true });
+    disposeUtilityRpc(host.id);
+    return NextResponse.json({ success: true, host: host.id });
   } catch (error) {
     return apiErrorResponse(error);
   }
-}
+});

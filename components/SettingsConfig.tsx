@@ -14,6 +14,8 @@ import { copyText } from "@/lib/clipboard";
 import type { AppUpdateInfo } from "./AppUpdateDialog";
 import { useFontSize, type FontSizePreference } from "@/hooks/useFontSize";
 import { useUiScale, type UiScalePreference } from "@/hooks/useUiScale";
+import { hostFetch, useHosts } from "@/lib/hosts/client";
+import { MachineScopeNote } from "./MachineScopeNote";
 const SettingsTabLoading = () => {
   const { t } = useI18n();
   return <div role="status" style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 12 }}>{t("settingsConfig.loadingSettings")}</div>;
@@ -24,6 +26,7 @@ const PluginsConfig = dynamic(() => import("./PluginsConfig").then((module) => m
 const McpConfig = dynamic(() => import("./McpConfig").then((module) => module.McpConfig), { loading: SettingsTabLoading, ssr: false });
 const AgentsConfig = dynamic(() => import("./AgentsConfig").then((module) => module.AgentsConfig), { loading: SettingsTabLoading, ssr: false });
 const UsageConfig = dynamic(() => import("./UsageConfig").then((module) => module.UsageConfig), { loading: SettingsTabLoading, ssr: false });
+const MachinesConfig = dynamic(() => import("./MachinesConfig").then((module) => module.MachinesConfig), { loading: SettingsTabLoading, ssr: false });
 
 type UpdateState = AppUpdateInfo;
 type WindowsServiceStatus = {
@@ -174,6 +177,9 @@ const SETTING_INDEX: SettingIndexEntry[] = [
   { id: "token-cost", tab: "usage", sectionKey: "settingsTabs.usage.label", labelKey: "usageConfig.rawTokenCost", descKey: "usageConfig.billedAtFullRate", fallbackSection: "Usage", fallbackLabel: "Raw Token Cost", fallbackDesc: "Token expenditure across providers and models", scope: "UI" },
   { id: "cache-savings", tab: "usage", sectionKey: "settingsTabs.usage.label", labelKey: "usageConfig.cacheSavings", descKey: "usageConfig.costQuality", fallbackSection: "Usage", fallbackLabel: "Cache Savings", fallbackDesc: "Prompt caching savings and cost quality breakdown", scope: "UI" },
   { id: "model-breakdown", tab: "usage", sectionKey: "settingsTabs.usage.label", labelKey: "usageConfig.breakdown", descKey: "usageConfig.model", fallbackSection: "Usage", fallbackLabel: "Model Breakdown", fallbackDesc: "Historical token usage and cost per model, day, and project", scope: "UI" },
+  // Machines
+  { id: "machines-list", tab: "machines", sectionKey: "settingsTabs.machines.label", labelKey: "hosts.settings.listTitle", descKey: "hosts.settings.listDesc", fallbackSection: "Machines", fallbackLabel: "Configured machines", fallbackDesc: "Connection state, omp version and last error for every machine that runs omp.", scope: "UI" },
+  { id: "machines-add", tab: "machines", sectionKey: "settingsTabs.machines.label", labelKey: "hosts.settings.add", descKey: "hosts.settings.addDesc", fallbackSection: "Machines", fallbackLabel: "Add machine", fallbackDesc: "Reach another machine over SSH: host, user, port, identity file, omp binary, agent directory.", scope: "UI" },
   // Windows Background Service & System Tray
   { id: "windows-service-autostart", tab: "system", sectionKey: "settingsConfig.windowsServiceTitle", labelKey: "settingsConfig.windowsServiceAutostart", descKey: "settingsConfig.windowsServiceAutostartDesc", fallbackSection: "Windows Background Service & System Tray", fallbackLabel: "Start with Windows", fallbackDesc: "Launch background service quietly in system tray when logging into Windows.", scope: "UI" },
   { id: "windows-service-shortcuts", tab: "system", sectionKey: "settingsConfig.windowsServiceTitle", labelKey: "settingsConfig.windowsServiceInstallBtn", descKey: "settingsConfig.windowsServiceDesc", fallbackSection: "Windows Background Service & System Tray", fallbackLabel: "Install Service & Shortcuts", fallbackDesc: "Manage background service execution, system tray monitor, Windows logon autostart, and Desktop shortcuts.", scope: "UI" },
@@ -374,6 +380,12 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
 }) {
   const isMobile = useIsMobile();
   const { t } = useI18n();
+  // Every omp-scoped panel below edits ONE machine's installation. `hostId` is
+  // null until the machine list loads; passing `undefined` to hostFetch then
+  // falls back to the stored selection instead of dropping the host entirely.
+  const { hostId } = useHosts();
+  const hostRef = useRef<string | null>(hostId);
+  hostRef.current = hostId;
   const workspaceReady = cwd !== null;
   const { fontSize, setFontSize } = useFontSize();
   const { uiScale, setUiScale } = useUiScale();
@@ -393,7 +405,9 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
   const [checking, setChecking] = useState(false);
   const [checkingAppUpdate, setCheckingAppUpdate] = useState(false);
   const [appUpdateMessage, setAppUpdateMessage] = useState<string | null>(null);
-  const [hasCheckedUpdates, setHasCheckedUpdates] = useState(false);
+  // Machine whose omp version was auto-checked when the System tab opened
+  // (undefined = not checked yet); a machine switch re-checks.
+  const [checkedUpdatesHost, setCheckedUpdatesHost] = useState<string | null | undefined>(undefined);
   const [ompUpdating, setOmpUpdating] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -448,16 +462,28 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
   const nativeSaveDrainingRef = useRef(false);
   const nativeSettingsMutatedRef = useRef(false);
 
+  // omp's settings file lives on the selected machine: drop the previous
+  // machine's values before reloading, and discard a response that lands after
+  // the machine changed again.
   useEffect(() => {
-    fetch("/api/omp-settings")
+    let cancelled = false;
+    nativeSettingsMutatedRef.current = false;
+    latestNativeSettingsRef.current = null;
+    setNativeSettings(null);
+    setNativeSettingsError(null);
+    setUpdate(null);
+    hostFetch("/api/omp-settings", undefined, hostId ?? undefined)
       .then((response) => (response.ok ? response.json() : Promise.reject(new Error(`HTTP ${response.status}`))))
       .then((data: { settings?: NativeSettings }) => {
-        if (!nativeSettingsMutatedRef.current) setNativeSettings(data.settings ?? {});
+        if (cancelled || nativeSettingsMutatedRef.current) return;
+        setNativeSettings(data.settings ?? {});
       })
-      .catch((error) => setNativeSettingsError(error instanceof Error ? error.message : String(error)));
-  }, []);
+      .catch((error) => { if (!cancelled) setNativeSettingsError(error instanceof Error ? error.message : String(error)); });
+    return () => { cancelled = true; };
+  }, [hostId]);
 
   const saveNativeSettings = useCallback((next: NativeSettings) => {
+    const targetHost = hostRef.current;
     nativeSettingsMutatedRef.current = true;
     setNativeSettings(next);
     setNativeSettingsError(null);
@@ -469,15 +495,19 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
     void (async () => {
       try {
         while (latestNativeSettingsRef.current !== null) {
+          // A machine switch reloads the form; anything still queued belongs to
+          // the machine that is no longer selected and must not be written.
+          if (hostRef.current !== targetHost) break;
           const snapshot = latestNativeSettingsRef.current;
           latestNativeSettingsRef.current = null;
           try {
-            const response = await fetch("/api/omp-settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settings: snapshot }) });
+            const response = await hostFetch("/api/omp-settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settings: snapshot }) }, targetHost ?? undefined);
             const data = (await response.json()) as { settings?: NativeSettings; error?: string };
             if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+            if (hostRef.current !== targetHost) break;
             if (latestNativeSettingsRef.current === null) setNativeSettings(data.settings ?? snapshot);
           } catch (error) {
-            setNativeSettingsError(error instanceof Error ? error.message : String(error));
+            if (hostRef.current === targetHost) setNativeSettingsError(error instanceof Error ? error.message : String(error));
             break;
           }
         }
@@ -506,17 +536,21 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
     void saveNativeSettings({ ...base, tools: { ...tools, approval: { ...(tools.approval ?? {}), ...patch } } });
   }, [nativeSettings, saveNativeSettings]);
 
+  // omp is installed per machine: check, update and restart always name the
+  // machine that was selected when the action started.
   const checkForUpdate = useCallback(async (force = false) => {
+    const targetHost = hostRef.current;
     setChecking(true);
     setMessage(null);
     try {
-      const response = await fetch("/api/omp-update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "check", ...(force ? { force: true } : {}) }) });
+      const response = await hostFetch("/api/omp-update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "check", ...(force ? { force: true } : {}) }) }, targetHost ?? undefined);
       const data = (await response.json()) as UpdateState & { error?: string };
+      if (hostRef.current !== targetHost) return;
       if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
       setUpdate(data);
       onOmpUpdateAvailabilityChange(data.updateAvailable);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error));
+      if (hostRef.current === targetHost) setMessage(error instanceof Error ? error.message : String(error));
     } finally {
       setChecking(false);
     }
@@ -537,7 +571,7 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
   const restartSessions = useCallback(async () => {
     setRestarting(true);
     try {
-      const response = await fetch("/api/omp-update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "restart" }) });
+      const response = await hostFetch("/api/omp-update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "restart" }) }, hostRef.current ?? undefined);
       const data = (await response.json()) as { error?: string; sessionsRestarted?: number };
       if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
       setMessage(t("settingsConfig.restartSuccess", { count: data.sessionsRestarted ?? 0 }));
@@ -549,20 +583,21 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
   }, [t]);
   const handleOmpUpdateNow = useCallback(async () => {
     if (ompUpdating) return;
+    const targetHost = hostRef.current ?? undefined;
     setOmpUpdating(true);
     setMessage(null);
     try {
-      const prepRes = await fetch("/api/omp-update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "update" }) });
+      const prepRes = await hostFetch("/api/omp-update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "update" }) }, targetHost);
       const prepData = (await prepRes.json()) as { attemptId?: string; error?: string; code?: string };
       if (!prepRes.ok || !prepData.attemptId) throw new Error(prepData.error || `HTTP ${prepRes.status}`);
-      const commitRes = await fetch("/api/omp-update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "commit", attemptId: prepData.attemptId }) });
+      const commitRes = await hostFetch("/api/omp-update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "commit", attemptId: prepData.attemptId }) }, targetHost);
       const commitData = (await commitRes.json()) as { error?: string };
       if (!commitRes.ok) throw new Error(commitData.error || `HTTP ${commitRes.status}`);
       const deadline = Date.now() + 5 * 60 * 1000;
       while (true) {
         if (Date.now() > deadline) throw new Error(t("settingsConfig.ompUpdateFailed"));
         await new Promise((r) => setTimeout(r, 500));
-        const statusRes = await fetch("/api/omp-update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "status" }) });
+        const statusRes = await hostFetch("/api/omp-update", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "status" }) }, targetHost);
         const status = (await statusRes.json()) as { state?: string; error?: string } | null;
         if (!status) break;
         if (status.state === "succeeded") {
@@ -589,10 +624,10 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
   }, [currentTab, fetchWindowsServiceStatus]);
 
   useEffect(() => {
-    if (currentTab !== "system" || hasCheckedUpdates) return;
-    setHasCheckedUpdates(true);
+    if (currentTab !== "system" || checkedUpdatesHost === hostId) return;
+    setCheckedUpdatesHost(hostId);
     void checkForUpdate();
-  }, [currentTab, hasCheckedUpdates, checkForUpdate]);
+  }, [currentTab, checkedUpdatesHost, hostId, checkForUpdate]);
 
   const trimmedQuery = searchQuery.trim().toLowerCase();
   const searchActive = trimmedQuery.length > 0;
@@ -773,6 +808,7 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                 <div>
                   <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>{t("settingsConfig.toolSafetyApprovals")}</h3>
                   <p style={{ margin: "4px 0 0", fontSize: 12, color: "var(--text-muted)" }}>{t("settingsConfig.toolSafetyApprovalsDesc")}</p>
+                  <MachineScopeNote style={{ marginTop: 8 }} />
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(2, minmax(0, 1fr))", gap: 10 }}>
                   <NativeSetting searchId="approval-mode" label={t("settingsConfig.approvalMode")} description={t("settingsConfig.approvalModeDesc")} scope="Native OMP">
@@ -817,6 +853,7 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                 <div>
                   <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>{t("settingsConfig.modelDefaults")}</h3>
                   <p style={{ margin: "4px 0 0", fontSize: 12, color: "var(--text-muted)" }}>{t("settingsConfig.modelDefaultsDesc")}</p>
+                  <MachineScopeNote style={{ marginTop: 8 }} />
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(2, minmax(0, 1fr))", gap: 10 }}>
                   <NativeSetting searchId="reasoning" label={t("settingsConfig.reasoning")} description={t("settingsConfig.reasoningDesc")} scope="Native OMP">
@@ -876,6 +913,18 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
               </div>
             )}
 
+            {/* MACHINES TAB */}
+            {currentTab === "machines" && (
+              <div
+                role="tabpanel"
+                id="settings-panel-machines"
+                aria-labelledby="settings-tab-machines"
+                style={{ display: "flex", height: "100%", minHeight: 0, flexDirection: "column", overflowY: "auto", padding: 20 }}
+              >
+                <MachinesConfig />
+              </div>
+            )}
+
             {/* USAGE & ANALYTICS TAB */}
             {currentTab === "usage" && (
               <div
@@ -898,6 +947,7 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
             {/* AGENT INTELLIGENCE TAB */}
             {currentTab === "intelligence" && (
               <div role="tabpanel" id="settings-panel-intelligence" aria-labelledby="settings-tab-intelligence" style={{ padding: 20, display: "flex", flexDirection: "column", gap: 18 }}>
+                <MachineScopeNote />
                 {/* Context Compaction Section */}
                 <section style={{ display: "flex", flexDirection: "column", gap: 10, borderTop: "1px solid var(--border)", paddingTop: 16 }}>
                   <div style={{ fontSize: 13, fontWeight: 600 }}>{t("settingsConfig.contextCompaction")}</div>
@@ -1031,6 +1081,7 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                 <div>
                   <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>{t("settingsConfig.extensionsTools")}</h3>
                   <p style={{ margin: "4px 0 0", fontSize: 12, color: "var(--text-muted)" }}>{t("settingsConfig.extensionsToolsDesc")}</p>
+                  <MachineScopeNote style={{ marginTop: 8 }} />
                 </div>
                 {cwd && (
                   <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(2, minmax(0, 1fr))", gap: 10 }}>
@@ -1097,6 +1148,7 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                   <p style={{ margin: "4px 0 0", fontSize: 12, color: "var(--text-muted)" }}>
                     {t("settingsConfig.agentsDesc")}
                   </p>
+                  <MachineScopeNote style={{ marginTop: 8 }} />
                 </div>
                 <AgentsConfig cwd={cwd} />
               </div>
@@ -1165,6 +1217,7 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
                     <div>
                       <div style={{ fontSize: 13, fontWeight: 600 }}>{t("settingsConfig.ompLabel")}</div>
+                      <MachineScopeNote style={{ marginTop: 5 }} />
                       <div style={{ marginTop: 4, color: update?.updateAvailable ? "var(--accent)" : "var(--text-muted)", fontFamily: "var(--font-mono)", fontSize: 12 }}>
                         {checking ? t("settingsConfig.checkingUpdates") : update?.updateAvailable ? t("appShell.updateVersion", { current: update.currentVersion ?? "?", available: update.availableVersion ?? "?" }) : update?.currentVersion ? t("settingsConfig.upToDate", { version: update.currentVersion }) : t("settingsConfig.versionUnavailable")}
                       </div>

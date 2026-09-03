@@ -9,17 +9,23 @@ export interface Tab {
   id: string;
   label: string;
   filePath: string;
+  /** Machine the file lives on. The same path exists on several machines, so
+   * it is part of the tab's identity and of every request the viewer makes. */
+  hostId?: string | null;
   sourceSessionId?: string | null;
 }
 
 interface Props {
   tabs: Tab[];
+  /** Machine id → display name. Set only when more than one machine exists,
+   * which is when a tab needs to say which machine its file is on. */
+  hostNames?: Record<string, string>;
   activeTabId: string;
   onSelectTab: (id: string) => void;
   onCloseTab: (id: string) => void;
 }
 
-export function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab }: Props) {
+export function TabBar({ tabs, hostNames, activeTabId, onSelectTab, onCloseTab }: Props) {
   const { t } = useI18n();
   const [hoveredClose, setHoveredClose] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -56,6 +62,8 @@ export function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab }: Props) {
     >
       {tabs.map((tab) => {
         const isActive = tab.id === activeTabId;
+        // Two machines can have the same path open; say which one this is.
+        const machineName = hostNames && tab.hostId ? hostNames[tab.hostId] ?? tab.hostId : null;
         return (
           <div
             key={tab.id}
@@ -65,7 +73,7 @@ export function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab }: Props) {
             role="tab"
             tabIndex={isActive ? 0 : -1}
             aria-selected={isActive}
-            aria-label={tab.filePath}
+            aria-label={machineName ? t("tabBar.fileOnMachine", { path: tab.filePath, machine: machineName }) : tab.filePath}
             onKeyDown={(event) => {
               if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onSelectTab(tab.id); }
               if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); onCloseTab(tab.id); }
@@ -137,10 +145,27 @@ export function TabBar({ tabs, activeTabId, onSelectTab, onCloseTab }: Props) {
                 flex: 1,
                 fontWeight: isActive ? 500 : 400,
               }}
-              title={tab.filePath}
+              title={machineName ? t("tabBar.fileOnMachine", { path: tab.filePath, machine: machineName }) : tab.filePath}
             >
               {tab.label}
             </span>
+            {machineName && (
+              <span
+                style={{
+                  flexShrink: 0,
+                  maxWidth: 56,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  padding: "1px 5px",
+                  borderRadius: "var(--radius-control)",
+                  background: "var(--bg-subtle)",
+                  color: "var(--text-dim)",
+                  fontSize: 10,
+                }}
+              >
+                {machineName}
+              </span>
+            )}
             <button
               onClick={(e) => { e.stopPropagation(); onCloseTab(tab.id); }}
               tabIndex={-1}

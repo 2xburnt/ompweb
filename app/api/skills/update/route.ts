@@ -1,5 +1,7 @@
-import { NextResponse } from "next/server";
-import { runNpx } from "@/lib/npx";
+import { NextResponse, type NextRequest } from "next/server";
+import { currentHost } from "@/lib/hosts/context";
+import { withHostRoute } from "@/lib/hosts/route";
+import { NpxUnavailableError, runNpx } from "@/lib/npx";
 import type { SkillInstallScope } from "@/lib/api-types";
 import { buildSkillUpdateArgs } from "@/lib/skill-updates";
 import { loadSkillsWithInstallInfo } from "@/lib/skills-service";
@@ -7,7 +9,8 @@ import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-acces
 
 export const dynamic = "force-dynamic";
 
-export async function POST(req: Request) {
+export const POST = withHostRoute(async (req: NextRequest) => {
+  const host = currentHost();
   try {
     const body = await req.json() as {
       cwd?: unknown;
@@ -22,12 +25,12 @@ export async function POST(req: Request) {
     if (!cwd || !pkg || !scope) {
       return NextResponse.json({ error: "cwd, package, and scope are required", code: "cwd_package_scope_required" }, { status: 400 });
     }
-    const allowedRoots = await getAllowedFileRoots();
-    if (!isExistingFilePathAllowed(cwd, allowedRoots)) {
+    const allowedRoots = await getAllowedFileRoots(host);
+    if (!(await isExistingFilePathAllowed(cwd, allowedRoots, host))) {
       return NextResponse.json({ error: "Access denied", code: "access_denied" }, { status: 403 });
     }
 
-    const { skills } = await loadSkillsWithInstallInfo(cwd);
+    const { skills } = await loadSkillsWithInstallInfo(cwd, host);
     const skill = skills.find(
       (item) => item.install?.package === pkg && item.install.scope === scope,
     );
@@ -41,10 +44,11 @@ export async function POST(req: Request) {
     const { stdout, stderr } = await runNpx(buildSkillUpdateArgs(skill.install), {
       timeout: 60_000,
       cwd: scope === "project" ? cwd : undefined,
-      env: { ...process.env, FORCE_COLOR: "0" },
+      env: { FORCE_COLOR: "0" },
+      host,
     });
 
-    const refreshed = await loadSkillsWithInstallInfo(cwd);
+    const refreshed = await loadSkillsWithInstallInfo(cwd, host);
     const updatedSkill = refreshed.skills.find(
       (item) => item.install?.package === pkg && item.install.scope === scope,
     );
@@ -52,8 +56,12 @@ export async function POST(req: Request) {
       success: true,
       skill: updatedSkill,
       output: `${stdout}${stderr}`.slice(-500),
+      host: host.id,
     });
   } catch (error: unknown) {
+    if (error instanceof NpxUnavailableError) {
+      return NextResponse.json({ error: error.message, code: error.code, host: error.hostId }, { status: 501 });
+    }
     const detail = error as { stdout?: string; stderr?: string; message?: string };
     const output = `${detail.stdout ?? ""}${detail.stderr ?? ""}`;
     return NextResponse.json(
@@ -61,4 +69,4 @@ export async function POST(req: Request) {
       { status: 500 },
     );
   }
-}
+});

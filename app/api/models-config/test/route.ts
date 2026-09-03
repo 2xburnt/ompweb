@@ -1,13 +1,14 @@
-import { NextResponse } from "next/server";
-import { mkdtempSync, rmSync, writeFileSync } from "fs";
-import { tmpdir } from "os";
-import { join } from "path";
+import { NextResponse, type NextRequest } from "next/server";
+import { currentHost } from "@/lib/hosts/context";
+import { withHostRoute } from "@/lib/hosts/route";
+import { makeHostTempDir } from "@/lib/omp/host-io";
 import {
   type ModelDefinition,
   type ProviderConfig,
   serializeModelsConfig,
   validateModelsConfig,
 } from "@/lib/omp/models-config";
+import { hostTmpdir } from "@/lib/omp/paths";
 import { type OmpModel, runIsolatedUtilityCommand } from "@/lib/omp/rpc-utility";
 
 export const dynamic = "force-dynamic";
@@ -24,7 +25,8 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export async function POST(req: Request) {
+export const POST = withHostRoute(async (req: NextRequest) => {
+  const host = currentHost();
   let tempDir: string | undefined;
 
   try {
@@ -51,11 +53,13 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: false, error: errorMessage(error) });
     }
 
-    // Isolated throwaway agent dir: the spawned omp sees only this candidate
-    // config (no stored credentials, no models.db cache) and never touches
-    // ~/.omp. Profile/XDG overrides are cleared so the redirect always wins.
-    tempDir = mkdtempSync(join(tmpdir(), "omp-web-model-test-"));
-    writeFileSync(join(tempDir, "models.yml"), serializeModelsConfig(config), "utf8");
+    // Isolated throwaway agent dir ON THE HOST that runs omp: the spawned omp
+    // sees only this candidate config (no stored credentials, no models.db
+    // cache) and never touches ~/.omp. Profile/XDG overrides are cleared so the
+    // redirect always wins. The candidate may carry an API key, so the file is
+    // owner-only.
+    tempDir = await makeHostTempDir(host, hostTmpdir(), "omp-web-model-test-");
+    await host.fs.writeFile(host.pathApi.join(tempDir, "models.yml"), serializeModelsConfig(config), { mode: 0o600 });
 
     const startedAt = Date.now();
     const { models } = await runIsolatedUtilityCommand<{ models: OmpModel[] }>(
@@ -64,6 +68,7 @@ export async function POST(req: Request) {
         env: { PI_CODING_AGENT_DIR: tempDir, OMP_PROFILE: "", PI_PROFILE: "", XDG_DATA_HOME: "" },
         timeoutMs: TEST_TIMEOUT_MS,
         signal: req.signal,
+        host,
       },
     );
     const latencyMs = Date.now() - startedAt;
@@ -75,17 +80,19 @@ export async function POST(req: Request) {
         error: `Model ${providerName}/${modelId} did not resolve — check the API key and provider config`,
         code: "model_test_unresolved",
         latencyMs,
+        host: host.id,
       });
     }
 
     return NextResponse.json({
       ok: true,
       latencyMs,
-        responseText: `${found.provider}/${found.id} resolved (configuration only; credentials were not contacted)`,
+      responseText: `${found.provider}/${found.id} resolved (configuration only; credentials were not contacted)`,
+      host: host.id,
     });
   } catch (error) {
     return NextResponse.json({ ok: false, error: errorMessage(error) }, { status: 500 });
   } finally {
-    if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+    if (tempDir) await host.fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
-}
+});

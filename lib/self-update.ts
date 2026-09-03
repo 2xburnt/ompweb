@@ -12,11 +12,11 @@ import {
   writeFileSync,
   type Stats,
 } from "fs";
-import { spawn } from "child_process";
+import { execFileSync, spawn } from "child_process";
 import { randomUUID } from "crypto";
-import { tmpdir } from "os";
-import { dirname, isAbsolute, join, posix, resolve, win32 } from "path";
-import { checkNpmUpdate, detectInstallMethod } from "./npm-update";
+import { homedir, tmpdir } from "os";
+import { delimiter, dirname, isAbsolute, join, posix, resolve, win32 } from "path";
+import { checkNpmUpdate, detectInstallMethod, getPackageDir, type InstallMethod } from "./npm-update";
 import { checkOmpUpdate } from "./omp/updates";
 
 export const SELF_UPDATE_PACKAGE = "@kahme247/ompweb";
@@ -275,27 +275,95 @@ export function cleanupStaleSelfUpdate(now = Date.now(), kind: Kind = "app"): vo
 }
 
 export function getSelfUpdateStatus(kind: Kind = "app"): SelfUpdateStatus | null {
+  if (!ensureSecureRoot(kind, false)) return null;
   const s = readStateJson<StoredStatus>(statusPath(kind));
   if (!s) return null;
   // minimal validation
   if (typeof s.attemptId !== "string" || typeof s.state !== "string") return null;
+  // An attempt whose worker died (server killed mid-update, reboot) would
+  // otherwise report "running" forever and keep the update dialog stuck.
+  // Once its lease has expired and no worker process is alive, record it as
+  // failed so the UI can show the recovery command and acknowledge it.
+  if ((s.state === "running" || s.state === "prepared") && !isProcessAlive(s.workerPid) && !isProcessAlive(s.managerPid)) {
+    const lease = readStateJson<{ attemptId?: unknown; expiresAt?: unknown }>(leasePath(kind));
+    if (!isActiveLease(lease)) {
+      const failed: StoredStatus = {
+        ...s,
+        state: "failed",
+        error: `The update was interrupted during the "${s.stage ?? "preparing"}" step and did not resume`,
+        finishedAt: new Date().toISOString(),
+        cleanupReady: true,
+      };
+      try {
+        atomicWrite(statusPath(kind), JSON.stringify(failed));
+      } catch {
+        // Report the derived state even if it could not be persisted.
+      }
+      return failed;
+    }
+  }
   return s;
 }
-export function getSelfUpdateSupport(): { supported: boolean; reason?: string; packageDir: string } {
-  const packageDir = process.env.OMP_WEB_PACKAGE_DIR ?? resolve(join(import.meta ? dirname(new URL(import.meta.url).pathname) : process.cwd(), ".."));
-  // simplified: always supported if packageDir exists
+export type UpdateSupervisor = "systemd" | "none";
+
+/** How the server is supervised. Under systemd the update worker must run in
+ * its own transient unit (stopping the service would otherwise kill it) and
+ * restart the service through systemctl; that needs the unit name, which the
+ * unit file provides as OMP_WEB_SERVICE. */
+export function detectSupervisor(env: NodeJS.ProcessEnv = process.env): { supervisor: UpdateSupervisor; serviceUnit: string | null; reason?: string } {
+  const serviceUnit = env.OMP_WEB_SERVICE?.trim() || null;
+  if (serviceUnit) return { supervisor: "systemd", serviceUnit };
+  if (env.INVOCATION_ID) {
+    return { supervisor: "systemd", serviceUnit: null, reason: "running under systemd without OMP_WEB_SERVICE; add Environment=OMP_WEB_SERVICE=<unit>.service to the unit file" };
+  }
+  return { supervisor: "none", serviceUnit: null };
+}
+
+function findOnPath(binary: string): string | null {
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, binary);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+export function getSelfUpdateSupport(): { supported: boolean; reason?: string; packageDir: string; installMethod: InstallMethod; supervisor: UpdateSupervisor } {
+  const packageDir = process.env.OMP_WEB_PACKAGE_DIR ? resolve(process.env.OMP_WEB_PACKAGE_DIR) : resolve(join(import.meta ? dirname(new URL(import.meta.url).pathname) : process.cwd(), ".."));
+  const installMethod = detectInstallMethod(packageDir);
+  const supervision = detectSupervisor();
   try {
-    if (!existsSync(packageDir)) return { supported: false, reason: "package dir not found", packageDir };
-    return { supported: true, packageDir: resolve(packageDir) };
+    if (!existsSync(packageDir)) return { supported: false, reason: "package dir not found", packageDir, installMethod, supervisor: supervision.supervisor };
+    if (supervision.supervisor === "systemd") {
+      if (!supervision.serviceUnit) return { supported: false, reason: supervision.reason, packageDir, installMethod, supervisor: "systemd" };
+      if (!findOnPath("systemd-run") || !findOnPath("systemctl")) {
+        return { supported: false, reason: "systemd-run/systemctl not found on PATH", packageDir, installMethod, supervisor: "systemd" };
+      }
+    }
+    return { supported: true, packageDir, installMethod, supervisor: supervision.supervisor };
   } catch {
-    return { supported: false, reason: "unsupported", packageDir };
+    return { supported: false, reason: "unsupported", packageDir, installMethod, supervisor: supervision.supervisor };
   }
 }
 
-function detectManager(packageDir: string): { manager: "npm" | "bun"; managerPath: string; prefix: string[] } {
+function detectManager(packageDir: string): { manager: InstallMethod; managerPath: string; prefix: string[] } {
   const manager = detectInstallMethod(packageDir);
-  const managerPath = manager === "bun" ? "bun" : "npm";
+  const managerPath = manager === "bun" ? "bun" : manager === "git" ? "git" : "npm";
   return { manager, managerPath, prefix: [] };
+}
+
+/** Tracked upstream of a git checkout, read synchronously (local, fast). */
+function gitUpstreamSync(packageDir: string): { remote: string; branch: string } {
+  try {
+    const upstream = execFileSync("git", ["-C", packageDir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], {
+      encoding: "utf8", timeout: 5_000, windowsHide: true, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    const slash = upstream.indexOf("/");
+    if (slash > 0) return { remote: upstream.slice(0, slash), branch: upstream.slice(slash + 1) || "main" };
+  } catch {
+    // Fall through to the default.
+  }
+  return { remote: "origin", branch: "main" };
 }
 
 export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResult> {
@@ -398,8 +466,13 @@ export function commitSelfUpdate(attemptId: string, kind: Kind = "app"): { accep
   const attempts = attemptsDir(kind, false);
   const workerPath = attempts ? join(attempts, attemptId, "worker.js") : null;
   const root = rootDir(kind);
-  const packageDir = process.env.OMP_WEB_PACKAGE_DIR ?? process.cwd();
+  const packageDir = getPackageDir();
   const { manager, managerPath, prefix } = detectManager(packageDir);
+  const supervision = detectSupervisor();
+  if (kind !== "omp" && supervision.supervisor === "systemd" && !supervision.serviceUnit) {
+    throw new SelfUpdateError("unsupported_supervisor", supervision.reason ?? "unsupported supervisor", 409);
+  }
+  const upstream = manager === "git" ? gitUpstreamSync(packageDir) : { remote: "origin", branch: "main" };
   const fromVersion = status.fromVersion;
   const targetVersion = status.targetVersion;
   const descriptor = {
@@ -427,18 +500,48 @@ export function commitSelfUpdate(attemptId: string, kind: Kind = "app"): { accep
     String(process.env.OMP_WEB_LAUNCHER_PID ?? process.pid),
     "--server-pid",
     String(process.pid),
+    "--descriptor",
     JSON.stringify(descriptor),
     "--manager-prefix",
     JSON.stringify(prefix),
     "--kind",
     kind,
+    "--supervisor",
+    supervision.supervisor,
+    "--service-unit",
+    supervision.serviceUnit ?? "",
+    "--remote",
+    upstream.remote,
+    "--branch",
+    upstream.branch,
   ];
   try {
-    const child = spawn(process.execPath, workerPath ? [workerPath, ...args] : args, {
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true,
-    });
+    const workerArgs = workerPath ? [workerPath, ...args] : args;
+    let child;
+    if (kind !== "omp" && supervision.supervisor === "systemd" && supervision.serviceUnit) {
+      // The worker stops the service it was spawned from; a child inside the
+      // service's cgroup would die with it. A transient unit keeps it alive
+      // (and inherits none of the service's environment, so pass what the
+      // git/npm steps need explicitly).
+      const unit = `ompweb-update-${attemptId.slice(0, 8)}`;
+      const setenv = [
+        `--setenv=PATH=${process.env.PATH ?? ""}`,
+        `--setenv=HOME=${process.env.HOME ?? homedir()}`,
+        ...(process.env.OMP_WEB_OMP_BIN ? [`--setenv=OMP_WEB_OMP_BIN=${process.env.OMP_WEB_OMP_BIN}`] : []),
+        ...(process.env.OMP_WEB_HOME ? [`--setenv=OMP_WEB_HOME=${process.env.OMP_WEB_HOME}`] : []),
+      ];
+      child = spawn("systemd-run", ["--user", "--collect", "--quiet", `--unit=${unit}`, "--property=KillMode=process", ...setenv, "--", process.execPath, ...workerArgs], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    } else {
+      child = spawn(process.execPath, workerArgs, {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+    }
     child.unref();
     // record worker pid
     const updated: StoredStatus = { ...readStateJson<StoredStatus>(statusPath(kind))!, workerPid: child.pid };

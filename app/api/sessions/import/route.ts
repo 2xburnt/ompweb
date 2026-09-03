@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
 import { apiErrorResponse } from "@/lib/api-utils";
-import { mkdirSync, writeFileSync } from "fs";
-import path from "path";
 import { randomUUID } from "crypto";
-import { getSessionsDir, getSessionDirNameForCwd } from "@/lib/omp/paths";
-import { invalidateSessionListCache } from "@/lib/session-reader";
+import { currentHost } from "@/lib/hosts/context";
+import { withHostRoute } from "@/lib/hosts/route";
+import { getSessionsDir, getSessionDirNameForCwd, hostPath } from "@/lib/omp/paths";
+import { cacheSessionPath, invalidateSessionListCache } from "@/lib/session-reader";
 import { invalidateSessionFileListCache } from "@/lib/omp/session-files";
 import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-access";
 import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
@@ -19,10 +19,12 @@ function isoSessionTimestamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
-// POST /api/sessions/import — import a native omp session .jsonl file.
-// The session keeps its original entries but can only target a workspace the
-// user previously authorized through projects, sessions, or cwd selection.
-export async function POST(req: Request) {
+// POST /api/sessions/import?host=<id> — import a native omp session .jsonl
+// file onto a host (the default host when none is named). The session keeps
+// its original entries but can only target a workspace on that host the user
+// previously authorized through projects, sessions, or cwd selection. The
+// file is written straight into the host's sessions directory.
+export const POST = withHostRoute(async (req: Request) => {
   try {
     const body = await parseJsonWithinLimit<{ fileName?: unknown; content?: unknown }>(req, MAX_IMPORT_REQUEST_BYTES);
     const fileName = typeof body.fileName === "string" ? body.fileName.trim() : "";
@@ -82,25 +84,30 @@ export async function POST(req: Request) {
     }
 
     const allowedRoots = await getAllowedFileRoots();
-    if (!isExistingFilePathAllowed(cwd, allowedRoots)) {
+    if (!await isExistingFilePathAllowed(cwd, allowedRoots)) {
       return NextResponse.json({ error: "Imported session workspace is not authorized", code: "import_cwd_not_authorized" }, { status: 403 });
     }
 
-    const sessionDir = path.join(getSessionsDir(), getSessionDirNameForCwd(cwd));
-    mkdirSync(sessionDir, { recursive: true });
-    const sessionFile = path.join(sessionDir, `${isoSessionTimestamp()}_${randomUUID()}.jsonl`);
-    writeFileSync(sessionFile, rewritten.join("\n") + "\n", "utf8");
+    const host = currentHost();
+    const pathApi = hostPath();
+    const sessionDir = pathApi.join(getSessionsDir(), getSessionDirNameForCwd(cwd));
+    await host.fs.mkdir(sessionDir, { recursive: true });
+    const sessionFile = pathApi.join(sessionDir, `${isoSessionTimestamp()}_${randomUUID()}.jsonl`);
+    await host.fs.writeFile(sessionFile, rewritten.join("\n") + "\n");
 
     // New session must appear immediately: clear both the list cache and the
-    // mtime-keyed walk cache (the AGENTS.md-documented Windows/NTFS trap).
+    // mtime-keyed walk cache (the AGENTS.md-documented Windows/NTFS trap), and
+    // register the id→(host, path) mapping so the import can be opened before
+    // the next listing.
     invalidateSessionListCache();
     invalidateSessionFileListCache();
+    cacheSessionPath(freshId, sessionFile, host.id, true);
 
-    return NextResponse.json({ success: true, sessionFile });
+    return NextResponse.json({ success: true, sessionFile, sessionId: freshId, host: host.id });
   } catch (error) {
     if (error instanceof RequestBodyTooLargeError) {
       return NextResponse.json({ error: "Session import request is too large", code: "session_import_request_too_large" }, { status: 413 });
     }
     return apiErrorResponse(error);
   }
-}
+});

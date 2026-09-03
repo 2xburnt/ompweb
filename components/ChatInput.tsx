@@ -2,7 +2,7 @@
 
 import React, { useRef, useState, useCallback, useEffect, useImperativeHandle, forwardRef, memo, KeyboardEvent } from "react";
 import { ChevronDown, ListChecks, Search, Shrink, Sparkles, Target, Wrench, Zap } from "lucide-react";
-import { getSubmitDuringRunBehavior } from "@/lib/composer-prefs";
+import { composerModelsStorageKey, getSubmitDuringRunBehavior } from "@/lib/composer-prefs";
 import type { BuiltinSlashCommandResult, CompactResultInfo, QueuedMessages, SlashCommandInfo } from "@/hooks/useAgentSession";
 import type { ActiveGoal, ActivePlan } from "@/lib/web-mode-state";
 import { formatGoalElapsed } from "@/lib/web-mode-state";
@@ -30,6 +30,7 @@ import {
 import { FolderIcon, getFileIcon } from "./FileIcons";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useI18n } from "@/lib/i18n";
+import { hostFetch } from "@/lib/hosts/client";
 import { selectableThinkingLevels } from "@/lib/thinking-levels";
 import type { ToolPreset } from "@/lib/tool-presets";
 
@@ -112,6 +113,8 @@ interface Props {
   onAdvisorChange?: (enabled: boolean) => void;
   /** Collapse the entire composer into a minimized bar. */
   onMinimize?: () => void;
+  /** Machine whose model registry this composer shows (per-machine model pins). */
+  modelHostId?: string | null;
   /** Active status label attached to the composer's top edge (e.g. "Waiting for model..."). */
   statusText?: string | null;
 }
@@ -125,11 +128,9 @@ export interface ChatInputHandle {
 }
 
 const COMPOSITION_END_ENTER_GRACE_MS = 100;
-const COMPOSER_MODELS_STORAGE_KEY = "omp-composer-models";
-
-function readVisibleModelKeys(): Set<string> | null {
+function readVisibleModelKeys(hostId: string | null): Set<string> | null {
   try {
-    const value = JSON.parse(localStorage.getItem(COMPOSER_MODELS_STORAGE_KEY) ?? "null");
+    const value = JSON.parse(localStorage.getItem(composerModelsStorageKey(hostId)) ?? "null");
     return Array.isArray(value) ? new Set(value.filter((item): item is string => typeof item === "string")) : null;
   } catch {
     return null;
@@ -416,6 +417,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   advisorEnabled,
   onAdvisorChange,
   onMinimize,
+  modelHostId,
   statusText,
 }: Props, ref) {
   const isMobile = useIsMobile();
@@ -812,7 +814,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   useEffect(() => {
     if (slashQuery === null || !cwd) return;
     const controller = new AbortController();
-    void fetch(`/api/skills?cwd=${encodeURIComponent(cwd)}`, { signal: controller.signal })
+    void hostFetch(`/api/skills?cwd=${encodeURIComponent(cwd)}`, { signal: controller.signal }, modelHostId ?? undefined)
       .then((response) => response.ok ? response.json() as Promise<{ skills?: Array<{ name?: string; disableModelInvocation?: boolean }> }> : null)
       .then((data) => {
         if (!data) return;
@@ -820,7 +822,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       })
       .catch(() => {});
     return () => controller.abort();
-  }, [cwd, slashQuery]);
+  }, [cwd, modelHostId, slashQuery]);
 
   const builtinSlashCommands: SlashCommandPaletteItem[] = React.useMemo(
     () => BUILTIN_SLASH_COMMAND_DEFS
@@ -918,7 +920,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     const fetchCwd = cwd;
     const query = atQueryText;
     const timer = setTimeout(() => {
-      fetch(`/api/file-index?cwd=${encodeURIComponent(fetchCwd)}&q=${encodeURIComponent(query)}`)
+      hostFetch(`/api/file-index?cwd=${encodeURIComponent(fetchCwd)}&q=${encodeURIComponent(query)}`, undefined, modelHostId ?? undefined)
         .then((res) => {
           if (!res.ok) throw new Error(`file search failed: ${res.status}`);
           return res.json() as Promise<{ matches?: FileIndexEntry[] }>;
@@ -929,7 +931,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         });
     }, 150);
     return () => clearTimeout(timer);
-  }, [needsServerSearch, atQueryText, cwd]);
+  }, [needsServerSearch, atQueryText, cwd, modelHostId]);
 
   const serverResultInUse = needsServerSearch
     && atServerResult !== null
@@ -965,7 +967,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
     // a newer one has taken over.
     const controller = new AbortController();
     setFileIndexLoading(true);
-    fetch(`/api/file-index?cwd=${encodeURIComponent(fetchCwd)}`, { signal: controller.signal })
+    hostFetch(`/api/file-index?cwd=${encodeURIComponent(fetchCwd)}`, { signal: controller.signal }, modelHostId ?? undefined)
       .then((res) => {
         if (!res.ok) throw new Error(`file index failed: ${res.status}`);
         return res.json() as Promise<{ files?: string[]; truncated?: boolean }>;
@@ -986,7 +988,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
         }
       });
     return () => controller.abort();
-  }, [atTokenActive, cwd]);
+  }, [atTokenActive, cwd, modelHostId]);
 
   const applyAtCompletion = useCallback((entry: FileIndexEntry) => {
     if (!atQuery) return;
@@ -1411,11 +1413,15 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
   }, [slashActiveIndex, slashMenuOpen]);
 
   // Build model options: prefer modelList (has provider info), fallback to modelNames
+  // Which models the composer lists is a per-machine choice: model ids differ
+  // between machines, so one machine's pinned set would filter another
+  // machine's list down to nothing.
+  const composerModelsKey = composerModelsStorageKey(modelHostId ?? null);
   const [visibleModelKeys, setVisibleModelKeys] = useState<Set<string> | null>(null);
   useEffect(() => {
-    const refresh = () => setVisibleModelKeys(readVisibleModelKeys());
+    const refresh = () => setVisibleModelKeys(readVisibleModelKeys(modelHostId ?? null));
     const refreshFromStorage = (event: StorageEvent) => {
-      if (event.key === null || event.key === COMPOSER_MODELS_STORAGE_KEY) refresh();
+      if (event.key === null || event.key === composerModelsKey) refresh();
     };
     refresh();
     window.addEventListener("omp-composer-models-change", refresh);
@@ -1424,7 +1430,7 @@ export const ChatInput = memo(forwardRef<ChatInputHandle, Props>(function ChatIn
       window.removeEventListener("omp-composer-models-change", refresh);
       window.removeEventListener("storage", refreshFromStorage);
     };
-  }, []);
+  }, [composerModelsKey, modelHostId]);
 
   const modelOptions: ModelOption[] = React.useMemo(() => {
     if (modelList && modelList.length > 0) {

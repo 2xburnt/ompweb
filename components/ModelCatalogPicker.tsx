@@ -1,5 +1,7 @@
 "use client";
 
+import { hostFetch } from "@/lib/hosts/client";
+
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { useI18n } from "@/lib/i18n";
 import { formatCompactNumber } from "@/lib/format";
@@ -106,7 +108,7 @@ export function ModelCatalogPicker({ open, providerName, providerBaseUrl, existi
     setLoading(true);
     const timer = setTimeout(async () => {
       try {
-        const res = await fetch(`/api/models-config/catalog?${params.toString()}`, { signal: controller.signal });
+        const res = await hostFetch(`/api/models-config/catalog?${params.toString()}`, { signal: controller.signal });
         const data = await res.json() as { models?: CatalogModelEntry[]; error?: string };
         if (searchSeqRef.current !== seq) return;
         if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);

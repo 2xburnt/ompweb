@@ -2,11 +2,17 @@ import { execFile } from "child_process";
 import { existsSync } from "fs";
 import { homedir } from "os";
 import { delimiter, join } from "path";
+import { currentHost } from "../hosts/context";
+import type { Host } from "../hosts/registry";
 
 /**
- * Locating and probing the user's installed `omp` CLI. omp-web never embeds
- * the (Bun-only) @oh-my-pi SDK — every live-agent capability goes through the
+ * Locating and probing the `omp` CLI on a host. omp-web never embeds the
+ * (Bun-only) @oh-my-pi SDK — every live-agent capability goes through the
  * omp binary, so its absence is a first-class, user-visible state.
+ *
+ * Remote hosts are probed once by the host registry (Host.ready()); this
+ * module reports what that probe found. The local machine keeps the
+ * PATH/fallback-dir search below so a GUI-launched server still finds omp.
  */
 
 let cachedBin: string | null = null;
@@ -21,14 +27,17 @@ const BIN_NAME = process.platform === "win32" ? "omp.exe" : "omp";
 const MISS_TTL_MS = 30_000;
 
 /** Clear probes after an explicit `omp update` so the next request rechecks it. */
-export function invalidateOmpCliCache(): void {
-  cachedBin = null;
-  binMissAt = 0;
-  cachedVersion = null;
-  versionMissAt = 0;
+export function invalidateOmpCliCache(host: Host = currentHost()): void {
+  if (host.isLocal) {
+    cachedBin = null;
+    binMissAt = 0;
+    cachedVersion = null;
+    versionMissAt = 0;
+  }
+  host.invalidateOmp();
 }
 
-function probeOmpBin(): string | null {
+function probeLocalOmpBin(): string | null {
   const override = process.env.OMP_WEB_OMP_BIN;
   if (override) return existsSync(override) ? override : null;
   for (const dir of (process.env.PATH ?? "").split(delimiter)) {
@@ -51,16 +60,18 @@ function probeOmpBin(): string | null {
   return null;
 }
 
-/** Resolve the omp binary: OMP_WEB_OMP_BIN override, then PATH lookup. Returns
- * null when omp is not installed. A hit is cached for the process lifetime; a
- * miss is re-probed after MISS_TTL_MS. */
-export function resolveOmpBin(): string | null {
+/** Resolve the omp binary on a host. Local: OMP_WEB_OMP_BIN override, then PATH
+ * lookup (a hit is cached for the process lifetime; a miss is re-probed after
+ * MISS_TTL_MS). Remote: whatever Host.ready() found (null until probed or when
+ * omp is not installed there). */
+export function resolveOmpBin(host: Host = currentHost()): string | null {
+  if (!host.isLocal) return host.ompBin;
   // A global Bun/npm update can replace or remove its launcher while this
   // Next.js process is still alive. Never keep returning a stale cache entry.
   if (cachedBin && existsSync(cachedBin)) return cachedBin;
   cachedBin = null;
   if (Date.now() - binMissAt < MISS_TTL_MS) return null;
-  const found = probeOmpBin();
+  const found = probeLocalOmpBin();
   if (found) {
     cachedBin = found;
     binMissAt = 0;
@@ -73,10 +84,18 @@ export function resolveOmpBin(): string | null {
 /** `omp --version` output (e.g. "omp/17.1.3"), or null when unavailable.
  * Cached after the first successful probe; failures are retried after
  * MISS_TTL_MS so a later install is picked up without a server restart. */
-export async function getOmpVersion(): Promise<string | null> {
+export async function getOmpVersion(host: Host = currentHost()): Promise<string | null> {
+  if (!host.isLocal) {
+    try {
+      await host.ready();
+    } catch {
+      return null;
+    }
+    return host.ompVersion;
+  }
   if (cachedVersion) return cachedVersion;
   if (Date.now() - versionMissAt < MISS_TTL_MS) return null;
-  const bin = resolveOmpBin();
+  const bin = resolveOmpBin(host);
   if (!bin) {
     versionMissAt = Date.now();
     return null;

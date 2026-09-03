@@ -1,22 +1,19 @@
 import { NextResponse } from "next/server";
 import { apiErrorResponse } from "@/lib/api-utils";
-import { statSync, type Stats } from "fs";
-import { homedir } from "os";
-import { isAbsolute, resolve } from "path";
 import { allowFileRoot } from "@/lib/file-access";
-import { projectIdentityKey } from "@/lib/paths";
+import { currentHost } from "@/lib/hosts/context";
+import { withHostRoute } from "@/lib/hosts/route";
+import { hostProjectKey } from "@/lib/paths";
+import { normalizeProjectCwd } from "@/lib/project-registry";
 import { resolveProject } from "@/lib/worktree";
 
-function normalizeCwd(cwd: string): string {
-  if (cwd === "~") return homedir();
-  if (cwd.startsWith("~/")) return resolve(homedir(), cwd.slice(2));
-  return isAbsolute(cwd) ? cwd : resolve(cwd);
-}
-
-// POST /api/cwd/validate  body: { cwd: string }
-// Validates a candidate workspace before the UI selects it.
-export async function POST(req: Request) {
+// POST /api/cwd/validate[?host=<id>]  body: { cwd: string }
+// Validates a candidate workspace on the selected host before the UI selects
+// it. Returns { success, cwd, projectRoot, projectKey, host } where projectKey
+// is host-scoped (`<hostId>:<identity>`), matching the session list.
+export const POST = withHostRoute(async (req: Request) => {
   try {
+    const host = currentHost();
     const body = await req.json() as { cwd?: unknown };
     const cwd = typeof body.cwd === "string" ? body.cwd.trim() : "";
 
@@ -24,27 +21,28 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Path is required", code: "path_required" }, { status: 400 });
     }
 
-    const normalizedCwd = normalizeCwd(cwd);
-    let stat: Stats;
+    const normalizedCwd = normalizeProjectCwd(cwd);
+    let isDirectory: boolean;
     try {
-      stat = statSync(normalizedCwd);
+      isDirectory = (await host.fs.stat(normalizedCwd)).isDirectory();
     } catch {
       return NextResponse.json({ error: `Directory does not exist: ${cwd}`, code: "directory_not_found" }, { status: 400 });
     }
 
-    if (!stat.isDirectory()) {
+    if (!isDirectory) {
       return NextResponse.json({ error: `Path is not a directory: ${cwd}`, code: "not_a_directory" }, { status: 400 });
     }
 
-    allowFileRoot(normalizedCwd);
-    const project = await resolveProject(normalizedCwd);
+    allowFileRoot(normalizedCwd, host);
+    const project = await resolveProject(normalizedCwd, host);
     return NextResponse.json({
       success: true,
       cwd: normalizedCwd,
       projectRoot: project.projectRoot,
-      projectKey: projectIdentityKey(project.projectRoot),
+      projectKey: hostProjectKey(host.id, project.projectRoot),
+      host: host.id,
     });
   } catch (error) {
     return apiErrorResponse(error);
   }
-}
+});

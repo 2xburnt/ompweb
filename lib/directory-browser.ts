@@ -1,15 +1,22 @@
-import * as fsPromises from "fs/promises";
-import { homedir } from "os";
 import path from "path";
+import { currentHost } from "./hosts/context";
+import type { Host } from "./hosts/registry";
+import { expandHostHome, hostHomedir, hostPath } from "./omp/paths";
 
 export interface BrowsableDirectory {
   name: string;
   path: string;
 }
 
+/** Platform of the host a request targets: remote hosts are always POSIX, so
+ * Windows-only behavior (drive picker) applies to the local machine alone. */
+function hostPlatform(host: Host = currentHost()): NodeJS.Platform {
+  return host.isLocal ? process.platform : "linux";
+}
+
 export function shouldShowWindowsDrivePicker(
   directory?: string,
-  platform: NodeJS.Platform = process.platform,
+  platform: NodeJS.Platform = hostPlatform(),
 ): boolean {
   return platform === "win32" && !directory;
 }
@@ -21,10 +28,11 @@ export function getWindowsDriveCandidates(): BrowsableDirectory[] {
   }));
 }
 
-export async function listWindowsDrives(): Promise<BrowsableDirectory[]> {
+/** Local Windows only: probe every drive letter through the host fs. */
+export async function listWindowsDrives(host: Host = currentHost()): Promise<BrowsableDirectory[]> {
   const candidates = await Promise.all(getWindowsDriveCandidates().map(async (drive) => {
     try {
-      const driveStat = await fsPromises.stat(drive.path);
+      const driveStat = await host.fs.stat(drive.path);
       return driveStat.isDirectory() ? drive : null;
     } catch {
       return null;
@@ -34,13 +42,12 @@ export async function listWindowsDrives(): Promise<BrowsableDirectory[]> {
 }
 
 export function getBrowseStartDirectory(directory?: string): string {
-  return directory || homedir();
+  return directory || hostHomedir();
 }
 
+/** Expand "~" against the host's home and resolve to an absolute host path. */
 export function normalizeDirectory(directory: string): string {
-  if (directory === "~") return homedir();
-  if (directory.startsWith("~/")) return path.resolve(homedir(), directory.slice(2));
-  return path.resolve(directory);
+  return hostPath().resolve(expandHostHome(directory));
 }
 
 export function getParentDirectory(directory: string): string | null {
@@ -52,35 +59,20 @@ export function getParentDirectory(directory: string): string | null {
   return parent === normalized ? null : parent;
 }
 
-export async function resolveDirectory(directory: string): Promise<string> {
-  return fsPromises.realpath(normalizeDirectory(directory));
+/** Canonical (symlink-resolved) form of a directory on the host; rejects when
+ * it does not exist. */
+export async function resolveDirectory(directory: string, host: Host = currentHost()): Promise<string> {
+  return host.fs.realpath(normalizeDirectory(directory));
 }
 
-export async function listDirectories(directory: string): Promise<BrowsableDirectory[]> {
-  // Keep the directory argument opaque to Next's NFT build tracer. This is a
-  // user-selected path and must only be inspected at request time; tracing it
-  // as a static glob would walk the entire Windows profile during `next build`.
-  const readDirectory = Reflect.get(fsPromises, "readdir") as typeof fsPromises.readdir;
-  const entries = await readDirectory(directory, { withFileTypes: true });
-  // 忽略损坏、不可访问或不指向目录的符号链接。
-  const candidates = await Promise.all(entries.map(async (entry) => {
-    if (entry.isDirectory()) {
-      return { name: entry.name, path: path.join(directory, entry.name) };
-    }
-    if (!entry.isSymbolicLink()) return null;
-
-    try {
-      const entryPath = path.join(directory, entry.name);
-      const realEntryPath = await fsPromises.realpath(entryPath);
-      const entryStat = await fsPromises.stat(realEntryPath);
-      if (!entryStat.isDirectory()) return null;
-      return { name: entry.name, path: entryPath };
-    } catch {
-      return null;
-    }
-  }));
-
-  return candidates
-    .filter((entry): entry is BrowsableDirectory => entry !== null)
+/** Readable subdirectories of `directory` on the host, one readdir round
+ * trip. Symlinks count when they point at a directory; dangling, unreadable
+ * or file-targeted links are skipped. */
+export async function listDirectories(directory: string, host: Host = currentHost()): Promise<BrowsableDirectory[]> {
+  const entries = await host.fs.readdir(directory);
+  const pathApi = host.pathApi;
+  return entries
+    .filter((entry) => entry.type === "dir" || (entry.type === "symlink" && entry.targetType === "dir"))
+    .map((entry) => ({ name: entry.name, path: pathApi.join(directory, entry.name) }))
     .sort((left, right) => left.name.localeCompare(right.name));
 }

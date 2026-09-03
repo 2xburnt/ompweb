@@ -1,5 +1,7 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "child_process";
 import { createInterface } from "readline";
+import { currentHost } from "../hosts/context";
+import type { Host } from "../hosts/registry";
 import { sanitizeProjectCommandEnvironment } from "../project-command-env";
 import { resolveOmpBin } from "./omp-cli";
 import { encodeRpcFrames, RpcFrameDecoder, type RpcFrameRecord, type RpcProtocolVersion } from "./rpc-frame";
@@ -56,7 +58,9 @@ interface PendingCommand {
 }
 
 export interface RpcProcessOptions {
-  /** Working directory for the agent (also passed as --cwd). */
+  /** Host the omp process runs on (defaults to the current request's host). */
+  host?: Host;
+  /** Working directory for the agent on that host (also passed as --cwd). */
   cwd: string;
   /** Extra CLI args appended after the base `--mode rpc-ui --cwd <cwd>`. */
   extraArgs?: string[];
@@ -77,6 +81,7 @@ const STDERR_TAIL_LIMIT = 8 * 1024;
 
 export class RpcProcess {
   readonly cwd: string;
+  readonly host: Host;
   private child: ChildProcessWithoutNullStreams;
   private readonly pending = new Map<string, PendingCommand>();
   private readonly frameListeners = new Set<(frame: RpcFrame) => void>();
@@ -95,27 +100,35 @@ export class RpcProcess {
   private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(options: RpcProcessOptions) {
-    const resolveBin = options.dependencies?.resolveOmpBin ?? resolveOmpBin;
+    const host = options.host ?? currentHost();
+    this.host = host;
+    const bin = options.dependencies?.resolveOmpBin ? options.dependencies.resolveOmpBin() : resolveOmpBin(host);
     this.spawnProcess = options.dependencies?.spawn ?? spawn;
-    const bin = resolveBin();
     if (!bin) {
-      throw new Error("omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN.");
+      throw new Error(host.isLocal
+        ? "omp binary not found. Install oh-my-pi or set OMP_WEB_OMP_BIN."
+        : `omp binary not found on host "${host.id}". Install oh-my-pi there or set the host's ompBin.`);
     }
     this.cwd = options.cwd;
     if (options.onFrame) this.frameListeners.add(options.onFrame);
 
     const args = ["--mode", "rpc-ui", "--cwd", options.cwd, ...(options.extraArgs ?? [])];
-    this.child = this.spawnProcess(bin, args, {
-      cwd: options.cwd,
-      env: sanitizeProjectCommandEnvironment({ ...process.env, ...options.env }),
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-      // On POSIX, omp launches grandchildren (LSP servers, extension subprocesses). Run the
-      // child in its own process group so dispose() can SIGTERM/SIGKILL the whole
-      // tree — otherwise a crashed omp would orphan its LSP children as zombies.
-      // Windows uses taskkill /t instead, so detaching would only create a console.
-      detached: process.platform !== "win32",
-    });
+    if (options.dependencies?.spawn) {
+      // Test seam: the injected spawn sees exactly the local invocation.
+      this.child = this.spawnProcess(bin, args, {
+        cwd: options.cwd,
+        env: sanitizeProjectCommandEnvironment({ ...process.env, ...options.env }),
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+        detached: process.platform !== "win32",
+      });
+    } else {
+      // The host executor owns process-group/detach semantics: locally omp runs
+      // in its own group so dispose() can SIGTERM/SIGKILL the whole tree (LSP
+      // servers, extension subprocesses); remotely the ssh client is the child
+      // and closing it hangs up the remote omp.
+      this.child = host.executor.spawn([bin, ...args], { cwd: options.cwd, env: options.env });
+    }
 
     // A write queued when the child dies fails both the write callback and an
     // 'error' event on the pipe. Without a listener that event becomes an

@@ -28,6 +28,7 @@ import {
   VISIBLE_PAGE_SIZE,
 } from "@/lib/chat-lazy-load";
 import { getDraftSummary } from "@/lib/draft-store";
+import { hostFetch, useHosts } from "@/lib/hosts/client";
 
 interface Props {
   session: SessionInfo | null;
@@ -147,10 +148,13 @@ function withAssistantBlocks(
 
 function OmpRuntimeVersion() {
   const { t } = useI18n();
+  const { hostId, current: currentHost } = useHosts();
   const [version, setVersion] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/omp-version")
+    // The selected machine's omp; the probe result is the fallback.
+    setVersion(currentHost?.ompVersion ? currentHost.ompVersion.replace(/^omp\//, "") : null);
+    hostFetch("/api/omp-version", undefined, hostId)
       .then((res) => (res.ok ? res.json() : null))
       .then((data: { version: string | null } | null) => {
         // omp reports "omp/17.1.3"; show just the number next to the label.
@@ -160,7 +164,7 @@ function OmpRuntimeVersion() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [hostId, currentHost?.ompVersion]);
   return (
     <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
       omp <span style={{ color: "var(--text)" }}>{version ? `v${version}` : t("chatWindow.versionNotFound")}</span>
@@ -442,7 +446,7 @@ export function ChatWindow({ session, newSessionCwd, toolCallsDefaultCollapsed =
 
   const {
     loading, error, messages, entryIds, showPreCompactionHistory, streamState,
-    agentRunning, bashRunning, pendingBash, modelNames, modelList, modelsLoading, modelError, modelThinkingLevels, modelThinkingLevelMaps, thinkingLevel, fastModeEnabled, fastModeActive,
+    agentRunning, bashRunning, pendingBash, modelHostId, modelNames, modelList, modelsLoading, modelError, modelThinkingLevels, modelThinkingLevelMaps, thinkingLevel, fastModeEnabled, fastModeActive,
     toolPreset,
     liveModelMeta,
     retryInfo, contextUsage, forkingEntryId,
@@ -588,7 +592,7 @@ export function ChatWindow({ session, newSessionCwd, toolCallsDefaultCollapsed =
   // top, load another page while keeping the scroll position stable.
   const [visibleCount, setVisibleCount] = useState(VISIBLE_PAGE_SIZE);
   const prevSessionKeyForPagingRef = useRef<string | null>(null);
-  const sessionKeyForPaging = session?.id ?? (newSessionCwd ? `new:${newSessionCwd}` : "empty");
+  const sessionKeyForPaging = session?.id ?? (newSessionCwd ? `new:${modelHostId ?? "?"}:${newSessionCwd}` : "empty");
   useEffect(() => {
     if (prevSessionKeyForPagingRef.current !== sessionKeyForPaging) {
       prevSessionKeyForPagingRef.current = sessionKeyForPaging;
@@ -841,7 +845,7 @@ export function ChatWindow({ session, newSessionCwd, toolCallsDefaultCollapsed =
       return;
     }
     const controller = new AbortController();
-    fetch("/api/model-roles", { signal: controller.signal })
+    hostFetch("/api/model-roles", { signal: controller.signal })
       .then((response) => response.ok ? response.json() as Promise<{ roles?: Record<string, string> }> : null)
       .then((data) => setAdvisorRoleSelector(data?.roles?.advisor ?? null))
       .catch(() => {});
@@ -895,6 +899,7 @@ export function ChatWindow({ session, newSessionCwd, toolCallsDefaultCollapsed =
   const chatInputElement = (
     <ChatInput
       ref={chatInputRef}
+      modelHostId={modelHostId}
       onSend={handleSend}
       onAbort={handleAbort}
       onSteer={agentRunning ? handleSteer : undefined}
@@ -940,7 +945,7 @@ export function ChatWindow({ session, newSessionCwd, toolCallsDefaultCollapsed =
       onLoadSlashCommands={loadSlashCommands}
       onBuiltinCommand={handleBuiltinSlashCommand}
       onAudioUnlock={unlockAudio}
-      draftKey={session?.id ?? (newSessionCwd ? `new:${newSessionCwd}` : undefined)}
+      draftKey={session?.id ?? (newSessionCwd ? `new:${modelHostId ?? "?"}:${newSessionCwd}` : undefined)}
       cwd={session?.cwd ?? newSessionCwd}
       /* The pill bar and chevron only render in the non-empty layout; don't
          accept Escape-to-minimize in the fresh-chat branch where there is
@@ -1190,7 +1195,7 @@ export function ChatWindow({ session, newSessionCwd, toolCallsDefaultCollapsed =
       {/* Minimized pill bar - shown when composer is collapsed */}
       {composerMinimized && (
         <MinimizedComposerBar
-          draftKey={session?.id ?? (newSessionCwd ? `new:${newSessionCwd}` : undefined)}
+          draftKey={session?.id ?? (newSessionCwd ? `new:${modelHostId ?? "?"}:${newSessionCwd}` : undefined)}
           isStreaming={sessionBusy}
           isCompacting={isCompacting}
           statusText={composerStatusText}

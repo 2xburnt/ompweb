@@ -1,11 +1,12 @@
-import { existsSync, statSync } from "fs";
 import { normalize as normalizePath } from "path";
+import { currentHost, withHost } from "./hosts/context";
+import { getHost, listHosts, type Host } from "./hosts/registry";
 import { getAgentDir } from "./omp/paths";
 import {
   invalidateSessionFileListCache,
   listAllSessionInfos,
   loadSessionFile,
-  readSessionHeaderSync,
+  readSessionHeader as readSessionHeaderFile,
   type OmpSessionInfo,
 } from "./omp/session-files";
 import type {
@@ -21,10 +22,28 @@ import { normalizeToolCalls } from "./normalize";
 import { isRecord } from "./type-guards";
 import { taskResultRetryFailure, taskResultStructuredOutput, taskResultUsageCost } from "./task-result-details";
 import type { TodoPhase } from "./pi-types";
-import { projectIdentityKey, sessionPathKey } from "./paths";
+import { hostProjectKey, sessionPathKey } from "./paths";
 import { resolveProject, type ProjectInfo } from "./worktree";
 
 export { getAgentDir };
+
+/** Sessions of a host whose listing failed (unreachable, disabled mid-request)
+ * are skipped rather than failing the whole list; the host's status carries
+ * the error for the UI. */
+async function loadSessionsForHost(host: Host): Promise<SessionInfo[]> {
+  try {
+    await host.ready();
+  } catch (error) {
+    console.warn(`[omp-web] session list: host "${host.id}" unavailable (${error instanceof Error ? error.message : String(error)})`);
+    return [];
+  }
+  try {
+    return await withHost(host, () => loadHostSessions(host));
+  } catch (error) {
+    console.warn(`[omp-web] session list: host "${host.id}" failed (${error instanceof Error ? error.message : String(error)})`);
+    return [];
+  }
+}
 
 /**
  * `header.parentSession` has two forms in omp: a session FILE PATH (branch /
@@ -44,7 +63,12 @@ function matchParentSessionId(
 }
 
 async function loadAllSessions(): Promise<SessionInfo[]> {
-  const ompSessions: OmpSessionInfo[] = await listAllSessionInfos();
+  const perHost = await Promise.all(listHosts().map((host) => loadSessionsForHost(host)));
+  return perHost.flat().sort((a, b) => b.modified.localeCompare(a.modified));
+}
+
+async function loadHostSessions(host: Host): Promise<SessionInfo[]> {
+  const ompSessions: OmpSessionInfo[] = await listAllSessionInfos(host);
   const pathToId = new Map<string, string>();
   const knownIds = new Set<string>();
   for (const s of ompSessions) {
@@ -66,9 +90,10 @@ async function loadAllSessions(): Promise<SessionInfo[]> {
   }
 
   return ompSessions.map((s) => {
-    cacheSessionPath(s.id, s.path);
+    cacheSessionPath(s.id, s.path, host.id, true);
     const project = s.cwd ? projectByCwd.get(s.cwd) : undefined;
     return {
+      host: host.id,
       path: s.path,
       id: s.id,
       cwd: s.cwd,
@@ -84,7 +109,7 @@ async function loadAllSessions(): Promise<SessionInfo[]> {
         ? matchParentSessionId(s.parentSessionPath, pathToId, knownIds)
         : undefined,
       projectRoot: project?.projectRoot ?? s.cwd,
-      projectKey: projectIdentityKey(project?.projectRoot ?? s.cwd),
+      projectKey: hostProjectKey(host.id, project?.projectRoot ?? s.cwd),
       ...(project?.isWorktree && project.branch ? { worktreeBranch: project.branch } : {}),
     };
   });
@@ -128,8 +153,15 @@ export async function listAllSessions(): Promise<SessionInfo[]> {
 // ============================================================================
 // Session path caches, stored in globalThis for hot-reload safety.
 // ============================================================================
+interface CachedSessionLocation {
+  host: string;
+  path: string;
+  /** Last time the file was confirmed to exist (listing or exists probe). */
+  verifiedAt: number;
+}
+
 declare global {
-  var __piSessionPathCache: Map<string, string> | undefined;
+  var __piSessionPathCache: Map<string, CachedSessionLocation> | undefined;
   var __piPathToSessionIdCache: Map<string, string> | undefined;
   var __piSessionListPromise: Promise<SessionInfo[]> | undefined;
   var __piSessionListPromiseGeneration: number | undefined;
@@ -152,9 +184,79 @@ export function invalidateSessionListCache(): void {
   globalThis.__ompSessionEntriesCache?.clear();
 }
 
-function getPathCache(): Map<string, string> {
+// A path confirmed this recently is trusted without another existence probe
+// (each probe is a round trip on a remote host).
+const PATH_VERIFY_TTL_MS = 5_000;
+
+function getPathCache(): Map<string, CachedSessionLocation> {
   if (!globalThis.__piSessionPathCache) globalThis.__piSessionPathCache = new Map();
   return globalThis.__piSessionPathCache;
+}
+
+function pathToIdKey(hostId: string, filePath: string): string {
+  return `${hostId}\0${sessionPathKey(filePath)}`;
+}
+
+export interface ResolveSessionOptions {
+  /** Always probe the file on its host instead of trusting a recent listing.
+   * Required before spawning omp with --resume: a deleted file would make omp
+   * silently create a new session. */
+  verify?: boolean;
+}
+
+async function verifyLocation(sessionId: string, location: CachedSessionLocation, options: ResolveSessionOptions = {}): Promise<boolean> {
+  if (!options.verify && Date.now() - location.verifiedAt < PATH_VERIFY_TTL_MS) return true;
+  const host = getHost(location.host);
+  if (!host || !host.enabled) return false;
+  let exists = false;
+  try {
+    await host.ready();
+    exists = await host.fs.exists(location.path);
+  } catch {
+    exists = false;
+  }
+  if (exists) {
+    location.verifiedAt = Date.now();
+    return true;
+  }
+  // A deleted session must never resolve: callers spawn omp with --resume
+  // against the path, and omp silently creates a NEW session when the file
+  // is gone. Drop the dead entry directly; the list cache stays valid, so
+  // repeated 404 polls for the same id do not force a full rescan each time.
+  invalidateSessionPathCache(sessionId);
+  return false;
+}
+
+/** The host that owns a session, or null when the id is unknown everywhere. */
+export async function resolveSessionHost(sessionId: string): Promise<Host | null> {
+  const cached = getPathCache().get(sessionId);
+  if (cached) {
+    const host = getHost(cached.host);
+    if (host && host.enabled) return host;
+  }
+  await listAllSessions();
+  const resolved = getPathCache().get(sessionId);
+  if (!resolved) return null;
+  const host = getHost(resolved.host);
+  return host && host.enabled ? host : null;
+}
+
+/** Host + path of a session, verified to still exist (a listing within the
+ * last few seconds counts as verification unless `verify` is set). */
+export async function resolveSessionLocation(sessionId: string, options: ResolveSessionOptions = {}): Promise<{ host: Host; path: string } | null> {
+  const cached = getPathCache().get(sessionId);
+  if (cached && await verifyLocation(sessionId, cached, options)) {
+    const host = getHost(cached.host);
+    if (host && host.enabled) return { host, path: cached.path };
+  }
+
+  // Cache miss: scan all sessions to populate cache, then retry
+  await listAllSessions();
+  const resolved = getPathCache().get(sessionId);
+  if (!resolved) return null;
+  if (!await verifyLocation(sessionId, resolved, { verify: true })) return null;
+  const host = getHost(resolved.host);
+  return host && host.enabled ? { host, path: resolved.path } : null;
 }
 
 function getPathToIdCache(): Map<string, string> {
@@ -162,36 +264,20 @@ function getPathToIdCache(): Map<string, string> {
   return globalThis.__piPathToSessionIdCache;
 }
 
-export async function resolveSessionPath(sessionId: string): Promise<string | null> {
-  const cached = getPathCache().get(sessionId);
-  if (cached) {
-    if (existsSync(cached)) return cached;
-    // A deleted session must never resolve: callers spawn omp with --resume
-    // against the path, and omp silently creates a NEW session when the file
-    // is gone. Drop the dead entry directly; the list cache stays valid, so
-    // repeated 404 polls for the same id do not force a full rescan each time.
-    // (listAllSessions would drop it anyway on the next real list mutation.)
-    invalidateSessionPathCache(sessionId);
-  }
-
-  // Cache miss: scan all sessions to populate cache, then retry
-  await listAllSessions();
-  const resolved = getPathCache().get(sessionId);
-  if (!resolved) return null;
-  if (!existsSync(resolved)) {
-    invalidateSessionPathCache(sessionId);
-    return null;
-  }
-  return resolved;
+/** Session file path (on its host) for an id, or null when unknown or gone. */
+export async function resolveSessionPath(sessionId: string, options: ResolveSessionOptions = {}): Promise<string | null> {
+  const location = await resolveSessionLocation(sessionId, options);
+  return location ? location.path : null;
 }
 
-export async function resolveSessionIdByPath(filePath: string): Promise<string | undefined> {
-  const pathKey = sessionPathKey(filePath);
-  const cached = getPathToIdCache().get(pathKey);
+/** Session id for a file path on the given host (default: current host). */
+export async function resolveSessionIdByPath(filePath: string, host: Host = currentHost()): Promise<string | undefined> {
+  const key = pathToIdKey(host.id, filePath);
+  const cached = getPathToIdCache().get(key);
   if (cached) return cached;
 
   await listAllSessions();
-  return getPathToIdCache().get(pathKey);
+  return getPathToIdCache().get(key);
 }
 
 /**
@@ -206,44 +292,45 @@ export async function resolveParentSessionId(parentSession: string): Promise<str
   return (await resolveSessionPath(parentSession)) ? parentSession : undefined;
 }
 
-export function cacheSessionPath(sessionId: string, filePath: string): void {
-  const normalizedPath = normalizePath(filePath);
-  const pathKey = sessionPathKey(normalizedPath);
+export function cacheSessionPath(sessionId: string, filePath: string, hostId: string = currentHost().id, verified = false): void {
+  const host = getHost(hostId);
+  const normalizedPath = host && !host.isLocal ? filePath : normalizePath(filePath);
+  const pathKey = pathToIdKey(hostId, normalizedPath);
   const pathCache = getPathCache();
   const reverseCache = getPathToIdCache();
-  const previousPath = pathCache.get(sessionId);
-  const previousPathKey = previousPath ? sessionPathKey(previousPath) : undefined;
+  const previous = pathCache.get(sessionId);
+  const previousPathKey = previous ? pathToIdKey(previous.host, previous.path) : undefined;
   const previousSessionId = reverseCache.get(pathKey);
-  const previousOwnerPath = previousSessionId ? pathCache.get(previousSessionId) : undefined;
+  const previousOwner = previousSessionId ? pathCache.get(previousSessionId) : undefined;
   if (previousPathKey && previousPathKey !== pathKey && reverseCache.get(previousPathKey) === sessionId) {
     reverseCache.delete(previousPathKey);
   }
   if (
     previousSessionId &&
     previousSessionId !== sessionId &&
-    previousOwnerPath &&
-    sessionPathKey(previousOwnerPath) === pathKey
+    previousOwner &&
+    pathToIdKey(previousOwner.host, previousOwner.path) === pathKey
   ) {
     pathCache.delete(previousSessionId);
   }
-  pathCache.set(sessionId, normalizedPath);
+  pathCache.set(sessionId, { host: hostId, path: normalizedPath, verifiedAt: verified ? Date.now() : 0 });
   reverseCache.set(pathKey, sessionId);
 }
 
 export function invalidateSessionPathCache(sessionId: string): void {
   const pathCache = getPathCache();
   const reverseCache = getPathToIdCache();
-  const filePath = pathCache.get(sessionId);
+  const location = pathCache.get(sessionId);
   pathCache.delete(sessionId);
-  const pathKey = filePath ? sessionPathKey(filePath) : undefined;
+  const pathKey = location ? pathToIdKey(location.host, location.path) : undefined;
   if (pathKey && reverseCache.get(pathKey) === sessionId) {
     reverseCache.delete(pathKey);
   }
 }
 
 /** Bounded, title-slot-aware header read (never loads message bodies). */
-export function readSessionHeader(filePath: string): SessionHeader | null {
-  return readSessionHeaderSync(filePath);
+export function readSessionHeader(filePath: string, host: Host = currentHost()): Promise<SessionHeader | null> {
+  return readSessionHeaderFile(filePath, host);
 }
 
 /** Full-file entry parse memoized on (path, size, mtimeMs). Read-only scans
@@ -273,26 +360,27 @@ function getSessionEntriesCache(): Map<string, SessionEntriesCacheEntry> {
   return globalThis.__ompSessionEntriesCache;
 }
 
-function loadSessionEntriesCached(filePath: string): SessionEntry[] {
+async function loadSessionEntriesCached(filePath: string, host: Host): Promise<SessionEntry[]> {
   let size: number;
   let mtimeMs: number;
   try {
-    const stat = statSync(filePath);
+    const stat = await host.fs.stat(filePath);
     size = stat.size;
     mtimeMs = stat.mtimeMs;
   } catch {
     // Missing/unreadable file — mirror loadSessionFile's lenient empty result.
-    return loadSessionFile(filePath).entries;
+    return (await loadSessionFile(filePath, {}, host)).entries;
   }
   const cache = getSessionEntriesCache();
-  const cached = cache.get(filePath);
+  const cacheKey = `${host.id}\0${filePath}`;
+  const cached = cache.get(cacheKey);
   if (cached && cached.size === size && cached.mtimeMs === mtimeMs) {
-    cache.delete(filePath);
-    cache.set(filePath, cached);
+    cache.delete(cacheKey);
+    cache.set(cacheKey, cached);
     return cached.entries;
   }
-  const entries = loadSessionFile(filePath).entries;
-  cache.set(filePath, { size, mtimeMs, entries });
+  const entries = (await loadSessionFile(filePath, {}, host)).entries;
+  cache.set(cacheKey, { size, mtimeMs, entries });
   // Two bounds: entry count and total cached file bytes (parsed JS expands
   // several-fold). Inserted files larger than the whole budget are still
   // cached — they are evicted by the next insert, and skipping the cache
@@ -309,8 +397,8 @@ function loadSessionEntriesCached(filePath: string): SessionEntry[] {
 }
 
 /** Session entries without blob resolution (fine for reference/thinking scans). */
-export function getSessionEntries(filePath: string): SessionEntry[] {
-  return loadSessionEntriesCached(filePath);
+export function getSessionEntries(filePath: string, host: Host = currentHost()): Promise<SessionEntry[]> {
+  return loadSessionEntriesCached(filePath, host);
 }
 
 function parseTodoPhases(value: unknown): TodoPhase[] | null {

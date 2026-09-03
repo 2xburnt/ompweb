@@ -1,12 +1,15 @@
+import { withSessionRoute } from "@/lib/hosts/route";
 import { getRpcSession } from "@/lib/rpc-manager";
 
 export const dynamic = "force-dynamic";
 
-// GET /api/agent/[id]/events - SSE stream of agent events
-export async function GET(
+// GET /api/agent/[id]/events - SSE stream of agent events. Registry-only
+// (the wrapper lives in this process whatever host runs omp), so the host
+// is resolved for context but never probed.
+export const GET = withSessionRoute(async (
   req: Request,
   { params }: { params: Promise<{ id: string }> }
-) {
+) => {
   const { id } = await params;
 
   // SSE is observer-only: listing or opening a saved session must not create
@@ -118,4 +121,4 @@ export async function GET(
       Connection: "keep-alive",
     },
   });
-}
+}, { ready: false });

@@ -1,38 +1,42 @@
-import { statSync } from "fs";
+import { currentHost } from "@/lib/hosts/context";
+import type { Host } from "@/lib/hosts/registry";
+import { withHostRoute } from "@/lib/hosts/route";
 import { invalidateModelsCache, loadModelsWithCache, withModelRuntimeError, withSafeModelLoadFailure, type ModelsData } from "@/lib/models-cache";
 import { disposeUtilityRpc, runUtilityCommand, type OmpModel } from "@/lib/omp/rpc-utility";
-import { getModelsConfigPath } from "@/lib/omp/paths";
+import { resolveModelsConfigPath } from "@/lib/omp/paths";
 import { readDisabledProviders } from "@/lib/omp/model-roles";
 
 export const dynamic = "force-dynamic";
 
-// The omp model registry (auth + models.yml) is global, not per-cwd, so one
-// cache entry serves every request. The ?cwd= query parameter is still
-// accepted for client compatibility but no longer affects the result.
+// The omp model registry (auth + models.yml) is global per host, not per-cwd,
+// so one cache entry serves every request for a host. The ?cwd= query
+// parameter is still accepted for client compatibility but no longer affects
+// the result.
 const MODELS_CACHE_KEY = "global";
 
 declare global {
-  var __ompModelsConfigFingerprint: string | undefined;
+  var __ompModelsConfigFingerprints: Map<string, string> | undefined;
 }
 
-function refreshModelsIfConfigChanged(): void {
-  const path = getModelsConfigPath();
+async function refreshModelsIfConfigChanged(host: Host): Promise<void> {
+  const path = await resolveModelsConfigPath();
   let fingerprint = `${path}:missing`;
   try {
-    const stat = statSync(path);
-    fingerprint = `${path}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`;
+    const stat = await host.fs.stat(path);
+    fingerprint = `${path}:${stat.mtimeMs}:${stat.size}`;
   } catch {
     // A missing models file is a valid state; the fingerprint still detects
     // its later creation.
   }
 
-  const previous = globalThis.__ompModelsConfigFingerprint;
-  globalThis.__ompModelsConfigFingerprint = fingerprint;
+  const fingerprints = (globalThis.__ompModelsConfigFingerprints ??= new Map());
+  const previous = fingerprints.get(host.id);
+  fingerprints.set(host.id, fingerprint);
   if (previous !== undefined && previous !== fingerprint) {
     // The utility process reads models.yml once at startup. External edits
     // therefore need the same invalidation as the web editor's PUT route.
-    invalidateModelsCache();
-    disposeUtilityRpc();
+    invalidateModelsCache(host.id);
+    disposeUtilityRpc(host.id);
   }
 }
 
@@ -60,10 +64,11 @@ function supportsFastMode(model: OmpModel): boolean {
   return model.provider === "anthropic" || model.provider === "openai" || model.provider === "google";
 }
 
-async function loadModels(): Promise<ModelsData> {
+async function loadModels(host: Host): Promise<ModelsData> {
   const availableResponse = await runUtilityCommand<{ models?: unknown }>(
     { type: "get_available_models" },
     120_000,
+    host,
   );
   const available = Array.isArray(availableResponse.models)
     ? availableResponse.models
@@ -86,6 +91,7 @@ async function loadModels(): Promise<ModelsData> {
   const loginResponse = await runUtilityCommand<{ providers?: unknown }>(
     { type: "get_login_providers" },
     30_000,
+    host,
   );
   const loginProviders = Array.isArray(loginResponse.providers)
     ? loginResponse.providers.filter((provider): provider is { id: string; name: string; authenticated: boolean } => (
@@ -95,7 +101,7 @@ async function loadModels(): Promise<ModelsData> {
       && typeof (provider as { authenticated?: unknown }).authenticated === "boolean"
     ))
     : [];
-  const disabledProviders = readDisabledProviders();
+  const disabledProviders = await readDisabledProviders(host);
   const connectedProviders = loginProviders
     .filter((provider) => provider.authenticated)
     .map((provider) => ({ id: provider.id, name: provider.name, disabled: disabledProviders.has(provider.id) }));
@@ -112,6 +118,7 @@ async function loadModels(): Promise<ModelsData> {
     const state = await runUtilityCommand<{ model?: { provider?: string; id?: string } }>(
       { type: "get_state" },
       30_000,
+      host,
     );
     const provider = state.model?.provider;
     const modelId = state.model?.id;
@@ -135,11 +142,12 @@ const EMPTY_MODELS: ModelsData = {
   thinkingLevels: {},
 };
 
-export async function GET() {
-  refreshModelsIfConfigChanged();
+export const GET = withHostRoute(async () => {
+  const host = currentHost();
   try {
-    return Response.json(await loadModelsWithCache(MODELS_CACHE_KEY, () => loadModels()));
+    await refreshModelsIfConfigChanged(host);
+    return Response.json({ ...(await loadModelsWithCache(MODELS_CACHE_KEY, () => loadModels(host), host.id)), host: host.id });
   } catch {
-    return Response.json(withSafeModelLoadFailure(EMPTY_MODELS));
+    return Response.json({ ...withSafeModelLoadFailure(EMPTY_MODELS), host: host.id });
   }
-}
+});

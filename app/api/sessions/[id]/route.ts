@@ -1,7 +1,4 @@
 import { NextResponse } from "next/server";
-import { closeSync, openSync, readFileSync, readdirSync, readSync, statSync } from "fs";
-import * as fsRuntime from "fs";
-import { dirname, join } from "path";
 import {
   buildSessionTree,
   deleteSessionFileWithArtifacts,
@@ -9,9 +6,10 @@ import {
   loadSessionFile,
   MAX_SESSION_LOAD_BYTES,
   parseTitleSlotLine,
-  readSessionHeaderSync,
+  scanSessionInfoFromSlices,
+  SESSION_TITLE_SLOT_BYTES,
   setSessionTitle,
-  writeSessionFileAtomicSync,
+  writeSessionFileAtomic,
 } from "@/lib/omp/session-files";
 import {
   resolveParentSessionId,
@@ -24,6 +22,9 @@ import {
 } from "@/lib/session-reader";
 import { resolveSessionPathOr404 } from "@/lib/api-utils";
 import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
+import { currentHost } from "@/lib/hosts/context";
+import { withSessionRoute } from "@/lib/hosts/route";
+import { hostPath } from "@/lib/omp/paths";
 import { sessionPathKey } from "@/lib/paths";
 import { getRpcSession } from "@/lib/rpc-manager";
 
@@ -160,22 +161,27 @@ function projectTreeForResponse<T extends { entry: { id: string }; children: T[]
   return projectedRoots;
 }
 
-export async function GET(
+// Slot-aware header window of a sibling session (readSessionHeader's bound):
+// enough to learn a child's id and parentSession without loading its body.
+const CHILD_HEADER_BYTES = 64 * 1024 + SESSION_TITLE_SLOT_BYTES;
+
+export const GET = withSessionRoute(async (
   req: Request,
   { params }: { params: Promise<{ id: string }> }
-) {
+) => {
   const { id } = await params;
   try {
     const resolved = await resolveSessionPathOr404(id);
     if ("response" in resolved) return resolved.response;
     const filePath = resolved.filePath;
+    const host = currentHost();
 
     const searchParams = new URL(req.url).searchParams;
     const deferThinking = searchParams.has("deferThinking");
     const deferToolResultImages = searchParams.has("deferMedia");
     const includeState = searchParams.has("includeState");
 
-    const { header, entries, error: loadError } = loadSessionFile(filePath, {
+    const { header, entries, error: loadError } = await loadSessionFile(filePath, {
       resolveBlobs: true,
       skipToolResultImages: deferToolResultImages,
     });
@@ -193,11 +199,12 @@ export async function GET(
     const context = buildSessionContext(entries, leafId, { deferThinking, deferToolResultImages });
 
     let modified = header.timestamp ?? new Date().toISOString();
-    try { modified = statSync(filePath).mtime.toISOString(); } catch { /* use header timestamp */ }
+    try { modified = new Date((await host.fs.stat(filePath)).mtimeMs).toISOString(); } catch { /* use header timestamp */ }
     const parentSessionId = header.parentSession
       ? await resolveParentSessionId(header.parentSession)
       : undefined;
     const info = {
+      host: host.id,
       path: filePath,
       id: header.id,
       cwd: header.cwd ?? "",
@@ -235,6 +242,7 @@ export async function GET(
 
     return NextResponse.json({
       sessionId: id,
+      host: host.id,
       filePath,
       info,
       leafId,
@@ -245,13 +253,13 @@ export async function GET(
   } catch (error) {
     return sessionsErrorResponse(error);
   }
-}
+});
 
 // PATCH /api/sessions/[id]  body: { name: string }
-export async function PATCH(
+export const PATCH = withSessionRoute(async (
   req: Request,
   { params }: { params: Promise<{ id: string }> }
-) {
+) => {
   const { id } = await params;
   try {
     const { name } = await parseJsonWithinLimit<{ name?: string }>(req, 64 * 1024);
@@ -276,28 +284,30 @@ export async function PATCH(
       const resolved = await resolveSessionPathOr404(id);
       if ("response" in resolved) return resolved.response;
       const filePath = resolved.filePath;
-      setSessionTitle(filePath, name.trim(), "user");
+      await setSessionTitle(filePath, name.trim(), "user");
     }
     invalidateSessionListCache();
     return NextResponse.json({ ok: true });
   } catch (error) {
     return sessionsErrorResponse(error);
   }
-}
+});
 
 // DELETE /api/sessions/[id]
-export async function DELETE(
+export const DELETE = withSessionRoute(async (
   _req: Request,
   { params }: { params: Promise<{ id: string }> }
-) {
+) => {
   const { id } = await params;
   try {
     const resolved = await resolveSessionPathOr404(id);
     if ("response" in resolved) return resolved.response;
     const filePath = resolved.filePath;
+    const host = currentHost();
+    const pathApi = hostPath();
 
     // Read only the bounded header before deleting.
-    const deletedHeader = readSessionHeader(filePath);
+    const deletedHeader = await readSessionHeader(filePath);
     const deletedSessionId = deletedHeader?.id ?? id;
     const parentSession = deletedHeader?.parentSession;
 
@@ -320,58 +330,41 @@ export async function DELETE(
       }
     }
 
-    // Re-attach all direct children to this session's parent (cascade re-parent)
-    // Scan sibling files in the same directory
+    // Re-attach all direct children to this session's parent (cascade re-parent).
+    // Siblings live in the same directory; their slot-aware header windows are
+    // fetched in ONE round trip (readSlices) so a remote host is not probed
+    // once per file, and no sibling is ever loaded whole unless it is a child
+    // that needs rewriting.
     const targetPathKey = sessionPathKey(filePath);
-    const dir = dirname(filePath);
+    const dir = pathApi.dirname(filePath);
     const skippedChildren: Array<{ id: string; reason: string }> = [];
     try {
-      const readDirectorySync = Reflect.get(fsRuntime, "readdirSync") as typeof readdirSync;
-      const files = readDirectorySync(dir).filter(
-        (file) => file.endsWith(".jsonl") && sessionPathKey(join(dir, file)) !== targetPathKey,
-      );
-      for (const file of files) {
-        const childPath = join(dir, file);
+      const siblings = (await host.fs.readdir(dir))
+        .filter((entry) => entry.name.endsWith(".jsonl") && (entry.isFile() || entry.targetType === "file"))
+        .map((entry) => pathApi.join(dir, entry.name))
+        .filter((siblingPath) => sessionPathKey(siblingPath) !== targetPathKey);
+      const slices = await host.fs.readSlices(siblings, CHILD_HEADER_BYTES, 0);
+      for (const childPath of siblings) {
+        const slice = slices.get(childPath);
+        if (!slice) continue; // vanished between readdir and read — not a child we can fix
+        const childInfo = scanSessionInfoFromSlices(childPath, slice, false);
+        if (!childInfo?.parentSessionPath) continue;
+        const linkedByPath = sessionPathKey(childInfo.parentSessionPath) === targetPathKey;
+        if (!linkedByPath && childInfo.parentSessionPath !== deletedSessionId) continue;
+        const childId = childInfo.id || pathApi.basename(childPath);
 
         // Re-parenting rewrites the whole child file; a child at/above the
         // load ceiling would cause a huge allocation (RangeError) during the
         // read and a full-file rewrite. Skip it like a live session.
-        try {
-          if (statSync(childPath).size > MAX_SESSION_LOAD_BYTES) {
-            // Report the real session id when the header is readable without
-            // loading the whole file (bounded 64KB prefix read).
-            let oversizedId = file;
-            try {
-              const fd = openSync(childPath, "r");
-              try {
-                const head = Buffer.alloc(64 * 1024);
-                const bytes = readSync(fd, head, 0, head.length, 0);
-                const lines = head.toString("utf8", 0, bytes).split("\n");
-                const headerIndex = parseTitleSlotLine(lines[0] ?? "") ? 1 : 0;
-                const parsed = JSON.parse(lines[headerIndex] ?? "{}") as { id?: unknown };
-                if (typeof parsed.id === "string") oversizedId = parsed.id;
-              } finally {
-                closeSync(fd);
-              }
-            } catch {
-              // Header unreadable — fall back to the basename.
-            }
-            skippedChildren.push({ id: oversizedId, reason: "session_child_too_large" });
-            continue;
-          }
-        } catch {
-          continue; // vanished between readdir and stat — not a child we can fix
+        if (slice.size > MAX_SESSION_LOAD_BYTES) {
+          skippedChildren.push({ id: childId, reason: "session_child_too_large" });
+          continue;
         }
-        const childHeader = readSessionHeaderSync(childPath);
-        if (!childHeader || !childHeader.parentSession) continue;
-        const linkedByPath = sessionPathKey(childHeader.parentSession) === targetPathKey;
-        if (!linkedByPath && childHeader.parentSession !== deletedSessionId) continue;
 
         // A live omp process owns its session file and flushes its whole
         // in-memory state on write — our rewrite would be clobbered by (or
         // interleaved with) its next flush.
-        const childId = childHeader.id;
-        if (childId && getRpcSession(childId)?.isAlive?.()) {
+        if (childInfo.id && getRpcSession(childInfo.id)?.isAlive?.()) {
           skippedChildren.push({ id: childId, reason: "session_child_live" });
           continue;
         }
@@ -380,13 +373,13 @@ export async function DELETE(
         let headerIndex: number;
         let header: { type?: string; id?: string; parentSession?: string };
         try {
-          lines = readFileSync(childPath, "utf8").split("\n");
+          lines = (await host.fs.readFile(childPath)).toString("utf8").split("\n");
           headerIndex = parseTitleSlotLine(lines[0] ?? "") ? 1 : 0;
           header = JSON.parse(lines[headerIndex]) as typeof header;
         } catch {
+          skippedChildren.push({ id: childId, reason: "session_child_rewrite_failed" });
           continue;
         }
-
 
         // Write the replacement in the same form the child used.
         header.parentSession = linkedByPath
@@ -394,11 +387,12 @@ export async function DELETE(
           : (grandparentId ?? parentSession);
         lines[headerIndex] = JSON.stringify(header);
         try {
-          // Atomic: writeFileSync truncates first, so a crash or ENOSPC here
-          // would permanently truncate a session the user did NOT delete.
-          writeSessionFileAtomicSync(childPath, lines.join("\n"), "reparent");
+          // Atomic (temp file + rename on the host): a truncating write would
+          // let a crash or ENOSPC permanently truncate a session the user did
+          // NOT delete.
+          await writeSessionFileAtomic(childPath, lines.join("\n"));
         } catch {
-          skippedChildren.push({ id: childId ?? file, reason: "session_child_rewrite_failed" });
+          skippedChildren.push({ id: childId, reason: "session_child_rewrite_failed" });
         }
       }
     } catch { /* skip if dir unreadable */ }
@@ -406,7 +400,7 @@ export async function DELETE(
     // Await the child's exit before unlinking: omp flushes session state on
     // shutdown and would recreate the file if it were still running.
     await getRpcSession(id)?.destroyAndWait?.();
-    deleteSessionFileWithArtifacts(filePath);
+    await deleteSessionFileWithArtifacts(filePath);
     invalidateSessionPathCache(id);
     invalidateSessionListCache();
     return NextResponse.json({
@@ -416,4 +410,4 @@ export async function DELETE(
   } catch (error) {
     return sessionsErrorResponse(error);
   }
-}
+});

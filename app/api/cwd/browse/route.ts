@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { apiErrorResponse } from "@/lib/api-utils";
-import { stat } from "fs/promises";
 import {
   getBrowseStartDirectory,
   getParentDirectory,
@@ -9,37 +8,42 @@ import {
   resolveDirectory,
   shouldShowWindowsDrivePicker,
 } from "@/lib/directory-browser";
+import { currentHost } from "@/lib/hosts/context";
+import { withHostRoute } from "@/lib/hosts/route";
 
-// GET /api/cwd/browse?path=...：列出文件系统中的可读子目录。
-export async function GET(request: NextRequest) {
+// GET /api/cwd/browse?path=...[&host=<id>]：列出所选主机文件系统中的可读子目录。
+// The Windows drive picker only applies to the local machine on win32; remote
+// hosts are POSIX and start at their home directory.
+export const GET = withHostRoute(async (request: NextRequest) => {
   try {
+    const host = currentHost();
     const requested = request.nextUrl.searchParams.get("path")?.trim();
     if (shouldShowWindowsDrivePicker(requested)) {
-      return NextResponse.json({ path: "", parentPath: null, drives: await listWindowsDrives(), directories: [] });
+      return NextResponse.json({ path: "", parentPath: null, drives: await listWindowsDrives(host), directories: [], host: host.id });
     }
     const candidate = getBrowseStartDirectory(requested);
 
     let resolved: string;
     try {
-      resolved = await resolveDirectory(candidate);
+      resolved = await resolveDirectory(candidate, host);
     } catch {
       return NextResponse.json({ error: "Directory does not exist", code: "directory_not_found" }, { status: 404 });
     }
 
-
-    const directoryStat = await stat(resolved);
+    const directoryStat = await host.fs.stat(resolved);
     if (!directoryStat.isDirectory()) {
       return NextResponse.json({ error: "Path is not a directory", code: "not_a_directory" }, { status: 400 });
     }
 
-    const directories = await listDirectories(resolved);
+    const directories = await listDirectories(resolved, host);
 
     return NextResponse.json({
       path: resolved,
       parentPath: getParentDirectory(resolved),
       directories,
+      host: host.id,
     });
   } catch (error) {
     return apiErrorResponse(error);
   }
-}
+});

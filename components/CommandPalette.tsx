@@ -3,10 +3,11 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Command } from "cmdk";
-import { Moon, Plus, Sun, MessageSquare } from "lucide-react";
+import { Moon, Plus, Server, Sun, MessageSquare } from "lucide-react";
 import type { SessionInfo } from "@/lib/types";
 import { useI18n } from "@/lib/i18n";
 import { useTheme } from "@/hooks/useTheme";
+import { hostNameOf, useHosts } from "@/lib/hosts/client";
 
 type Props = {
   onSelectSession: (session: SessionInfo) => void;
@@ -27,6 +28,8 @@ function relativeTime(value: string, locale: string): string {
 export const CommandPalette = memo(function CommandPalette({ onSelectSession, onNewSession, currentModel }: Props) {
   const { t, locale } = useI18n();
   const { isDark, toggleTheme } = useTheme();
+  const { hosts } = useHosts();
+  const multiHost = hosts.filter((host) => host.enabled).length > 1;
   const [open, setOpen] = useState(false);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [loading, setLoading] = useState(false);
@@ -94,7 +97,21 @@ export const CommandPalette = memo(function CommandPalette({ onSelectSession, on
         <Command.List style={{ padding: "8px", overflowY: "auto", maxHeight: "min(55vh, 440px)" }}>
           <Command.Empty style={{ padding: 20, textAlign: "center", color: "var(--text-muted)", fontSize: 13 }}>{loading ? "Loading sessions..." : t("commandPalette.empty")}</Command.Empty>
           <Command.Group heading={t("commandPalette.sessions")}>
-            {sessions.map((session) => <Command.Item key={session.id} value={`${session.name ?? session.id} ${session.cwd}`} onSelect={() => choose(() => onSelectSession(session))} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 10px", borderRadius: "var(--radius-control)", color: "var(--text)", cursor: "pointer" }}><MessageSquare size={15} color="var(--accent)" /><span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{session.name || session.id}</span><span style={{ color: "var(--text-dim)", fontSize: 11 }}>{relativeTime(session.modified, locale)}</span></Command.Item>)}
+            {sessions.map((session) => {
+              const machine = multiHost ? hostNameOf(hosts, session.host) : "";
+              return (
+                <Command.Item key={session.id} value={`${session.name ?? session.id} ${session.cwd} ${machine}`} onSelect={() => choose(() => onSelectSession(session))} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 10px", borderRadius: "var(--radius-control)", color: "var(--text)", cursor: "pointer" }}>
+                  <MessageSquare size={15} color="var(--accent)" />
+                  <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{session.name || session.id}</span>
+                  {machine && (
+                    <span title={t("hosts.sidebar.badge", { name: machine })} style={{ display: "inline-flex", alignItems: "center", gap: 4, maxWidth: 110, padding: "1px 6px", borderRadius: 8, background: "var(--bg-subtle)", border: "1px solid var(--border)", color: "var(--text-dim)", fontSize: 10, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <Server size={10} aria-hidden="true" />{machine}
+                    </span>
+                  )}
+                  <span style={{ color: "var(--text-dim)", fontSize: 11 }}>{relativeTime(session.modified, locale)}</span>
+                </Command.Item>
+              );
+            })}
           </Command.Group>
           <Command.Group heading={t("commandPalette.actions")}>
             <Command.Item value={t("commandPalette.newSession")} onSelect={() => choose(onNewSession)} style={{ display: "flex", gap: 10, padding: "9px 10px", borderRadius: "var(--radius-control)", color: "var(--text)", cursor: "pointer" }}><Plus size={15} color="var(--accent)" />{t("commandPalette.newSession")}</Command.Item>

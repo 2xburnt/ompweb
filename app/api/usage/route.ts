@@ -1,11 +1,16 @@
 import { NextResponse } from "next/server";
 import { apiErrorResponse } from "@/lib/api-utils";
+import { withHostRoute } from "@/lib/hosts/route";
 import { getUsageReport } from "@/lib/usage-service";
 import type { UsageGranularity, UsageTimeRange } from "@/lib/usage-types";
 
 export const dynamic = "force-dynamic";
 
-export async function GET(req: Request) {
+// GET /api/usage?host=<id>&range=...  — usage report for one host. The local
+// host answers from ompweb's SQLite index; a remote host is queried read-only
+// through its sqlite3 CLI and reports `unsupported: true` (with an empty
+// report) when it has no readable index.
+export const GET = withHostRoute(async (req: Request) => {
   try {
     const url = new URL(req.url);
     const rangeParam = url.searchParams.get("range");
@@ -42,4 +47,4 @@ export async function GET(req: Request) {
   } catch (error) {
     return apiErrorResponse(error);
   }
-}
+});

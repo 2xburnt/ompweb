@@ -60,6 +60,10 @@ interface AppUpdateReleaseNotes {
   htmlUrl: string;
 }
 
+// A release page (`/owner/repo/releases/tag/v<version>`) for package installs,
+// or a compare view (`/owner/repo/compare/<a>...<b>`) for git checkouts.
+const RELEASE_PATH_RE = /^\/[\w.-]+\/[\w.-]+\/(?:releases\/tag\/v[\w.+-]+|compare\/[\w.-]+\.\.\.[\w.-]+)$/;
+
 function isSafeReleaseUrl(value: string, version: string): boolean {
   try {
     const url = new URL(value);
@@ -70,7 +74,8 @@ function isSafeReleaseUrl(value: string, version: string): boolean {
       && url.password === ""
       && url.search === ""
       && url.hash === ""
-      && url.pathname === `/kahme247/ompweb/releases/tag/v${version}`;
+      && RELEASE_PATH_RE.test(url.pathname)
+      && (!url.pathname.includes("/releases/tag/") || url.pathname.endsWith(`/releases/tag/v${version}`));
   } catch {
     return false;
   }
@@ -120,7 +125,14 @@ export interface AppUpdateInfo {
   availableVersion: string | null;
   updateAvailable: boolean;
   updateCommand?: string;
+  /** "git" when ompweb runs from a checkout (updates pull and rebuild this repository). */
+  installMethod?: "git" | "npm" | "bun";
+  repoUrl?: string | null;
+  branch?: string;
+  behindBy?: number;
+  dirty?: boolean;
   selfUpdateSupported?: boolean;
+  selfUpdateReason?: string;
   selfUpdateStatus?: {
     attemptId: string;
     state: string;
@@ -200,7 +212,10 @@ export function AppUpdateDialog({ open, update, phase, visibleStage, error, onPr
     return () => controller.abort();
   }, [availableVersion, releaseNotes?.version, shouldLoadReleaseNotes]);
   const busy = phase === "preparing" || phase === "restarting" || phase === "completed";
-  const command = update?.updateCommand || "npm install -g @kahme247/ompweb";
+  const command = update?.updateCommand || (update?.installMethod === "git" ? "git pull --ff-only && npm ci && npm run build" : "npm install -g @kahme247/ompweb");
+  const gitDescription = update?.installMethod === "git"
+    ? t("appUpdateDialog.gitDescription", { count: String(update.behindBy ?? 0), branch: update.branch ?? "main" })
+    : null;
   const completedVersion = update?.selfUpdateStatus?.targetVersion ?? update?.availableVersion ?? update?.currentVersion ?? "?";
   const versionTransition = getAppUpdateVersionTransition(update, phase);
   const effectiveStage = visibleStage ?? update?.selfUpdateStatus?.stage;
@@ -228,7 +243,7 @@ export function AppUpdateDialog({ open, update, phase, visibleStage, error, onPr
         ? t("appUpdateDialog.completed", { version: completedVersion })
         : phase === "failed"
           ? t("appUpdateDialog.failedDescription")
-          : t("appUpdateDialog.description");
+          : (gitDescription ?? t("appUpdateDialog.description"));
 
   return (
     <Dialog open={open} onOpenChange={(next) => { if (!next && !busy) onNotNow(); }}>
