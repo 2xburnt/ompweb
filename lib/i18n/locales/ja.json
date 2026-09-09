@@ -1018,6 +1018,7 @@
   "settingsTabs.system.label": "System & Updates",
   "settingsTabs.system.description": "App updates, runtime version, and active session restart",
   "settingsConfig.loadingSettings": "Loading settings…",
+  "settingsConfig.back": "戻る",
   "settingsConfig.title": "Settings",
   "settingsConfig.saving": "Saving…",
   "settingsConfig.autoSaved": "Auto-saved",

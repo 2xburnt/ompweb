@@ -1018,6 +1018,7 @@
   "settingsTabs.system.label": "系统与更新",
   "settingsTabs.system.description": "应用更新、运行时版本与活动会话重启",
   "settingsConfig.loadingSettings": "正在加载设置…",
+  "settingsConfig.back": "返回",
   "settingsConfig.title": "设置",
   "settingsConfig.saving": "保存中…",
   "settingsConfig.autoSaved": "已自动保存",
