@@ -5,7 +5,9 @@ import type { ToolCallContent, ToolResultMessage } from "@/lib/types";
 export type ToolCategory = "read" | "search" | "edit" | "terminal" | "todo" | "task" | "code" | "web" | "other";
 
 export function getToolCategory(toolName: string): ToolCategory {
-  const name = toolName.toLowerCase();
+  // User-run shell rows synthesize "bash (local)" (MessageView.tsx) — one
+  // shell execution either way, so drop any trailing "(...)" qualifier first.
+  const name = toolName.toLowerCase().replace(/\s*\(.*\)\s*$/, "");
   if (name === "read" || name.endsWith(".read") || name.endsWith("_read") || name === "file_read") return "read";
   if (name === "grep" || name === "glob" || name.includes("search") || name.endsWith(".grep") || name.endsWith(".glob")) return "search";
   if (name === "edit" || name === "write" || name === "ast_edit" || name.endsWith(".edit") || name.endsWith(".write")) return "edit";

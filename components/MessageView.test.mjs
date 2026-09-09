@@ -215,6 +215,22 @@ test("consecutive tool calls group into an activity group summary", () => {
   assert.match(html, /Read 2 files and searched 1 time/);
 });
 
+test("bash (local) rows count as terminal commands in group summaries", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    isStreaming: true,
+    toolCallsDefaultCollapsed: true,
+    message: {
+      role: "assistant",
+      content: [
+        { type: "toolCall", toolCallId: "call-1", toolName: "bash", input: { command: "go vet ./..." } },
+        { type: "toolCall", toolCallId: "call-2", toolName: "bash (local)", input: { command: "go test ./..." } },
+      ],
+    },
+  }));
+
+  assert.match(html, /Ran 2 commands/);
+});
+
 test("todo tool calls render clean status badge with action and task name", () => {
   const html = renderToStaticMarkup(React.createElement(MessageView, {
     isStreaming: true,

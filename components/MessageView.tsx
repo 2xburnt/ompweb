@@ -758,7 +758,7 @@ const ThinkingBlock = memo(function ThinkingBlock({ block, duration, sessionId, 
             <span className="activity-row-duration">{t("messageView.durationSeconds", { seconds: duration })}</span>
           )}
           <ChevronDown
-            size={11}
+            size={12}
             strokeWidth={1.8}
             aria-hidden
             style={{
@@ -893,7 +893,7 @@ const ToolCallBlock = memo(function ToolCallBlock({
             <span className="activity-row-duration">{t("messageView.durationSeconds", { seconds: duration })}</span>
           )}
           <ChevronDown
-            size={11}
+            size={12}
             strokeWidth={1.8}
             aria-hidden
             style={{
