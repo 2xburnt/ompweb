@@ -1839,6 +1839,7 @@ export function AppShell() {
               onSessionStatsChange={handleSessionStatsChange}
               onSessionStatsPanelOpen={openSessionStatsPanel}
               onGenerationSpeedChange={handleGenerationSpeedChange}
+              onOpenProviders={() => setSettingsTab("providers")}
             />
           ) : initialCwdStatus === "validating" ? (
             <div

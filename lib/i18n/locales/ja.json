@@ -248,6 +248,8 @@
   "chatInput.settings": "設定",
   "chatInput.changeModel": "モデルを変更",
   "chatInput.modelsLabel": "モデル",
+  "chatInput.providersLabel": "プロバイダー",
+  "chatInput.addProviders": "プロバイダーを追加",
   "chatInput.changeReasoning": "思考レベルを変更",
   "chatInput.changeReasoningTitle": "思考レベルを変更: {level}",
   "chatInput.reasoningLabel": "思考",

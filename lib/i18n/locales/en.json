@@ -262,6 +262,8 @@
   "chatInput.settings": "Settings",
   "chatInput.changeModel": "Change model",
   "chatInput.modelsLabel": "Models",
+  "chatInput.providersLabel": "Providers",
+  "chatInput.addProviders": "Add Providers",
   "chatInput.changeReasoning": "Change reasoning level",
   "chatInput.changeReasoningTitle": "Change reasoning level: {level}",
   "chatInput.reasoningLabel": "Reasoning",

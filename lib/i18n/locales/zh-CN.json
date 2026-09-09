@@ -248,6 +248,8 @@
   "chatInput.settings": "设置",
   "chatInput.changeModel": "切换模型",
   "chatInput.modelsLabel": "模型",
+  "chatInput.providersLabel": "提供商",
+  "chatInput.addProviders": "添加提供商",
   "chatInput.changeReasoning": "更改思考等级",
   "chatInput.changeReasoningTitle": "更改思考等级：{level}",
   "chatInput.reasoningLabel": "思考",

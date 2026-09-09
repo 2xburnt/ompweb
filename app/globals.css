@@ -1581,6 +1581,10 @@ span.token.table {
   gap: 7px;
   height: 32px;
   margin: 8px 8px 6px;
+  width: calc(100% - 16px);
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  min-height: 32px;
   padding: 0 9px;
   background: var(--bg);
   border: 1px solid var(--border);
@@ -1711,6 +1715,57 @@ span.token.table {
   color: var(--text-dim);
   font-size: 10px;
   border-top: 1px solid var(--border);
+}
+
+/* Nested model picker: provider rail + models pane */
+.picker-nested {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+.picker-nested-models {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  padding: 2px 4px 6px;
+  overflow-y: scroll;
+  border-left: 1px solid var(--border);
+}
+.picker-nested-providers {
+  flex: 0 0 140px;
+  min-width: 0;
+  min-height: 0;
+  padding: 2px 4px 6px;
+  overflow-y: scroll;
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+}
+.picker-provider-row {
+  gap: 7px;
+}
+.picker-add-providers {
+  margin: 0;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  color: var(--text-muted);
+  min-height: 34px;
+}
+.picker-add-providers:hover,
+.picker-add-providers:focus-visible {
+  color: var(--text);
+}
+.picker-empty {
+  padding: 10px 8px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+@media (max-width: 640px) {
+  .picker-nested[data-searching="false"] .picker-nested-models {
+    border-left: none;
+  }
+  .picker-nested-providers {
+    flex: 1 1 auto;
+  }
 }
 /* Mobile: the reasoning options become wrapped compact chips instead of a
    stacked full-width row list — seven 34px rows otherwise eat most of a
