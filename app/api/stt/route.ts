@@ -1,10 +1,8 @@
 import { NextResponse } from "next/server";
 import { parseFormDataWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
+import { MAX_STT_AUDIO_BYTES, MAX_STT_REQUEST_BYTES } from "@/lib/stt";
 
 export const dynamic = "force-dynamic";
-
-export const MAX_STT_AUDIO_BYTES = 25 * 1024 * 1024;
-const MAX_STT_REQUEST_BYTES = MAX_STT_AUDIO_BYTES + 1024 * 1024;
 
 function extractUpstreamErrorMessage(data: unknown, rawText: string, status: number): string {
   if (data && typeof data === "object" && "error" in data) {
