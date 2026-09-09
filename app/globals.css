@@ -165,7 +165,9 @@ html.omp .omp-wordmark {
 }
 
 /* Warm-ember palette (dark). Same AA verification as light. */
-html.dark {
+html.dark:not([data-theme]):not(.omp),
+html[data-theme="dark"],
+html.theme-dark {
   --bg: #1B1916;
   --bg-panel: #231F1B;
   --bg-hover: #2B2721;
@@ -194,6 +196,316 @@ html.dark {
   --status-renamed: #7CA8FF;
   --on-accent: #FFFFFF;
   --overlay-backdrop: color-mix(in srgb, var(--text) 24%, transparent);
+}
+
+/* One Light palette. */
+html[data-theme="one-light"], html.theme-one-light {
+  color-scheme: light;
+  --bg: #FAFAFA;
+  --bg-panel: #F0F0F0;
+  --bg-hover: #E5E5E6;
+  --bg-selected: #DBDBDC;
+  --border: #DCDCDC;
+  --text: #383A42;
+  --text-muted: #696C77;
+  --text-dim: #A0A1A7;
+  --accent: #2F65D9;
+  --accent-strong: #2F65D9;
+  --accent-hover: #1E4FB8;
+  --user-bg: #EEF3FE;
+  --tool-bg: #F2F4F8;
+  --bg-subtle: rgba(56,58,66,0.04);
+  --status-error: #E45649;
+  --status-success: #50A14F;
+  --status-warning: #C18401;
+  --status-modified: #986801;
+  --status-renamed: #4078F2;
+  --on-accent: #FFFFFF;
+  --overlay-backdrop: color-mix(in srgb, var(--text) 24%, transparent);
+}
+
+/* Catppuccin Latte palette. */
+html[data-theme="catppuccin-latte"], html.theme-catppuccin-latte {
+  color-scheme: light;
+  --bg: #EFF1F5;
+  --bg-panel: #E6E9EF;
+  --bg-hover: #DCE0E8;
+  --bg-selected: #CCD0DA;
+  --border: #BCC0CC;
+  --text: #4C4F69;
+  --text-muted: #65687E;
+  --text-dim: #8C8FA1;
+  --accent: #1E66F5;
+  --accent-strong: #1E66F5;
+  --accent-hover: #04A5E5;
+  --user-bg: #E4E8F8;
+  --tool-bg: #E6E9EF;
+  --bg-subtle: rgba(76,79,105,0.05);
+  --status-error: #D20F39;
+  --status-success: #40A02B;
+  --status-warning: #DF8E1D;
+  --status-modified: #FE640B;
+  --status-renamed: #1E66F5;
+  --on-accent: #FFFFFF;
+  --overlay-backdrop: color-mix(in srgb, var(--text) 24%, transparent);
+}
+
+/* Rosé Pine Dawn palette. */
+html[data-theme="rose-pine-dawn"], html.theme-rose-pine-dawn {
+  color-scheme: light;
+  --bg: #FAF4ED;
+  --bg-panel: #FFFAF3;
+  --bg-hover: #F2E9E1;
+  --bg-selected: #DFDAD9;
+  --border: #CECACD;
+  --text: #575279;
+  --text-muted: #6E6A86;
+  --text-dim: #9893A5;
+  --accent: #286983;
+  --accent-strong: #286983;
+  --accent-hover: #1F5469;
+  --user-bg: #F5EDE8;
+  --tool-bg: #FFFBF5;
+  --bg-subtle: rgba(87,82,121,0.05);
+  --status-error: #B4637A;
+  --status-success: #286983;
+  --status-warning: #EA9D34;
+  --status-modified: #D7827E;
+  --status-renamed: #907AA9;
+  --on-accent: #FFFFFF;
+  --overlay-backdrop: color-mix(in srgb, var(--text) 24%, transparent);
+}
+
+/* Dracula palette. */
+html[data-theme="dracula"], html.theme-dracula {
+  color-scheme: dark;
+  --bg: #282A36;
+  --bg-panel: #21222C;
+  --bg-hover: #343746;
+  --bg-selected: #44475A;
+  --border: #44475A;
+  --text: #F8F8F2;
+  --text-muted: #B4B8D0;
+  --text-dim: #6272A4;
+  --accent: #FF79C6;
+  --accent-strong: #BD93F9;
+  --accent-hover: #FFA2D8;
+  --user-bg: #2E303E;
+  --tool-bg: #21222C;
+  --bg-subtle: rgba(248,248,242,0.05);
+  --status-error: #FF5555;
+  --status-success: #50FA7B;
+  --status-warning: #FFB86C;
+  --status-modified: #F1FA8C;
+  --status-renamed: #8BE9FD;
+  --on-accent: #282A36;
+  --overlay-backdrop: color-mix(in srgb, var(--text) 24%, transparent);
+  --shadow-card: 0 1px 2px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.05);
+  --shadow-pop: 0 2px 8px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.06);
+  --shadow-modal: 0 8px 32px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.08);
+}
+
+/* Harbor palette. */
+html[data-theme="harbor"], html.theme-harbor {
+  color-scheme: dark;
+  --bg: #1B1B1B;
+  --bg-panel: #242424;
+  --bg-hover: #2E2E2E;
+  --bg-selected: #383838;
+  --border: #3D3D3D;
+  --text: #EFEBDC;
+  --text-muted: #C0B8A0;
+  --text-dim: #817F68;
+  --accent: #E75A50;
+  --accent-strong: #D2483E;
+  --accent-hover: #F0736A;
+  --user-bg: #262120;
+  --tool-bg: #202020;
+  --bg-subtle: rgba(239,235,220,0.05);
+  --status-error: #F44336;
+  --status-success: #77838A;
+  --status-warning: #E1CE98;
+  --status-modified: #DC8164;
+  --status-renamed: #E58980;
+  --on-accent: #FFFFFF;
+  --overlay-backdrop: color-mix(in srgb, var(--text) 24%, transparent);
+  --shadow-card: 0 1px 2px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.05);
+  --shadow-pop: 0 2px 8px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.06);
+  --shadow-modal: 0 8px 32px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.08);
+}
+
+/* One Dark Pro palette. */
+html[data-theme="one-dark-pro"], html.theme-one-dark-pro {
+  color-scheme: dark;
+  --bg: #282C34;
+  --bg-panel: #21252B;
+  --bg-hover: #2C313C;
+  --bg-selected: #3E4451;
+  --border: #3A3F4B;
+  --text: #ABB2BF;
+  --text-muted: #8B94A5;
+  --text-dim: #5C6370;
+  --accent: #61AFEF;
+  --accent-strong: #4D8CD6;
+  --accent-hover: #7EC7FF;
+  --user-bg: #232731;
+  --tool-bg: #1E2227;
+  --bg-subtle: rgba(171,178,191,0.05);
+  --status-error: #E06C75;
+  --status-success: #98C379;
+  --status-warning: #E5C07B;
+  --status-modified: #D19A66;
+  --status-renamed: #61AFEF;
+  --on-accent: #FFFFFF;
+  --overlay-backdrop: color-mix(in srgb, var(--text) 24%, transparent);
+  --shadow-card: 0 1px 2px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.04);
+  --shadow-pop: 0 2px 8px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.05);
+  --shadow-modal: 0 8px 32px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.07);
+}
+
+/* Rosé Pine palette. */
+html[data-theme="rose-pine"], html.theme-rose-pine {
+  color-scheme: dark;
+  --bg: #191724;
+  --bg-panel: #1F1D2E;
+  --bg-hover: #26233A;
+  --bg-selected: #403D52;
+  --border: #393552;
+  --text: #E0DEF4;
+  --text-muted: #908CAA;
+  --text-dim: #6E6A86;
+  --accent: #EBBCBA;
+  --accent-strong: #C4A7E7;
+  --accent-hover: #F2CECC;
+  --user-bg: #232033;
+  --tool-bg: #1D1A2B;
+  --bg-subtle: rgba(224,222,244,0.05);
+  --status-error: #EB6F92;
+  --status-success: #9CCFD8;
+  --status-warning: #F6C177;
+  --status-modified: #EBBCBA;
+  --status-renamed: #C4A7E7;
+  --on-accent: #191724;
+  --overlay-backdrop: color-mix(in srgb, var(--text) 24%, transparent);
+  --shadow-card: 0 1px 2px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04);
+  --shadow-pop: 0 2px 8px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.05);
+  --shadow-modal: 0 8px 32px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.07);
+}
+
+/* Catppuccin Mocha palette. */
+html[data-theme="catppuccin-mocha"], html.theme-catppuccin-mocha {
+  color-scheme: dark;
+  --bg: #1E1E2E;
+  --bg-panel: #181825;
+  --bg-hover: #262638;
+  --bg-selected: #313244;
+  --border: #45475A;
+  --text: #CDD6F4;
+  --text-muted: #A6ADC8;
+  --text-dim: #6C7086;
+  --accent: #CBA6F7;
+  --accent-strong: #B4BEFE;
+  --accent-hover: #D8BCF9;
+  --user-bg: #252438;
+  --tool-bg: #181825;
+  --bg-subtle: rgba(205,214,244,0.05);
+  --status-error: #F38BA8;
+  --status-success: #A6E3A1;
+  --status-warning: #F9E2AF;
+  --status-modified: #FAB387;
+  --status-renamed: #89B4FA;
+  --on-accent: #11111B;
+  --overlay-backdrop: color-mix(in srgb, var(--text) 24%, transparent);
+  --shadow-card: 0 1px 2px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04);
+  --shadow-pop: 0 2px 8px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.05);
+  --shadow-modal: 0 8px 32px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.07);
+}
+
+/* Gruvbox Dark palette. */
+html[data-theme="gruvbox-dark"], html.theme-gruvbox-dark {
+  color-scheme: dark;
+  --bg: #282828;
+  --bg-panel: #1D2021;
+  --bg-hover: #32302F;
+  --bg-selected: #3C3836;
+  --border: #504945;
+  --text: #EBDBB2;
+  --text-muted: #BDAE93;
+  --text-dim: #928374;
+  --accent: #FE8019;
+  --accent-strong: #D65D0E;
+  --accent-hover: #FF9C42;
+  --user-bg: #322D29;
+  --tool-bg: #202020;
+  --bg-subtle: rgba(235,219,178,0.05);
+  --status-error: #FB4934;
+  --status-success: #B8BB26;
+  --status-warning: #FABD2F;
+  --status-modified: #D3869B;
+  --status-renamed: #83A598;
+  --on-accent: #FFFFFF;
+  --overlay-backdrop: color-mix(in srgb, var(--text) 24%, transparent);
+  --shadow-card: 0 1px 2px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04);
+  --shadow-pop: 0 2px 8px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.05);
+  --shadow-modal: 0 8px 32px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.07);
+}
+
+/* Nord palette. */
+html[data-theme="nord"], html.theme-nord {
+  color-scheme: dark;
+  --bg: #2E3440;
+  --bg-panel: #272C36;
+  --bg-hover: #3B4252;
+  --bg-selected: #434C5E;
+  --border: #4C566A;
+  --text: #ECEFF4;
+  --text-muted: #D8DEE9;
+  --text-dim: #8892B0;
+  --accent: #88C0D0;
+  --accent-strong: #5E81AC;
+  --accent-hover: #9BD6E6;
+  --user-bg: #343B4A;
+  --tool-bg: #262B35;
+  --bg-subtle: rgba(236,239,244,0.05);
+  --status-error: #BF616A;
+  --status-success: #A3BE8C;
+  --status-warning: #EBCB8B;
+  --status-modified: #D08770;
+  --status-renamed: #81A1C1;
+  --on-accent: #2E3440;
+  --overlay-backdrop: color-mix(in srgb, var(--text) 24%, transparent);
+  --shadow-card: 0 1px 2px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.04);
+  --shadow-pop: 0 2px 8px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.05);
+  --shadow-modal: 0 8px 32px rgba(0,0,0,0.65), 0 0 0 1px rgba(255,255,255,0.07);
+}
+
+/* Tokyo Night palette. */
+html[data-theme="tokyo-night"], html.theme-tokyo-night {
+  color-scheme: dark;
+  --bg: #1A1B26;
+  --bg-panel: #16161E;
+  --bg-hover: #24283B;
+  --bg-selected: #283457;
+  --border: #2F354D;
+  --text: #C0CAF5;
+  --text-muted: #9AA5CE;
+  --text-dim: #565F89;
+  --accent: #7AA2F7;
+  --accent-strong: #567ECC;
+  --accent-hover: #8DB4FF;
+  --user-bg: #222538;
+  --tool-bg: #161620;
+  --bg-subtle: rgba(192,202,245,0.05);
+  --status-error: #F7768E;
+  --status-success: #9ECE6A;
+  --status-warning: #E0AF68;
+  --status-modified: #FF9E64;
+  --status-renamed: #7DCFFF;
+  --on-accent: #FFFFFF;
+  --overlay-backdrop: color-mix(in srgb, var(--text) 24%, transparent);
+  --shadow-card: 0 1px 2px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.04);
+  --shadow-pop: 0 2px 8px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.05);
+  --shadow-modal: 0 8px 32px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.07);
 }
 
 /* Shape / elevation / motion tokens (warm-humanistic system). */

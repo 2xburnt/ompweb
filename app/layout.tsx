@@ -79,7 +79,7 @@ export default function RootLayout({
             of the wrong theme. Matches html.dark / html.omp selectors in globals.css. */}
         <script
           dangerouslySetInnerHTML={{
-            __html: `(function(){try{var t=localStorage.getItem("omp-theme"),d=matchMedia("(prefers-color-scheme: dark)").matches;if(t==="omp"||!t||t==="system"){document.documentElement.classList.add("omp")}else if(t==="dark"||(t!=="light"&&d))document.documentElement.classList.add("dark")}catch(e){}})();`,
+            __html: `(function(){try{var t=localStorage.getItem("omp-theme"),d=matchMedia("(prefers-color-scheme: dark)").matches;var dt={"dark":1,"omp":1,"dracula":1,"harbor":1,"one-dark-pro":1,"rose-pine":1,"catppuccin-mocha":1,"gruvbox-dark":1,"nord":1,"tokyo-night":1};var lt={"light":1,"one-light":1,"catppuccin-latte":1,"rose-pine-dawn":1};var res=t==="system"?(d?"dark":"light"):(!t?"omp":t);if(!dt[res]&&!lt[res]&&res!=="omp")res="omp";var dark=!!dt[res]&&res!=="omp";if(dark)document.documentElement.classList.add("dark");if(res==="omp"){document.documentElement.classList.add("omp")}else{document.documentElement.classList.add("theme-"+res)}document.documentElement.setAttribute("data-theme",res);}catch(e){}})();`,
           }}
         />
         <script
