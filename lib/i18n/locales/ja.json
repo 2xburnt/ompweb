@@ -656,6 +656,7 @@
   "messageView.noMessage": "（メッセージなし）",
   "messageView.noOutput": "（出力なし）",
   "messageView.noSummary": "（要約なし）",
+  "messageView.interruptedByUser": "ユーザーによって停止されました",
   "messageView.readFiles": "読み取ったファイル",
   "messageView.responseError": "応答エラー",
   "messageView.showDetails": "詳細を表示",

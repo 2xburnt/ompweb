@@ -8,7 +8,7 @@ const jiti = createJiti(import.meta.url, {
   jsx: { runtime: "automatic" },
   tsconfigPaths: true,
 });
-const { MessageView, SafeMarkdownBody, TaskResultPanel } = await jiti.import("./MessageView.tsx");
+const { MessageView, SafeMarkdownBody, TaskResultPanel, isInterruptedMessage } = await jiti.import("./MessageView.tsx");
 const { CodeBlock } = await jiti.import("./MermaidBlock.tsx");
 
 test("large message content avoids the markdown pipeline until requested", () => {
@@ -246,4 +246,69 @@ test("todo tool calls render clean status badge with action and task name", () =
   assert.match(html, /tool-call-todo-badge/);
   assert.match(html, /Completed/);
   assert.match(html, /Build redesigned component/);
+});
+
+test("isInterruptedMessage identifies user interruptions accurately", () => {
+  assert.equal(isInterruptedMessage("Interrupted by user"), true);
+  assert.equal(isInterruptedMessage("interrupted by user"), true);
+  assert.equal(isInterruptedMessage("Interrupted"), true);
+  assert.equal(isInterruptedMessage("Request aborted"), true);
+  assert.equal(isInterruptedMessage("Aborted"), true);
+  assert.equal(isInterruptedMessage(null, "aborted"), true);
+  assert.equal(isInterruptedMessage("Generation stopped by user"), true);
+  assert.equal(isInterruptedMessage("429 Too Many Requests"), false);
+  assert.equal(isInterruptedMessage("Provider connection failed"), false);
+  assert.equal(isInterruptedMessage(null), false);
+});
+
+test("interrupted assistant message renders user-friendly status badge without responseError prefix", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    toolCallsDefaultCollapsed: false,
+    message: {
+      role: "assistant",
+      errorMessage: "Interrupted by user",
+      content: [],
+    },
+  }));
+
+  assert.match(html, /role="status"/);
+  assert.match(html, /Generation stopped by user/);
+  assert.doesNotMatch(html, /messageView\.responseError/);
+  assert.doesNotMatch(html, /Response error/);
+  assert.doesNotMatch(html, /role="alert"/);
+});
+
+test("actual error assistant message renders alert badge without responseError prefix", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    toolCallsDefaultCollapsed: false,
+    message: {
+      role: "assistant",
+      errorMessage: "429 Too Many Requests: Rate limit exceeded",
+      content: [],
+    },
+  }));
+
+  assert.match(html, /role="alert"/);
+  assert.match(html, /429 Too Many Requests: Rate limit exceeded/);
+  assert.doesNotMatch(html, /messageView\.responseError/);
+  assert.doesNotMatch(html, /Response error:/);
+});
+
+test("interrupted message with partial content renders content before interrupted badge", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    toolCallsDefaultCollapsed: false,
+    message: {
+      role: "assistant",
+      errorMessage: "Interrupted by user",
+      content: [
+        { type: "text", text: "Partial generated response text" },
+      ],
+    },
+  }));
+
+  const contentIdx = html.indexOf("Partial generated response text");
+  const statusIdx = html.indexOf("Generation stopped by user");
+  assert.ok(contentIdx !== -1, "partial content must be rendered");
+  assert.ok(statusIdx !== -1, "status badge must be rendered");
+  assert.ok(contentIdx < statusIdx, "content must precede the interrupted status badge");
 });

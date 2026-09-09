@@ -684,6 +684,7 @@
   "messageView.noMessage": "(no message)",
   "messageView.noOutput": "(no output)",
   "messageView.noSummary": "(no summary)",
+  "messageView.interruptedByUser": "Generation stopped by user",
   "messageView.readFiles": "Read files",
   "messageView.responseError": "Response error",
   "messageView.showDetails": "Show details",
