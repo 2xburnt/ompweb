@@ -2014,30 +2014,30 @@ html.dark .dropdown-surface :is(select, option) {
 /* Collapsible "Process details" row: quiet when collapsed, subtle hover,
    small chevron that flips when expanded. */
 .process-details-toggle {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   width: auto;
-  min-height: 24px;
-  padding: 2px 8px;
-  margin-left: -8px;
+  min-height: 22px;
+  padding: 2px 0;
+  margin: 0;
   border: none;
-  border-radius: 6px;
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
   font: inherit;
-  font-size: 12px;
+  font-size: 11.5px;
+  font-weight: 500;
   text-align: left;
-  transition: background var(--dur-fast) var(--ease-out-warm), color var(--dur-fast) var(--ease-out-warm);
+  transition: color var(--dur-fast) var(--ease-out-warm);
 }
 .process-details-toggle:hover {
-  background: var(--bg-hover);
   color: var(--text);
 }
 .process-details-toggle:focus-visible {
   outline: 2px solid var(--accent);
-  outline-offset: 0;
+  outline-offset: 2px;
+  border-radius: 3px;
 }
 .process-details-label {
   min-width: 0;
@@ -2181,6 +2181,165 @@ html.dark .dropdown-surface :is(select, option) {
 .tool-call-output-error .tool-call-output-text {
   color: var(--status-error);
 }
+
+/* Activity group container for consecutive tool operations (unboxed, borderless) */
+.activity-group {
+  min-width: 0;
+  max-width: 760px;
+  margin: 1px 0;
+  border: 0;
+  background: transparent;
+}
+.activity-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 22px;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11.5px;
+  text-align: left;
+  transition: color var(--dur-fast) var(--ease-out-warm);
+}
+.activity-group-header:hover {
+  color: var(--text);
+}
+.activity-group-header:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+.activity-group-icon-cluster {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.activity-group-summary {
+  font-weight: 500;
+  color: inherit;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1 1 auto;
+}
+.activity-group-body {
+  border: 0;
+  border-left: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  background: transparent;
+  padding: 2px 0 2px 12px;
+  margin-left: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.activity-group-item {
+  min-width: 0;
+}
+.activity-group-item-trigger {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  min-height: 22px;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 1.35;
+  text-align: left;
+  transition: color var(--dur-fast) var(--ease-out-warm);
+}
+.activity-group-item-trigger:hover {
+  color: var(--text);
+}
+.activity-tool-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+.activity-file-link {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+  text-underline-offset: 2px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.activity-file-link:hover {
+  color: var(--accent);
+  text-decoration-color: var(--accent);
+}
+.tool-call-todo-badge {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  font-size: 11px;
+}
+.todo-op-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  background: color-mix(in srgb, var(--accent) 15%, var(--bg));
+  color: var(--accent);
+}
+.todo-op-tag.todo-op-done {
+  background: color-mix(in srgb, var(--status-success) 15%, var(--bg));
+  color: var(--status-success);
+}
+.todo-op-tag.todo-op-start {
+  background: color-mix(in srgb, var(--status-renamed) 15%, var(--bg));
+  color: var(--status-renamed);
+}
+.todo-task-name {
+  color: var(--text);
+  font-weight: 500;
+}
+.thinking-details {
+  width: min(calc(100% - 21px), 760px);
+  margin: 3px 0 4px 21px;
+}
+.thinking-output {
+  padding: 8px 12px;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-muted);
+  border-left: 2px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  background: var(--bg-subtle);
+  border-radius: 0 var(--radius-control) var(--radius-control) 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.thinking-output-error {
+  color: var(--status-error);
+  border-left-color: var(--status-error);
+}
 .tabbar-scroll {
   border-bottom: 1px solid var(--border);
   scrollbar-width: thin;
@@ -2303,7 +2462,7 @@ html.dark .dropdown-surface :is(select, option) {
     flex-shrink: 0;
   }
   .right-panel-container.right-panel-open {
-    width: 42%;
+    width: var(--right-panel-width, 42%);
     min-width: 300px;
   }
   .right-panel-container.right-panel-closed {
@@ -2315,6 +2474,15 @@ html.dark .dropdown-surface :is(select, option) {
   .right-panel-container > * {
     width: 42vw;
     min-width: 300px;
+  }
+  /* user-chosen pixel width: content follows the container instead */
+  .right-panel-container.right-panel-custom-width > * {
+    width: 100%;
+    min-width: 0;
+  }
+  /* no easing while the user drags the resize handle */
+  .right-panel-container.right-panel-resizing {
+    transition: none;
   }
 }
 
