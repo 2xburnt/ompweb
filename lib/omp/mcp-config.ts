@@ -183,9 +183,12 @@ function projectRoot(cwd: string): string {
   if (cached && cached.expiresAt > Date.now()) return cached.root;
   let root: string;
   try {
-    root = resolve(execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"] }).trim());
+    root = resolve(execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", windowsHide: true, stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 }).trim());
   } catch {
-    root = resolve(cwd);
+    // Transient git failure (hang, timeout, sick mount): fall back to the cwd
+    // but do NOT cache it — a cached fallback would aim MCP reads/writes at
+    // the wrong directory for the full TTL instead of retrying git next call.
+    return resolve(cwd);
   }
   if (projectRootCache.size > 500) projectRootCache.clear();
   projectRootCache.set(cwd, { root, expiresAt: Date.now() + PROJECT_ROOT_TTL_MS });
