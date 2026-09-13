@@ -17,6 +17,7 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 - Keep composer controls on one line, with equally sized Send, Stop, and Queue buttons and model names truncating before short effort labels.
 - Align the + button and primary action with matching composer insets.
 - Clearly dim Attach files while the agent is running; queued messages remain text-only.
+- Recover saved responses before reporting an empty agent reply after returning to a backgrounded page or PWA. Preserve provider errors and distinguish new runs from older answers.
 
 ---
 
