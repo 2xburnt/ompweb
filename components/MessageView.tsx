@@ -3,6 +3,7 @@
 import { memo, useState, useId, useRef, useEffect, useMemo, useCallback, type ComponentProps } from "react";
 import { Copy, Check, GitFork, CornerUpLeft, ChevronRight, ChevronDown, Brain, EyeOff, CircleAlert, CircleSlash, LoaderCircle, FileText, Search, FileEdit, Terminal, CheckSquare, Bot, Code2, Globe, MessagesSquare, Wrench } from "lucide-react";
 import { MarkdownBody } from "./MarkdownBody";
+import { MessageCopyActions } from "./MessageCopyActions";
 import { ClickableImage } from "./ImageLightbox";
 import { translate, useI18n, type Locale } from "@/lib/i18n";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
@@ -303,7 +304,7 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
   onEditContent?: (content: string) => void;
 }) {
   const { t, locale } = useI18n();
-  const { copied, copy: copyContent } = useCopyFeedback();
+  const bodyRef = useRef<HTMLDivElement>(null);
 
   const content =
     typeof message.content === "string"
@@ -329,6 +330,7 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
       <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", maxWidth: "85%", minWidth: 0 }}>
         <div
           className="chat-message-card"
+          ref={bodyRef}
           data-selection-scope="message"
           tabIndex={-1}
           style={{
@@ -364,7 +366,7 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
               })}
             </div>
           )}
-          {content && <SafeMarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{content}</SafeMarkdownBody>}
+          {content && <div data-message-text><SafeMarkdownBody className="markdown-user-message" cwd={cwd} onOpenFile={onOpenFile}>{content}</SafeMarkdownBody></div>}
         </div>
 
         {/* Bottom row: action buttons + timestamp — inside the bubble's column,
@@ -373,34 +375,7 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
             display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end",
             gap: 6, marginTop: 3, width: "100%",
           }}>
-          <div
-            style={{
-              display: "flex", gap: 3,
-            }}
-          >
-            <Tooltip content={t("messageView.copyMessage")}>
-              <button
-                onClick={() => copyContent(content)}
-                aria-label={t("messageView.copyMessage")}
-                style={{
-                  display: "flex", alignItems: "center", gap: 4,
-                  padding: "3px 8px", height: 24, minHeight: 24,
-                  background: "none", border: "none",
-                  borderRadius: 5,
-                  color: copied ? "var(--accent)" : "var(--text-dim)",
-                  cursor: "pointer",
-                  fontSize: 11, fontWeight: 400,
-                  whiteSpace: "nowrap",
-                  transition: "color var(--dur-fast) var(--ease-out-warm)",
-                }}
-                onMouseEnter={(e) => { if (!copied) e.currentTarget.style.color = "var(--accent)"; }}
-                onMouseLeave={(e) => { if (!copied) e.currentTarget.style.color = "var(--text-dim)"; }}
-              >
-                {copied ? <Check size={11} strokeWidth={1.8} /> : <Copy size={11} strokeWidth={1.8} />}
-                {copied ? t("messageView.copied") : t("messageView.copy")}
-              </button>
-            </Tooltip>
-          </div>
+          <MessageCopyActions texts={[content]} bodyRef={bodyRef} />
           {(canFork || canNavigate) && (
             <div
               style={{
@@ -508,6 +483,8 @@ function AssistantMessageView({
 }) {
   const { t, locale } = useI18n();
   const time = showTimestamp ? formatTime(message.timestamp, locale) : null;
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const texts = (message.content ?? []).filter((block): block is TextContent => block.type === "text").map((block) => block.text);
   const blockItems = (message.content ?? [])
     .map((block, originalIndex) => ({ block, originalIndex }))
     .filter(({ block }) => !isEmptyThinkingBlock(block, { isStreaming }));
@@ -651,7 +628,7 @@ function AssistantMessageView({
         })()}
       </div>
 
-      <div data-selection-scope="message" tabIndex={-1} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+      <div ref={bodyRef} data-selection-scope="message" tabIndex={-1} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
         {groupAdjacentBlocks(blockItems).map((group, groupIdx) => {
           if (group.type === "single") {
             const { block, originalIndex } = group.item;
@@ -729,9 +706,10 @@ function AssistantMessageView({
         )}
       </div>
 
-      {time && !isStreaming && (
-        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 3 }}>
-          <span style={{ fontSize: 10, color: "var(--text-dim)" }}>{time}</span>
+      {!isStreaming && (texts.some((text) => text.trim()) || time) && (
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "space-between", gap: 6, marginTop: 3 }}>
+          <MessageCopyActions texts={texts} bodyRef={bodyRef} />
+          {time && <span style={{ fontSize: 10, color: "var(--text-dim)", marginLeft: "auto" }}>{time}</span>}
         </div>
       )}
     </div>
@@ -760,7 +738,7 @@ function BlockView({ block, toolResults, isStreaming, streamingDuration, toolCal
 // skip their ReactMarkdown re-parse and only the actively growing block
 // re-renders per frame.
 const TextBlock = memo(function TextBlock({ block, isStreaming, cwd, onOpenFile }: { block: TextContent; isStreaming?: boolean; cwd?: string; onOpenFile?: (filePath: string) => void }) {
-  return <SafeMarkdownBody isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile}>{block.text}</SafeMarkdownBody>;
+  return <div data-message-text><SafeMarkdownBody isStreaming={isStreaming} cwd={cwd} onOpenFile={onOpenFile}>{block.text}</SafeMarkdownBody></div>;
 }, (prev, next) => (
   prev.block.text === next.block.text
   && prev.isStreaming === next.isStreaming

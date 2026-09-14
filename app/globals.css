@@ -2664,6 +2664,35 @@ html.dark .dropdown-surface :is(select, option) {
   animation: chat-message-in var(--dur-med) var(--ease-out-warm) both;
 }
 
+.message-copy-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px;
+}
+.message-copy-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 3px 8px;
+  border: none;
+  border-radius: var(--radius-control);
+  background: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.message-copy-action:hover {
+  color: var(--accent);
+  background: var(--bg-hover);
+}
+@media (pointer: coarse) {
+  .message-copy-action {
+    min-height: 44px;
+  }
+}
+
 @keyframes toast-in {
   from { opacity: 0; transform: translate3d(18px, 8px, 0) scale(0.97); }
   to   { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }

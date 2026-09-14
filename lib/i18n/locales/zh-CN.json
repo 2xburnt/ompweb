@@ -643,6 +643,7 @@
   "messageView.copied": "已复制",
   "messageView.copy": "复制",
   "messageView.copyMessage": "复制消息",
+  "messageView.copyMarkdown": "复制为 Markdown",
   "messageView.largeMessageReveal": "大消息（{size}）。以纯文本显示",
   "messageView.creating": "创建中...",
   "messageView.creatingSession": "正在创建会话...",

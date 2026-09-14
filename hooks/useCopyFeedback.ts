@@ -8,14 +8,14 @@ import { copyText } from "@/lib/clipboard";
  * previously inlined the same state + timer dance. */
 export function useCopyFeedback(): { copied: boolean; copy: (text: string) => void } {
   const [copied, setCopied] = useState(false);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const mountedRef = useRef(true);
 
   const copy = useCallback((text: string) => {
     copyText(text).then(() => {
       if (!mountedRef.current) return;
       setCopied(true);
-      if (timerRef.current) clearTimeout(timerRef.current);
+      clearTimeout(timerRef.current);
       timerRef.current = setTimeout(() => setCopied(false), 1500);
     }).catch(() => {
       // Clipboard denied (permissions, unfocused document): stay silent —
@@ -23,9 +23,12 @@ export function useCopyFeedback(): { copied: boolean; copy: (text: string) => vo
     });
   }, []);
 
-  useEffect(() => () => {
-    mountedRef.current = false;
-    if (timerRef.current) clearTimeout(timerRef.current);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      clearTimeout(timerRef.current);
+    };
   }, []);
 
   return { copied, copy };

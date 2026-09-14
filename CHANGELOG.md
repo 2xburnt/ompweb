@@ -8,11 +8,13 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ### Added
 
+- Add **Copy** and **Copy as Markdown** below user messages and completed assistant replies, with keyboard access and touch-sized controls. Copy only message text, excluding thinking, tool output, and renderer controls; preserve full source for oversized raw-text messages.
 - Scope Ctrl+A / Cmd+A to the selected message, currently loaded chat, or active file contents instead of the whole page. Message selection includes collapsed extension previews and expanded details without toolbar labels. Newer pane focus takes precedence over retained child selections. Text fields and IME composition retain native behavior; browser-menu commands and embedded viewers remain browser-controlled.
 - Add an off-by-default **Scope native Select All (experimental)** switch in Settings → Interface & Behavior. The per-browser preference narrows whole-page selections from native menus while leaving keyboard scoping independent. Disable it if browser selection handles or menus behave unexpectedly; intentional whole-page selections can also be narrowed.
 
 ### Fixes & Improvements
 
+- Restore copy-success feedback after React Strict Mode re-runs effect setup.
 - Keep sent-message copy, edit, and fork actions visible without hover or a reveal tap. Also keep file mention/download, Git open-file actions, and sidebar menus visible alongside their metadata; wrap message actions on narrow screens.
 - Expand complete tool inputs inline, including multiline code and edit patches, while keeping command previews compact and output visibility unchanged.
 - Keep composer controls on one line, with equally sized Send, Stop, and Queue buttons and model names truncating before short effort labels.

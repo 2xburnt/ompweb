@@ -643,6 +643,7 @@
   "messageView.copied": "コピーしました",
   "messageView.copy": "コピー",
   "messageView.copyMessage": "メッセージをコピー",
+  "messageView.copyMarkdown": "Markdownとしてコピー",
   "messageView.largeMessageReveal": "大きなメッセージ（{size}）。プレーンテキストで表示",
   "messageView.creating": "作成中...",
   "messageView.creatingSession": "セッションを作成中...",
