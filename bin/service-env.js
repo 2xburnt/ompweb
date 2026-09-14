@@ -1,10 +1,8 @@
 "use strict";
 
 // Shared systemd EnvironmentFile helpers for the ompweb Linux service.
-//
-// The service reads runtime configuration from
-// ~/.omp/agent/web-service.env (KEY=value, shell-style quoting) so the tray
-// and CLI can change port/hostname/password without regenerating the unit.
+// Runtime settings live in ~/.omp/agent/web-service.env so changing the
+// port, bind address, or password does not require regenerating the unit.
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const fs = require("node:fs");
@@ -14,14 +12,16 @@ const os = require("node:os");
 const path = require("node:path");
 
 function getServiceEnvPath(home = os.homedir()) {
-  const ompDir = process.env.PI_CODING_AGENT_DIR?.replace(/^~(?=\/|$)/, home);
-  if (ompDir) return path.join(ompDir, "web-service.env");
-  return path.join(home, ".omp", "agent", "web-service.env");
+  const configuredDir = process.env.PI_CODING_AGENT_DIR?.replace(/^~(?=\/|$)/, home);
+  return path.join(configuredDir || path.join(home, ".omp", "agent"), "web-service.env");
 }
 
-// Escape a value for a double-quoted assignment (systemd env-file quoting).
+// Escape a value for a double-quoted systemd env-file assignment.
 function escapeEnvValue(value) {
-  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, " ");
+  return String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r?\n/g, " ");
 }
 
 function serializeServiceEnv(entries) {
@@ -32,17 +32,21 @@ function serializeServiceEnv(entries) {
   );
 }
 
-// Parse KEY="value" lines; tolerates comments, blanks, and unquoted values.
+// Parse KEY="value" lines. Tolerate comments, blank lines, and unquoted
+// values so the file can also be edited by hand.
 function parseServiceEnv(text) {
   const entries = {};
   for (const rawLine of String(text ?? "").split("\n")) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#") || line.startsWith(";")) continue;
-    const eq = line.indexOf("=");
-    if (eq <= 0) continue;
-    const key = line.slice(0, eq).trim();
+
+    const separator = line.indexOf("=");
+    if (separator <= 0) continue;
+
+    const key = line.slice(0, separator).trim();
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-    let value = line.slice(eq + 1).trim();
+
+    let value = line.slice(separator + 1).trim();
     const quoted = value.length >= 2 && value.startsWith('"') && value.endsWith('"');
     if (quoted) value = value.slice(1, -1);
     entries[key] = value.replace(/\\(["\\])/g, "$1");
@@ -58,7 +62,7 @@ function readServiceEnv(envPath = getServiceEnvPath()) {
   }
 }
 
-// Atomic write (temp file + rename), user-readable only: holds the password.
+// Atomic write, user-readable only: this file may contain the web password.
 function writeServiceEnv(entries, envPath = getServiceEnvPath()) {
   fs.mkdirSync(path.dirname(envPath), { recursive: true });
   const temporary = `${envPath}.${process.pid}.tmp`;

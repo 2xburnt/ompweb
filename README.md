@@ -124,15 +124,26 @@ Install ompweb as a systemd **user** service that starts at login and restarts
 on crash:
 
 ```bash
-npx --yes @kahme247/ompweb@latest ompweb-systemd install
+npx --yes --package=@kahme247/ompweb@latest ompweb-systemd install
+```
+The installer creates `~/.omp/agent/web-service.env` automatically with mode
+`600`; no manual file creation is required. The explicit `--package` form makes
+`npx` run the systemd executable from the selected package.
+
+To bind the service to all IPv4 interfaces for LAN access, set a password while
+installing:
+
+```bash
+OMP_WEB_HOSTNAME=0.0.0.0 OMP_WEB_PASSWORD='change-me' \
+  npx --yes --package=@kahme247/ompweb@latest ompweb-systemd install
 ```
 
 Manage it with:
 
 ```bash
-npx --yes @kahme247/ompweb@latest ompweb-systemd status    # Show service state
-npx --yes @kahme247/ompweb@latest ompweb-systemd restart   # start / stop / restart
-npx --yes @kahme247/ompweb@latest ompweb-systemd uninstall # Stop and remove
+npx --yes --package=@kahme247/ompweb@latest ompweb-systemd status    # Show service state
+npx --yes --package=@kahme247/ompweb@latest ompweb-systemd restart   # start / stop / restart
+npx --yes --package=@kahme247/ompweb@latest ompweb-systemd uninstall # Stop and remove
 ```
 
 The service runs the locally installed `ompweb` binary resolved at install time
@@ -146,6 +157,13 @@ journal:
 
 ```bash
 journalctl --user -u ompweb -f
+```
+
+On a headless server, enable user lingering if the service must keep running
+after the last login session ends:
+
+```bash
+loginctl enable-linger "$USER"
 ```
 
 ### Linux System Tray (KDE Plasma and compatible)

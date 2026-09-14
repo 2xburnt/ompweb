@@ -9,25 +9,28 @@ if (!isNodeVersionSupported(process.versions.node)) {
   process.exit(1);
 }
 
-// Forward `ompweb ompweb-launchd [args]` → bin/omp-web-launchd.js so that
-// `npx @kahme247/ompweb@latest ompweb-launchd install` works without `-p`.
-if (process.argv[2] === "ompweb-launchd" || process.argv[2] === "launchd") {
+// Forward service subcommands from the main bin. This makes both
+// `npx @kahme247/ompweb@latest ompweb-launchd ...` and
+// `npx @kahme247/ompweb@latest ompweb-systemd ...` work without requiring
+// callers to know the path of the secondary executable.
+const forwardedServiceScripts = {
+  launchd: "omp-web-launchd.js",
+  "ompweb-launchd": "omp-web-launchd.js",
+  systemd: "omp-web-systemd.js",
+  "ompweb-systemd": "omp-web-systemd.js",
+};
+const forwardedServiceScript = forwardedServiceScripts[process.argv[2]];
+if (forwardedServiceScript) {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { spawnSync } = require("node:child_process");
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { join } = require("node:path");
-  const { status } = spawnSync(process.execPath, [join(__dirname, "omp-web-launchd.js"), ...process.argv.slice(3)], { stdio: "inherit" });
-  process.exit(status ?? 1);
-}
-
-// Forward `ompweb ompweb-systemd [args]` → bin/omp-web-systemd.js (Linux service).
-if (process.argv[2] === "ompweb-systemd" || process.argv[2] === "systemd") {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { spawnSync } = require("node:child_process");
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { join } = require("node:path");
-  const { status } = spawnSync(process.execPath, [join(__dirname, "omp-web-systemd.js"), ...process.argv.slice(3)], { stdio: "inherit" });
-  process.exit(status ?? 1);
+  const result = spawnSync(process.execPath, [join(__dirname, forwardedServiceScript), ...process.argv.slice(3)], { stdio: "inherit" });
+  if (result.error) {
+    console.error(`Failed to run ${process.argv[2]}: ${result.error.message}`);
+    process.exit(1);
+  }
+  process.exit(result.status ?? 1);
 }
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports

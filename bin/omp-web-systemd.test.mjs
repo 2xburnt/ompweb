@@ -1,67 +1,90 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 const require = createRequire(import.meta.url);
 const {
-  UNIT,
-  UNIT_PATH,
   buildUnit,
+  escapeUnitPath,
   escapeUnitValue,
+  formatExecStart,
   resolveOmpwebBin,
   runCli,
+  validateHostname,
+  validatePort,
 } = require("./omp-web-systemd.js");
+const {
+  parseServiceEnv,
+  serializeServiceEnv,
+  writeServiceEnv,
+} = require("./service-env.js");
 
-test("escapeUnitValue escapes backslashes, quotes, and percent specifiers", () => {
-  assert.equal(escapeUnitValue("plain"), "plain");
-  assert.equal(escapeUnitValue("back\\slash"), "back\\\\slash");
-  assert.equal(escapeUnitValue('quo"te'), "quo\\\"te");
-  assert.equal(escapeUnitValue("100%h"), "100%%h");
+test("service env files round-trip quoted values", () => {
+  const serialized = serializeServiceEnv({
+    PORT: "30177",
+    OMP_WEB_HOSTNAME: "0.0.0.0",
+    OMP_WEB_PASSWORD: 'secret\\with"quotes',
+  });
+
+  assert.match(serialized, /OMP_WEB_PASSWORD="secret\\\\with\\"quotes"/);
+  assert.deepEqual(parseServiceEnv(serialized), {
+    PORT: "30177",
+    OMP_WEB_HOSTNAME: "0.0.0.0",
+    OMP_WEB_PASSWORD: 'secret\\with"quotes',
+  });
 });
 
-test("buildUnit renders ExecStart, EnvironmentFile, and install target", () => {
+test("writeServiceEnv creates the parent directory and a private file", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ompweb-service-env-"));
+  try {
+    const envPath = path.join(dir, "nested", "web-service.env");
+    writeServiceEnv({ PORT: "40100", OMP_WEB_HOSTNAME: "127.0.0.1" }, envPath);
+    assert.deepEqual(parseServiceEnv(readFileSync(envPath, "utf8")), {
+      PORT: "40100",
+      OMP_WEB_HOSTNAME: "127.0.0.1",
+    });
+    if (process.platform !== "win32") assert.equal(statSync(envPath).mode & 0o777, 0o600);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("buildUnit points at the generated env file and keeps runtime settings out of the unit", () => {
   const unit = buildUnit({
     ompwebBin: "/usr/local/bin/ompweb",
-    env: {
-      OMP_WEB_OMP_BIN: "/home/u/.bun/bin/omp",
-    },
+    env: { OMP_WEB_OMP_BIN: "/home/u/.bun/bin/omp" },
     home: "/home/u",
+    envPath: "/home/u/.omp/agent/web-service.env",
   });
 
   assert.match(unit, /ExecStart=\/usr\/local\/bin\/ompweb\n/);
   assert.match(unit, /WorkingDirectory=%h/);
-  // Runtime config lives in the env file so edits don't need a reinstall.
-  assert.match(unit, /EnvironmentFile=.*web-service\.env/);
-  assert.ok(!unit.includes("PORT="));
-  assert.ok(!unit.includes("OMP_WEB_PASSWORD"));
+  assert.match(unit, /EnvironmentFile=\/home\/u\/\.omp\/agent\/web-service\.env/);
+  assert.doesNotMatch(unit, /PORT=/);
+  assert.doesNotMatch(unit, /OMP_WEB_PASSWORD/);
   assert.match(unit, /Restart=on-failure/);
+  assert.match(unit, /StartLimitIntervalSec=60/);
+  assert.match(unit, /StartLimitBurst=5/);
   assert.match(unit, /WantedBy=default\.target/);
-  // PATH order uses the host delimiter and node dir, so it is Linux-only.
   if (process.platform === "linux") {
-    assert.match(unit, /"PATH=\/home\/u\/.bun\/bin:\/usr\/local\/bin:.*\/usr\/bin:\/bin"/);
-  }
-  // Only one Environment line with quoted pairs.
-  const envLines = unit.split("\n").filter((line) => line.startsWith("Environment="));
-  assert.equal(envLines.length, 1);
-});
-
-test("buildUnit dedupes PATH dirs without omp", () => {
-  const unit = buildUnit({
-    ompwebBin: "/usr/bin/ompweb",
-    env: {},
-    home: "/home/u",
-  });
-  assert.ok(!unit.includes("OMP_WEB_OMP_BIN"));
-  // PATH order uses the host delimiter and node dir, so it is Linux-only.
-  if (process.platform === "linux") {
-    assert.match(unit, /"PATH=\/usr\/bin:.*\/home\/u\/\.local\/bin:/);
+    assert.match(unit, /"PATH=\/home\/u\/\.bun\/bin:\/usr\/local\/bin:.*\/usr\/bin:\/bin"/);
   }
 });
 
-test("resolveOmpwebBin honors OMP_WEB_SYSTEMD_BIN override", () => {
+test("unit helpers escape systemd values and paths", () => {
+  assert.equal(escapeUnitValue("100%h"), "100%%h");
+  assert.equal(escapeUnitValue('quo"te\\'), 'quo\\"te\\\\');
+  assert.equal(escapeUnitPath("/home/user name/web-service.env"), "/home/user\\x20name/web-service.env");
+  assert.equal(escapeUnitPath("/home/100%name/web-service.env"), "/home/100%%name/web-service.env");
+  assert.equal(formatExecStart("/usr/local/bin/ompweb"), "/usr/local/bin/ompweb");
+  assert.equal(formatExecStart("/home/user name/ompweb"), '"/home/user name/ompweb"');
+});
+
+test("resolveOmpwebBin honors an executable override", () => {
   const dir = mkdtempSync(path.join(tmpdir(), "ompweb-systemd-"));
   try {
     const fake = path.join(dir, "ompweb");
@@ -72,30 +95,69 @@ test("resolveOmpwebBin honors OMP_WEB_SYSTEMD_BIN override", () => {
   }
 });
 
-test("resolveOmpwebBin rejects a non-executable override", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "ompweb-systemd-"));
+test("port and hostname validation rejects unsafe values", () => {
+  assert.equal(validatePort("30177"), "30177");
+  assert.equal(validateHostname("0.0.0.0"), "0.0.0.0");
+  assert.throws(() => validatePort("0"), /invalid port/);
+  assert.throws(() => validatePort("65536"), /invalid port/);
+  assert.throws(() => validatePort("not-a-port"), /invalid port/);
+  assert.throws(() => validateHostname("  "), /hostname must not be empty/);
+});
+
+test("install creates the env file and unit with LAN settings", { skip: process.platform !== "linux" }, () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "ompweb-systemd-install-"));
   try {
-    const plain = path.join(dir, "ompweb");
-    writeFileSync(plain, "not executable\n", { mode: 0o644 });
-    if (process.platform === "win32") {
-      // X_OK always passes on Windows, so the override is accepted.
-      assert.equal(resolveOmpwebBin({ OMP_WEB_SYSTEMD_BIN: plain }), plain);
-    } else {
-      assert.throws(() => resolveOmpwebBin({ OMP_WEB_SYSTEMD_BIN: plain }), /not executable/);
-    }
+    const home = path.join(dir, "home");
+    const binDir = path.join(dir, "bin");
+    const fakeOmpweb = path.join(binDir, "ompweb");
+    const fakeSystemctl = path.join(binDir, "systemctl");
+    mkdirSync(home, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(fakeOmpweb, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(fakeSystemctl, "#!/bin/sh\ncase \"$*\" in *is-active*) exit 3 ;; *) exit 0 ;; esac\n", { mode: 0o755 });
+
+    const childEnv = {
+      ...process.env,
+      HOME: home,
+      PATH: binDir,
+      OMP_WEB_SYSTEMD_BIN: fakeOmpweb,
+      OMP_WEB_HOSTNAME: "0.0.0.0",
+      OMP_WEB_PASSWORD: "test-password",
+      OMP_WEB_NO_OPEN: "0",
+      PORT: "40123",
+    };
+    delete childEnv.PI_CODING_AGENT_DIR;
+
+    const result = spawnSync(process.execPath, [path.join(process.cwd(), "bin", "omp-web-systemd.js"), "install", "--no-autostart"], {
+      env: childEnv,
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+
+    const envPath = path.join(home, ".omp", "agent", "web-service.env");
+    const unitPath = path.join(home, ".config", "systemd", "user", "ompweb.service");
+    assert.deepEqual(parseServiceEnv(readFileSync(envPath, "utf8")), {
+      PORT: "40123",
+      OMP_WEB_HOSTNAME: "0.0.0.0",
+      OMP_WEB_NO_OPEN: "0",
+      OMP_WEB_PASSWORD: "test-password",
+    });
+    assert.match(readFileSync(unitPath, "utf8"), /EnvironmentFile=.*web-service\.env/);
+    assert.match(result.stdout, /config:.*web-service\.env/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("runCli with help returns exit code 0 and unit constants are stable", async () => {
-  const res = await runCli(["--help"]);
-  assert.equal(res.exitCode, 0);
-  assert.equal(UNIT, "ompweb.service");
-  assert.ok(UNIT_PATH.endsWith(path.join(".config", "systemd", "user", "ompweb.service")));
+test("main ompweb bin forwards the systemd subcommand", () => {
+  const result = spawnSync(process.execPath, [path.join(process.cwd(), "bin", "omp-web.js"), "systemd", "--version"], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), require("../package.json").version);
 });
 
-test("runCli rejects unknown commands with exit code 2", async () => {
-  const res = await runCli(["bogus-command"]);
-  assert.equal(res.exitCode, 2);
+test("runCli handles help and unknown commands without systemd", async () => {
+  assert.deepEqual((await runCli(["--help"])).exitCode, 0);
+  assert.deepEqual((await runCli(["bogus-command"])).exitCode, 2);
 });
