@@ -183,6 +183,31 @@ test("expanded tool calls show the compact command header", () => {
   assert.match(html, /\$<\/span><code>read foo\.ts<\/code>/);
 });
 
+test("ask tool previews question prompts instead of object coercion", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    isStreaming: true,
+    toolCallsDefaultCollapsed: true,
+    message: {
+      role: "assistant",
+      content: [{
+        type: "toolCall",
+        toolCallId: "call-ask",
+        toolName: "ask",
+        input: {
+          questions: [
+            { header: "Color", question: "Which color do you prefer?", options: [{ label: "Blue" }], multiSelect: false },
+            { header: "Features", question: "Which features should be enabled?", options: [{ label: "Search" }], multiSelect: true },
+          ],
+        },
+      }],
+    },
+  }));
+
+  assert.match(html, /Color: Which color do you prefer\?/);
+  assert.match(html, /Features: Which features should be enabled\?/);
+  assert.doesNotMatch(html, /\[object Object\]/);
+});
+
 test("expanded read output uses compact terminal text without line gutters", () => {
   const html = renderToStaticMarkup(React.createElement(MessageView, {
     isStreaming: true,

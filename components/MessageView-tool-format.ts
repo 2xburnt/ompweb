@@ -105,9 +105,43 @@ export function getHubJobsHeader(jobs: HubJobRow[]): string {
 }
 
 
+function formatToolPreviewValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
+  try {
+    return JSON.stringify(value) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function getAskPreview(input: Record<string, unknown>): string | null {
+  if (!Array.isArray(input.questions)) return null;
+
+  const prompts = input.questions
+    .filter(isRecord)
+    .map((question) => {
+      const header = typeof question.header === "string" ? question.header.trim() : "";
+      const prompt = typeof question.question === "string" ? question.question.trim() : "";
+      if (header && prompt) return `${header}: ${prompt}`;
+      return header || prompt;
+    })
+    .filter(Boolean);
+
+  if (prompts.length === 0) return input.questions.length > 0 ? `${input.questions.length} question${input.questions.length === 1 ? "" : "s"}` : "";
+  const label = prompts.length === 1 ? "Question" : `${prompts.length} questions`;
+  return `${label}: ${prompts.map((prompt) => `“${prompt}”`).join(" · ")}`;
+}
+
 export function getToolPreview(block: ToolCallContent): string {
   const input = block.input;
   if (!input || typeof input !== "object") return "";
+
+  if (block.toolName.toLowerCase() === "ask") {
+    const askPreview = getAskPreview(input);
+    if (askPreview !== null) return askPreview.slice(0, 120);
+  }
 
   if (getToolCategory(block.toolName) === "todo") {
     const todoSummary = getTodoSummary(input);
@@ -128,14 +162,14 @@ export function getToolPreview(block: ToolCallContent): string {
   if (keys.length === 0) return "";
 
   // Common tool input patterns
-  if ("command" in input) return String(input.command).slice(0, 120);
-  if ("path" in input) return String(input.path).slice(0, 120);
-  if ("file_path" in input) return String(input.file_path).slice(0, 120);
-  if ("pattern" in input) return String(input.pattern).slice(0, 120);
-  if ("query" in input) return String(input.query).slice(0, 120);
+  if ("command" in input) return formatToolPreviewValue(input.command).slice(0, 120);
+  if ("path" in input) return formatToolPreviewValue(input.path).slice(0, 120);
+  if ("file_path" in input) return formatToolPreviewValue(input.file_path).slice(0, 120);
+  if ("pattern" in input) return formatToolPreviewValue(input.pattern).slice(0, 120);
+  if ("query" in input) return formatToolPreviewValue(input.query).slice(0, 120);
 
   const first = input[keys[0]];
-  return String(first).slice(0, 120);
+  return formatToolPreviewValue(first).slice(0, 120);
 }
 
 export function getSemanticToolLabel(block: ToolCallContent): { action: string; target: string; isFile?: boolean } {
