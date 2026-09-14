@@ -88,6 +88,8 @@ export interface WebSessionState {
   isPromptRunning: boolean;
   isBashRunning: boolean;
   isCompacting: boolean;
+  /** Web-observed current-run response; not a persisted-history cursor. */
+  responseObserved?: boolean;
   autoCompactionEnabled: boolean;
   interruptMode: "immediate" | "wait";
   steeringMode: "all" | "one-at-a-time";

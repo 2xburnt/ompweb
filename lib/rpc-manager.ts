@@ -1,6 +1,8 @@
+import { randomUUID } from "crypto";
 import { existsSync, realpathSync } from "fs";
 import { homedir } from "os";
 import { validateAgentImages } from "./image-attachments";
+import { hasVisibleAssistantContent } from "./assistant-response";
 import { invalidateModelsCache } from "./models-cache";
 import { RpcCommandError, RpcCommandTimeoutError, RpcProcess, type RpcFrame } from "./omp/rpc-process";
 import { readNativeSettings } from "./omp/settings-config";
@@ -21,7 +23,8 @@ import type {
   SessionStatsInfo,
   WebSessionState,
 } from "./pi-types";
-import type { ExtensionWidgetItem, ProjectLaunchConfig } from "./types";
+import type { AgentMessage, ExtensionWidgetItem, ProjectLaunchConfig } from "./types";
+import type { SessionLiveSnapshot, SessionLiveToolEvent, SessionStreamCursor } from "./session-sync";
 
 // ============================================================================
 // Types
@@ -29,10 +32,12 @@ import type { ExtensionWidgetItem, ProjectLaunchConfig } from "./types";
 
 export interface AgentEvent {
   type: string;
+  web: SessionStreamCursor;
   [key: string]: unknown;
 }
 
 type EventListener = (event: AgentEvent) => void;
+type UnsequencedAgentEvent = { type: string; [key: string]: unknown };
 
 interface CompactionResultLike {
   summary?: string;
@@ -228,7 +233,7 @@ function patchEstimatedTokensAfter(result: unknown): void {
 
 export class AgentSessionWrapper {
   private listeners: EventListener[] = [];
-  private pendingUiRequests = new Map<string, AgentEvent>();
+  private pendingUiRequests = new Map<string, UnsequencedAgentEvent>();
   private uiExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private extensionStatuses = new Map<string, string>();
   private extensionWidgets = new Map<string, ExtensionWidgetItem>();
@@ -240,6 +245,13 @@ export class AgentSessionWrapper {
   private bashRunning = false;
   private streaming = false;
   private compacting = false;
+  private streamId = randomUUID();
+  private streamSequence = 0;
+  private streamingMessage: Partial<AgentMessage> | null = null;
+  private liveToolEvents = new Map<string, SessionLiveToolEvent>();
+  /** Positive evidence for this run, retained after native completion but before disk append. */
+  private responseObserved = false;
+  private responseRunActive = false;
   private fastModeEnabled = false;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private onDestroyCallback: (() => void) | null = null;
@@ -256,11 +268,11 @@ export class AgentSessionWrapper {
   /** Host tools the web UI registered via set_host_tools (agent-callable). */
   private hostToolNames: Set<string> = new Set();
   /** host_tool_call ids awaiting a host_tool_result from the browser. */
-  private pendingHostTools: Map<string, AgentEvent> = new Map();
+  private pendingHostTools: Map<string, UnsequencedAgentEvent> = new Map();
   /** URI schemes the web UI registered via set_host_uri_schemes. */
   private hostUriSchemes: Map<string, { writable?: boolean }> = new Map();
   /** host_uri_request ids awaiting a host_uri_result from the browser. */
-  private pendingHostUris: Map<string, AgentEvent> = new Map();
+  private pendingHostUris: Map<string, UnsequencedAgentEvent> = new Map();
   /** Resolves once an in-flight destroyAndWait finishes; null when idle. Read
    * by startRpcSession so a replacement spawn awaits the old child's exit. */
   destroyPromise: Promise<void> | null = null;
@@ -303,6 +315,33 @@ export class AgentSessionWrapper {
     return this.isAlive() && (this.promptRunning || this.streaming || this.compacting || this.bashRunning);
   }
 
+  /** NDJSON messages are fresh snapshots; copy containers, not token payloads. */
+  getStreamSnapshot(): SessionLiveSnapshot {
+    return {
+      cursor: { streamId: this.streamId, sequence: this.streamSequence },
+      isStreaming: this.streaming,
+      isPromptRunning: this.promptRunning,
+      isCompacting: this.compacting,
+      responseObserved: this.responseObserved,
+      streamingMessage: this.streamingMessage ? { ...this.streamingMessage } : null,
+      toolEvents: Array.from(this.liveToolEvents.values(), (event) => ({ ...event })),
+    };
+  }
+
+  private clearLiveSnapshots(): void {
+    this.streamingMessage = null;
+    this.liveToolEvents.clear();
+    this.streamSequence += 1;
+  }
+
+  private resetStream(): void {
+    this.clearLiveSnapshots();
+    this.responseObserved = false;
+    this.responseRunActive = false;
+    this.streamId = randomUUID();
+    this.streamSequence = 0;
+  }
+
   start(): void {
     this.unsubscribeFrames = this.proc.onFrame((frame) => this.handleFrame(frame));
     this.resetIdleTimer();
@@ -340,6 +379,13 @@ export class AgentSessionWrapper {
   }
 
   private applyIdentity(state: RpcSessionState): void {
+    if (this._sessionId && (state.sessionId !== this._sessionId || (state.sessionFile && state.sessionFile !== this._sessionFile))) {
+      this.resetStream();
+      this.promptRunning = false;
+      this.awaitingAgentStart = false;
+      this.awaitingAgentStartDeadline = 0;
+      this.continuationGraceUntil = 0;
+    }
     this._sessionId = state.sessionId;
     this._sessionFile = state.sessionFile ?? "";
     this._sessionName = state.sessionName;
@@ -366,7 +412,7 @@ export class AgentSessionWrapper {
 
   private handleFrame(frame: RpcFrame): void {
     this.resetIdleTimer();
-    const event = frame as AgentEvent;
+    const event = frame;
     let refreshSessionList = false;
 
     switch (event.type) {
@@ -554,7 +600,7 @@ export class AgentSessionWrapper {
     this.pendingUiRequests.clear();
   }
 
-  private trackExtensionUiRequest(event: AgentEvent): boolean {
+  private trackExtensionUiRequest(event: UnsequencedAgentEvent): boolean {
     const method = event.method as string;
     const id = event.id as string;
     if (method === "cancel") {
@@ -615,7 +661,7 @@ export class AgentSessionWrapper {
    * forever waiting for a response. Registered host tools are routed to
    * listeners in handleFrame (see the host_tool_call case).
    */
-  private rejectUnexpectedHostTool(event: AgentEvent): void {
+  private rejectUnexpectedHostTool(event: UnsequencedAgentEvent): void {
     const id = typeof event.id === "string" ? event.id : "";
     if (!id) return;
     const toolName = typeof event.toolName === "string" ? event.toolName : "unknown";
@@ -659,10 +705,65 @@ export class AgentSessionWrapper {
     this.pendingHostUris.clear();
   }
 
-  private emit(event: AgentEvent): void {
+  private emit(event: UnsequencedAgentEvent): void {
+    // `web` belongs to this wrapper, never to native/extension-supplied frames.
+    // Strip it before caching tool snapshots as well as before wire emission.
+    delete event.web;
+    switch (event.type) {
+      case "agent_start":
+        this.responseObserved = false;
+        this.responseRunActive = true;
+        this.clearLiveSnapshots();
+        break;
+      case "agent_end":
+        if (event.isTerminal === false) break;
+        this.responseRunActive = false;
+        this.streaming = false;
+        this.promptRunning = false;
+        this.compacting = false;
+        this.clearLiveSnapshots();
+        break;
+      case "prompt_error":
+      case "prompt_result":
+        this.responseRunActive = false;
+        this.streaming = false;
+        this.compacting = false;
+        this.promptRunning = false;
+        this.clearLiveSnapshots();
+        break;
+      case "message_start":
+      case "message_update": {
+        const message = event.message as Partial<AgentMessage> | undefined;
+        if (message && message.role !== "user") this.streamingMessage = message;
+        if (this.responseRunActive && hasVisibleAssistantContent(message)) this.responseObserved = true;
+        break;
+      }
+      case "message_end": {
+        const message = event.message as Partial<AgentMessage> | undefined;
+        if (this.responseRunActive && hasVisibleAssistantContent(message)) this.responseObserved = true;
+        if (message?.role && message.role === this.streamingMessage?.role) this.streamingMessage = null;
+        if (message?.role === "toolResult" && message.toolCallId) this.liveToolEvents.delete(message.toolCallId);
+        break;
+      }
+      case "tool_execution_start":
+      case "tool_execution_update":
+        if (typeof event.toolCallId === "string") {
+          this.liveToolEvents.set(event.toolCallId, {
+            ...this.liveToolEvents.get(event.toolCallId),
+            ...event,
+            type: event.type,
+            toolCallId: event.toolCallId,
+          });
+        }
+        break;
+      case "tool_execution_end":
+        if (typeof event.toolCallId === "string") this.liveToolEvents.delete(event.toolCallId);
+        break;
+    }
+    event.web = { streamId: this.streamId, sequence: ++this.streamSequence };
     for (const l of this.listeners) {
       try {
-        l(event);
+        l(event as AgentEvent);
       } catch {
         // A throwing subscriber (SSE encode failure, UI handler bug) must not
         // starve the remaining subscribers — same isolation RpcProcess and
@@ -737,7 +838,7 @@ export class AgentSessionWrapper {
         this.forgetPendingUiRequest(id);
         continue;
       }
-      listener(event);
+      listener({ ...event, web: { streamId: this.streamId, sequence: ++this.streamSequence } });
     }
     return () => {
       const i = this.listeners.indexOf(listener);
@@ -850,13 +951,8 @@ export class AgentSessionWrapper {
     const wasRunning = this.isRunning();
 
     // Reconcile process-side flags with authoritative child state.
-    this.streaming = state.isStreaming;
-    this.compacting = state.isCompacting;
-    this._sessionName = state.sessionName;
-    if (state.sessionId) {
-      this._sessionId = state.sessionId;
-      this._sessionFile = state.sessionFile ?? this._sessionFile;
-    }
+    this.applyIdentity({ ...state, sessionFile: state.sessionFile ?? this._sessionFile });
+    this.streamSequence += 1;
 
     const awaitingExpired = !this.awaitingAgentStart || Date.now() >= this.awaitingAgentStartDeadline;
     const hasPendingWork =
@@ -876,6 +972,7 @@ export class AgentSessionWrapper {
       this.promptRunning = false;
       this.awaitingAgentStart = false;
       this.awaitingAgentStartDeadline = 0;
+      this.clearLiveSnapshots();
     }
 
     if (wasRunning && !this.isRunning()) {
@@ -888,6 +985,7 @@ export class AgentSessionWrapper {
       isStreaming: state.isStreaming,
       isPromptRunning: this.promptRunning,
       isBashRunning: this.bashRunning,
+      responseObserved: this.responseObserved,
       isCompacting: state.isCompacting,
       autoCompactionEnabled: state.autoCompactionEnabled,
       autoRetryEnabled: state.autoRetryEnabled,
@@ -949,6 +1047,10 @@ export class AgentSessionWrapper {
     // Stays true for the whole restart so send() rejects commands that would
     // otherwise hit the disposed or half-built child.
     this.restarting = true;
+    this.resetStream();
+    this.streaming = false;
+    this.promptRunning = false;
+    this.compacting = false;
     this.unsubscribeFrames?.();
     try {
       await old.dispose();
@@ -1027,6 +1129,10 @@ export class AgentSessionWrapper {
         }
         const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
         if (!streamingBehavior) {
+          this.responseObserved = false;
+          this.responseRunActive = false;
+          if (!this.isRunning()) this.clearLiveSnapshots();
+          this.streamSequence += 1;
           this.promptRunning = true;
           this.promptDispatchPendingCount += 1;
           this.awaitingAgentStart = false;
@@ -1061,6 +1167,8 @@ export class AgentSessionWrapper {
           this.promptRunning = false;
           this.awaitingAgentStart = false;
           this.awaitingAgentStartDeadline = 0;
+          this.streaming = false;
+          this.clearLiveSnapshots();
           notifyRunningChange();
           if (error instanceof RpcCommandTimeoutError) {
             // The child took the frame but never acked it, so nothing will ever
@@ -1090,6 +1198,8 @@ export class AgentSessionWrapper {
       }
 
       case "abort":
+        this.responseObserved = false;
+        this.responseRunActive = false;
         await this.withFinalRunningNotification(async () => {
           await this.proc.sendCommand({ type: "abort" });
           // If the prompt was aborted before the agent loop started, no
@@ -1103,6 +1213,7 @@ export class AgentSessionWrapper {
           this.awaitingAgentStart = false;
           this.awaitingAgentStartDeadline = 0;
           this.continuationGraceUntil = 0;
+          this.clearLiveSnapshots();
         });
         return null;
 
@@ -1164,6 +1275,7 @@ export class AgentSessionWrapper {
         try {
           return await this.withFinalRunningNotification(async () => {
             this.compacting = true;
+            this.streamSequence += 1;
             notifyRunningChange();
             try {
               const result = await this.proc.sendCommand<CompactionResultLike>({
@@ -1174,6 +1286,7 @@ export class AgentSessionWrapper {
               return result;
             } finally {
               this.compacting = false;
+              this.streamSequence += 1;
             }
           });
         } finally {
@@ -1281,6 +1394,11 @@ export class AgentSessionWrapper {
 
       default: {
         if (PASSTHROUGH_COMMANDS.has(type)) {
+          if (type === "abort_and_prompt") {
+            this.responseObserved = false;
+            this.responseRunActive = false;
+            this.streamSequence += 1;
+          }
           const result: unknown = await this.proc.sendCommand(command as { type: string });
           if (type === "set_thinking_level") this.invalidateSessionLists();
           return result ?? null;
@@ -1303,6 +1421,12 @@ export class AgentSessionWrapper {
     if (this.destroyPromise) return this.destroyPromise;
     if (!this._alive) return;
     this._alive = false;
+    this.streaming = false;
+    this.promptRunning = false;
+    this.compacting = false;
+    this.responseObserved = false;
+    this.responseRunActive = false;
+    this.clearLiveSnapshots();
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.sessionFileSignalTimer) {
       clearTimeout(this.sessionFileSignalTimer);

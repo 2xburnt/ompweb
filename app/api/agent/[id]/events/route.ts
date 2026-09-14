@@ -111,9 +111,15 @@ export async function GET(
         return;
       }
 
-      encode({ type: "connected", sessionId: id });
-      if (closed) return;
-      unsubscribe = session.onEvent((event) => encode(event));
+      // onEvent can synchronously replay pending UI requests. Subscribe before
+      // sampling the cursor/announcing readiness so catch-up has no event gap.
+      const detach = session.onEvent((event) => encode(event));
+      if (closed) {
+        detach();
+        return;
+      }
+      unsubscribe = detach;
+      encode({ type: "connected", sessionId: id, web: session.getStreamSnapshot().cursor });
     },
     // When a slow consumer resumes reading, the stream calls pull() as soon
     // as queue space is available. Flush any coalesced message_update here so

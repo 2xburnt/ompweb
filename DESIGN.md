@@ -100,6 +100,73 @@ Models and allow-listed OMP settings use surgical YAML updates that preserve
 unrelated content. Plugin operations run the installed `omp plugin` CLI. MCP
 configuration is project-local, validated before writing, and saved atomically.
 
+### Reconnect and foreground catch-up
+
+Completed conversation history is identified by persisted session entry IDs.
+Live `message_end` frames have no durable ID and can arrive before OMP writes
+the entry, so they trigger catch-up rather than append an unidentified copy.
+Streaming text, active tool output, and an optimistic user prompt remain
+separate from confirmed history.
+
+`GET /api/sessions/:id/context?sync=1` returns a `SessionSyncResponse`:
+
+- `cursor` contains `firstEntryId` and `lastEntryId` (both null for empty
+  history). Send its JSON value in the next request's `cursor` query parameter.
+- `mode: "append"` returns only messages after that position; `baseEntryId`
+  identifies the expected client prefix. An orphaned cursor or changed
+  compaction prefix returns `mode: "replace"`.
+- `context.messages` and `context.entryIds` remain aligned. `limit` is an
+  integer from 1 to 200 (default 200); follow `hasMore` with the returned cursor.
+  Only the selected page's image blobs are resolved.
+- Existing `leafId`, `includePreCompaction`, `deferThinking`, and `deferMedia`
+  view parameters remain available. A historical view excludes live output.
+- `live` contains the web-owned process's current partial message, active tool
+  snapshots, and lifecycle flags, or null for a file-only session. Reading
+  history never starts an OMP process. A live process can supply its first
+  partial before its session file exists, but a missing file cannot erase a
+  nonempty confirmed cursor.
+- `live.responseObserved` retains positive visible-answer evidence for the
+  current run after completion, even before its entry is readable on disk.
+  New runs and process/session changes reset it; tool calls alone do not count.
+
+`GET /api/sessions/:id/context?boundary=1` returns only `{ entryIds }` for
+the current active context. Prompt and interrupt dispatch use this fresh
+ID-only boundary instead of downloading the transcript. It shares the history
+index without hydrating message bodies or blobs and cannot be combined with
+sync, pagination, or historical-view parameters.
+
+SSE events carry `web: { streamId, sequence }`. The stream epoch changes when
+the native process or session identity changes. These values order live
+snapshots; they are not a persisted replay journal or `Last-Event-ID` support.
+Subscription precedes the `connected` cursor announcement. The client keeps
+processing live events while history loads and applies snapshot fields only
+when they cannot overwrite newer message, tool, or lifecycle state.
+
+Open/reopen, foreground/online, message completion, and persisted-file
+notifications share one coalesced catch-up loop. Pages are accumulated privately
+and published only when the selected history is complete. Failed reads retain
+the last complete cursor and displayed history. Overlapping full loads preserve
+newer complete history rather than treating an intermediate page as authoritative.
+Full initial loads and terminal metadata refreshes still update the branch tree.
+A completion or persistence notification during an in-flight read schedules
+one follow-up read from the newly returned cursor. Raw SSE completions never
+append a second copy of an entry that the history response already includes.
+
+Unchanged history pages reuse a file-versioned offset index and seek only the
+requested message bodies. The in-memory index cache is bounded to 32 views and
+32 MiB of charged metadata; it does not retain transcript bodies or increase
+the existing 256 MiB raw-file cache budget or 1 GiB load ceiling. Cold indexes
+and changed files require a full metadata scan. Growth alone is not proof of
+an append: the same inode can be rewritten and then extended, so any file
+version change invalidates offsets rather than trusting an unchecked prefix.
+Failed reads never advance the confirmed cursor.
+
+File-only catch-up also refreshes model and thinking metadata without replacing
+newer or pending RPC choices. Replacement observer connections restore browser
+registrations and the subagent roster only after successfully connecting.
+
+Deploy the frontend and API support together; no native OMP upgrade is required.
+
 ## Security contract
 
 - Bind loopback-only by default. A non-loopback hostname is an explicit opt-in.
