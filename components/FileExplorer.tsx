@@ -324,7 +324,6 @@ const ExplorerRow = memo(function ExplorerRow({
         ? (node.name + " (folder" + (open ? ", expanded" : ", collapsed") + ")")
         : (secondaryLabel ? (node.name + " (file, " + secondaryLabel + ")") : (node.name + " (file)"))}
       style={{
-        position: "relative",
         display: "flex",
         alignItems: "center",
         gap: 4,
@@ -368,9 +367,8 @@ const ExplorerRow = memo(function ExplorerRow({
           overflow: "hidden",
           textOverflow: "ellipsis",
           whiteSpace: "nowrap",
-          // The name is the answer the user is looking for, so the directory
-          // gives up width first.
-          flex: secondaryLabel ? "0 0 auto" : 1,
+          // Prefer the name, but let it shrink to keep row actions reachable.
+          flex: secondaryLabel ? "0 1 auto" : 1,
           maxWidth: secondaryLabel ? "72%" : undefined,
         }}
         title={node.fullPath}
@@ -403,7 +401,7 @@ const ExplorerRow = memo(function ExplorerRow({
           style={{ width: 6, height: 6, flexShrink: 0, borderRadius: "50%", background: "var(--accent)" }}
         />
       )}
-      {!hovered && !node.isDir && gitStatus && (
+      {!node.isDir && gitStatus && (
         <span
           title={t(GIT_STATUS_LABEL_KEYS[gitStatus.status])}
           aria-label={t(GIT_STATUS_LABEL_KEYS[gitStatus.status])}
@@ -420,7 +418,7 @@ const ExplorerRow = memo(function ExplorerRow({
           {gitStatus.code}
         </span>
       )}
-      {!hovered && containsGitChanges && (
+      {containsGitChanges && (
         <span
           title={t("fileExplorer.containsChangedFiles")}
           aria-label={t("fileExplorer.containsChangedFiles")}
@@ -436,7 +434,7 @@ const ExplorerRow = memo(function ExplorerRow({
       {loading && (
         <Loader2 size={10} strokeWidth={2} color="var(--text-dim)" style={{ animation: "spin 0.8s linear infinite", flexShrink: 0 }} aria-hidden="true" />
       )}
-      {onAtMention && hovered && (
+      {onAtMention && (
         <Tooltip content={mentionLabel}>
           <button
             onClick={(e) => {
@@ -445,16 +443,13 @@ const ExplorerRow = memo(function ExplorerRow({
             }}
             aria-label={mentionLabel}
             style={{
-              position: "absolute",
-              right: !node.isDir ? 28 : 4,
-              top: "50%",
-              transform: "translateY(-50%)",
+              flexShrink: 0,
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
               gap: 4,
               padding: "0 8px",
-              height: 20,
+              minWidth: 24, height: 24,
               background: "var(--bg-panel)",
               border: "1px solid var(--border)",
               borderRadius: "var(--radius-control)",
@@ -471,7 +466,7 @@ const ExplorerRow = memo(function ExplorerRow({
           </button>
         </Tooltip>
       )}
-      {hovered && !node.isDir && (
+      {!node.isDir && (
         <Tooltip content={downloadLabel}>
           <a
             href={`/api/files/${encodeFilePathForApi(node.fullPath)}?type=download`}
@@ -479,16 +474,13 @@ const ExplorerRow = memo(function ExplorerRow({
             onClick={(e) => e.stopPropagation()}
             aria-label={downloadLabel}
             style={{
-              position: "absolute",
-              right: 4,
-              top: "50%",
-              transform: "translateY(-50%)",
+              flexShrink: 0,
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
               gap: 4,
               padding: "0 5px",
-              height: 20,
+              minWidth: 24, height: 24,
               background: "var(--bg-panel)",
               border: "1px solid var(--border)",
               borderRadius: "var(--radius-control)",

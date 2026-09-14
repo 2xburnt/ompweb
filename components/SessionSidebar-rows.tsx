@@ -29,19 +29,11 @@ import {
 /**
  * Right-edge status column shared by project headers and session rows.
  *
- * Desktop session rows lay out `[status slot][gap][meta]` right-aligned at
- * `rowRight - 8`, project headers `[activity slot][gap][actions][gap][toggle]`
- * at `rowRight - 6`. Reserving the same total width in both (`8 + 46 + 2 + 6`
- * vs `6 + 2 + 24 + 2 + 22 + 6`) centres every indicator — running ring, unread
- * dot, project activity dot — on `rowRight - 62`, so it never moves.
- *
- * The session row's indicator must live outside the meta layer: that layer
- * fades out when the hover/focus action button takes over, and a dot rendered
- * inside the actions layer would jump right by the width difference.
+ * Keep the session indicator outside the timestamp and action controls so it
+ * stays visible while the menu is open.
  */
 const SIDEBAR_STATUS_SLOT = 12;
 const SIDEBAR_STATUS_GAP = 2;
-const SIDEBAR_TRAILING_META_WIDTH = 46;
 
 interface ProjectRowProps {
   project: ManagedProject;
@@ -113,7 +105,6 @@ function ProjectRow({
 }: ProjectRowProps) {
   const { t } = useI18n();
   const [hovered, setHovered] = useState(false);
-  const [focusWithin, setFocusWithin] = useState(false);
   const [showAllSessions, setShowAllSessions] = useState(false);
   const [actionMenuOpen, setActionMenuOpen] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
@@ -145,7 +136,6 @@ function ProjectRow({
   const visibleRoots = hiddenCount > 0 && !showAllSessions
     ? tree.slice(0, MAX_PROJECT_SESSIONS)
     : tree;
-  const showActions = hovered || focusWithin || actionMenuOpen;
 
   return (
     <section className="sidebar-project" data-active={isActive ? "true" : "false"} style={{ marginBottom: 12 }}>
@@ -173,10 +163,6 @@ function ProjectRow({
         onDragEnd={() => onDragPathChange(null)}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
-        onFocus={() => setFocusWithin(true)}
-        onBlur={(e) => {
-          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setFocusWithin(false);
-        }}
         onKeyDown={(event) => {
           if (event.key === "Escape" && actionMenuOpen) {
             event.stopPropagation();
@@ -350,7 +336,6 @@ function ProjectRow({
         )}
         <div
           className="sidebar-project-actions"
-          data-actions-visible={showActions ? "true" : "false"}
           style={{
             flexShrink: 0,
           }}
@@ -876,7 +861,6 @@ const SessionItem = memo(function SessionItem({
 }) {
   const { t, locale } = useI18n();
   const [hovered, setHovered] = useState(false);
-  const [focusWithin, setFocusWithin] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState("");
   const renameCancelRef = useRef(false);
@@ -888,7 +872,6 @@ const SessionItem = memo(function SessionItem({
   const menuButtonRef = useRef<HTMLButtonElement>(null);
   const title = session.name || session.firstMessage.slice(0, 50) || session.id.slice(0, 12);
   const relativeTime = formatRelativeTime(session.modified, locale, relativeTimeNow);
- const showActions = hovered || focusWithin || actionMenuOpen;
   const rowBackground = isSelected
     ? "color-mix(in srgb, var(--bg-selected) 70%, transparent)"
     : hovered ? "var(--bg-hover)" : "transparent";
@@ -974,14 +957,9 @@ const SessionItem = memo(function SessionItem({
     <>
     <div
       className="session-item-row"
-      data-actions-visible={showActions}
  onClick={confirmDelete || renaming ? undefined : onClick}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
-      onFocus={() => setFocusWithin(true)}
-      onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setFocusWithin(false);
-      }}
       onKeyDown={(event) => {
         if ((confirmDelete || actionMenuOpen) && event.key === "Escape") {
           event.stopPropagation();
@@ -1037,11 +1015,11 @@ const SessionItem = memo(function SessionItem({
                 {isRunning ? <RunningSessionIndicator size={12} /> : <UnreadSessionIndicator size={11} />}
               </span>
             )}
-            <div className="session-item-trailing" style={{ position: "relative", display: "flex", alignItems: "center", justifyContent: "flex-end", width: `var(--session-trailing-width, ${SIDEBAR_TRAILING_META_WIDTH}px)`, flexShrink: 0 }}>
-              <div className="session-item-metadata" style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", transition: "opacity var(--dur-fast) var(--ease-out-warm), visibility var(--dur-fast) var(--ease-out-warm)" }}>
+            <div className="session-item-trailing" style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", flexShrink: 0 }}>
+              <div className="session-item-metadata" style={{ display: "flex", alignItems: "center", justifyContent: "flex-end" }}>
                 {relativeTime && <span className="session-item-time" title={new Date(session.modified).toLocaleString(locale)} style={{ flexShrink: 0, whiteSpace: "nowrap", textAlign: "right", color: isSelected ? "var(--accent)" : "var(--text-dim)", fontSize: 10, fontVariantNumeric: "tabular-nums" }}>{relativeTime}</span>}
               </div>
-              <div className="session-item-actions" style={{ inset: 0, display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 2, transition: "opacity var(--dur-fast) var(--ease-out-warm)" }}>
+              <div className="session-item-actions" style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 2 }}>
                 <button type="button" ref={menuButtonRef} className="session-item-icon-button session-item-menu-button" onClick={(event) => { event.stopPropagation(); setActionMenuOpen((open) => !open); }} title={t("projects.actions")} aria-label={t("projects.actions")} aria-expanded={actionMenuOpen} style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: 0, lineHeight: 0, border: "none", borderRadius: "var(--radius-control)", background: actionMenuOpen ? "var(--bg-selected)" : "transparent", color: actionMenuOpen ? "var(--text)" : "var(--text-dim)", cursor: "pointer" }}>
                   <MoreHorizontal size={14} strokeWidth={2} aria-hidden="true" />
                 </button>

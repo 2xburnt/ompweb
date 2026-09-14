@@ -303,8 +303,6 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
   onEditContent?: (content: string) => void;
 }) {
   const { t, locale } = useI18n();
-  const [hovered, setHovered] = useState(false);
-  const [actionsActive, setActionsActive] = useState(false);
   const { copied, copy: copyContent } = useCopyFeedback();
 
   const content =
@@ -327,8 +325,6 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
   return (
     <div
       style={{ marginBottom: 18, display: "flex", flexDirection: "column", alignItems: "flex-end", paddingRight: 6 }}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
     >
       <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", maxWidth: "85%", minWidth: 0 }}>
         <div
@@ -373,20 +369,14 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
 
         {/* Bottom row: action buttons + timestamp — inside the bubble's column,
             spanning its width, so the timestamp aligns with its right edge. */}
-        {(time || canFork || canNavigate) && (
           <div style={{
-            display: "flex", alignItems: "center", justifyContent: "flex-end",
+            display: "flex", flexWrap: "wrap", alignItems: "center", justifyContent: "flex-end",
             gap: 6, marginTop: 3, width: "100%",
           }}>
           <div
             style={{
               display: "flex", gap: 3,
-              opacity: hovered || actionsActive ? 1 : 0,
-              pointerEvents: hovered || actionsActive ? "auto" : "none",
-              transition: "opacity var(--dur-fast) var(--ease-out-warm)",
             }}
-            onFocusCapture={() => setActionsActive(true)}
-            onBlurCapture={() => setActionsActive(false)}
           >
             <Tooltip content={t("messageView.copyMessage")}>
               <button
@@ -414,13 +404,8 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
           {(canFork || canNavigate) && (
             <div
               style={{
-                display: "flex", gap: 3,
-                opacity: (hovered || actionsActive || forking) ? 1 : 0,
-                pointerEvents: (hovered || actionsActive || forking) ? "auto" : "none",
-                transition: "opacity var(--dur-fast) var(--ease-out-warm)",
+                display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 3,
               }}
-              onFocusCapture={() => setActionsActive(true)}
-              onBlurCapture={() => setActionsActive(false)}
             >
               {canNavigate && (
                 <Tooltip content={t("messageView.editFromHereTitle")}>
@@ -475,7 +460,6 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
           )}
           {time && <span style={{ fontSize: 10, color: "var(--text-dim)" }}>{time}</span>}
           </div>
-        )}
       </div>
     </div>
   );

@@ -271,7 +271,6 @@ export function GitChangesPanel({ cwd, refreshKey, onOpenFile, onAtMention, onRe
                   onMouseEnter={() => setHoveredPath(file.filePath)}
                   onMouseLeave={() => setHoveredPath((prev) => (prev === file.filePath ? null : prev))}
                   style={{
-                    position: "relative",
                     display: "flex",
                     alignItems: "center",
                     gap: 6,
@@ -296,7 +295,7 @@ export function GitChangesPanel({ cwd, refreshKey, onOpenFile, onAtMention, onRe
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                       whiteSpace: "nowrap",
-                      flex: directory ? "0 0 auto" : 1,
+                      flex: directory ? "0 1 auto" : 1,
                       maxWidth: directory ? "60%" : undefined,
                     }}
                     title={file.filePath}
@@ -336,7 +335,6 @@ export function GitChangesPanel({ cwd, refreshKey, onOpenFile, onAtMention, onRe
                   >
                     {file.code}
                   </span>
-                  {isHovered && (
                     <button
                       type="button"
                       onClick={(e) => {
@@ -346,15 +344,12 @@ export function GitChangesPanel({ cwd, refreshKey, onOpenFile, onAtMention, onRe
                       title={t("gitChanges.openFile")}
                       aria-label={t("gitChanges.openFile")}
                       style={{
-                        position: "absolute",
-                        right: 4,
-                        top: "50%",
-                        transform: "translateY(-50%)",
+                        flexShrink: 0,
                         display: "flex",
                         alignItems: "center",
                         justifyContent: "center",
-                        width: 22,
-                        height: 20,
+                        width: 24,
+                        height: 24,
                         background: "var(--bg-panel)",
                         border: "1px solid var(--border)",
                         borderRadius: "var(--radius-control)",
@@ -364,7 +359,6 @@ export function GitChangesPanel({ cwd, refreshKey, onOpenFile, onAtMention, onRe
                     >
                       <ExternalLink size={11} strokeWidth={2.2} aria-hidden="true" />
                     </button>
-                  )}
                 </div>
               );
             })}

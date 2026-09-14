@@ -13,6 +13,13 @@ const { MessageView, SafeMarkdownBody, TaskResultPanel, isInterruptedMessage } =
 const { CodeBlock } = await jiti.import("./MermaidBlock.tsx");
 const { Collapsible } = await jiti.import("./ui/primitives.tsx");
 
+test("sent messages without timestamps or branch metadata still offer copy", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    message: { role: "user", content: "Keep this message copyable." },
+  }));
+  assert.match(html, /<button[^>]*aria-label="Copy message"/);
+});
+
 test("expanded grouped tool inputs follow streaming arguments without toggling output", async () => {
   const previousActEnvironment = globalThis.IS_REACT_ACT_ENVIRONMENT;
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
