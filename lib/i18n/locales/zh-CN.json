@@ -1047,6 +1047,8 @@
   "settingsTabs.mcp.description": "MCP 服务端、托管技能与 OMP 插件",
   "settingsTabs.system.label": "系统与更新",
   "settingsTabs.system.description": "应用更新、运行时版本与活动会话重启",
+  "settingsTabs.attentionRequired": "需要关注",
+  "settingsTabs.updateAvailable": "有可用更新",
   "settingsConfig.loadingSettings": "正在加载设置…",
   "settingsConfig.back": "返回",
   "settingsConfig.title": "设置",

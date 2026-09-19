@@ -1076,6 +1076,8 @@
   "settingsTabs.mcp.description": "MCP servers, managed skills, and OMP plugins",
   "settingsTabs.system.label": "System & Updates",
   "settingsTabs.system.description": "App updates, runtime version, and active session restart",
+  "settingsTabs.attentionRequired": "Attention required",
+  "settingsTabs.updateAvailable": "Update available",
   "settingsConfig.loadingSettings": "Loading settings…",
   "settingsConfig.back": "Back",
   "settingsConfig.title": "Settings",
