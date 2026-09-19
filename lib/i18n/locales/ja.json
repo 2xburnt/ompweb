@@ -1383,5 +1383,13 @@
   "usageConfig.emptyTitle": "利用レコードが見つかりません",
   "usageConfig.emptyDesc": "モデルと対話を開始すると、ここにトークン分析とコストが表示されます。",
   "usageConfig.loading": "利用状況を読み込み中…",
-  "usageConfig.error": "利用状況データを読み込めませんでした"
+  "usageConfig.error": "利用状況データを読み込めませんでした",
+  "settingsConfig.ttsAutoplay": "アシスタント応答の自動読み上げ",
+  "settingsConfig.ttsAutoplayDesc": "完了時にアシスタントの新しい応答を自動的に音声で読み上げます。",
+  "settingsConfig.ttsVoice": "読み上げ音声",
+  "settingsConfig.ttsVoiceDesc": "テキスト読み上げに使用するブラウザの音声を選択します。",
+  "settingsConfig.defaultVoice": "システムの既定の音声",
+  "messageView.readAloud": "読み上げ",
+  "messageView.stopSpeech": "読み上げを停止",
+  "settingsConfig.ttsNotSupported": "このブラウザではサポートされていません"
 }

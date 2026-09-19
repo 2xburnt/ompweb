@@ -1383,5 +1383,13 @@
   "usageConfig.emptyTitle": "暂无用量记录",
   "usageConfig.emptyDesc": "开始与模型对话后，将在此处显示 Token 用量和费用分析。",
   "usageConfig.loading": "正在加载用量分析…",
-  "usageConfig.error": "加载用量数据失败"
+  "usageConfig.error": "加载用量数据失败",
+  "settingsConfig.ttsAutoplay": "自动朗读助手回复",
+  "settingsConfig.ttsAutoplayDesc": "生成完成后自动语音朗读助手的新回复。",
+  "settingsConfig.ttsVoice": "朗读语音",
+  "settingsConfig.ttsVoiceDesc": "选择用于文本转语音朗读的浏览器声音。",
+  "settingsConfig.defaultVoice": "系统默认声音",
+  "messageView.readAloud": "朗读",
+  "messageView.stopSpeech": "停止朗读",
+  "settingsConfig.ttsNotSupported": "当前浏览器不支持"
 }

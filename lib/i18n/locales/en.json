@@ -1412,5 +1412,13 @@
   "usageConfig.emptyTitle": "No usage records found",
   "usageConfig.emptyDesc": "Start chatting with models to see your token analytics and costs here.",
   "usageConfig.loading": "Loading usage analytics…",
-  "usageConfig.error": "Could not load usage data"
+  "usageConfig.error": "Could not load usage data",
+  "settingsConfig.ttsAutoplay": "Auto-read assistant responses",
+  "settingsConfig.ttsAutoplayDesc": "Automatically read aloud new assistant replies when completed.",
+  "settingsConfig.ttsVoice": "Speech Voice",
+  "settingsConfig.ttsVoiceDesc": "Select the browser voice for text-to-speech reading.",
+  "settingsConfig.defaultVoice": "Default system voice",
+  "messageView.readAloud": "Read aloud",
+  "messageView.stopSpeech": "Stop speaking",
+  "settingsConfig.ttsNotSupported": "Not supported in this browser"
 }
