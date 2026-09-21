@@ -44,6 +44,9 @@ async function createSession(cwd: string, command: NewSessionCommand): Promise<R
   }
 
   const { provider, modelId, toolNames, thinkingLevel, advisor, ...promptCommand } = command;
+  // A caller may carry an old session id while starting a fresh session.
+  // Never forward it to omp: the server-assigned id is authoritative.
+  delete promptCommand.sessionId;
   if (typeof promptCommand.type !== "string" || !promptCommand.type.trim()) {
     return NextResponse.json({ error: "command type is required", code: "command_type_required" }, { status: 400 });
   }

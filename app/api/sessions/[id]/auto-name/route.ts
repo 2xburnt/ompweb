@@ -8,7 +8,7 @@ import {
   type TitleSourceMessage,
 } from "@/lib/omp/title-generate";
 import { getRpcSession } from "@/lib/rpc-manager";
-import { buildSessionContext, getSessionEntries, invalidateSessionListCache } from "@/lib/session-reader";
+import { buildSessionContext, getSessionEntries, invalidateSessionCaches } from "@/lib/session-reader";
 import { resolveSessionPathOr404 } from "@/lib/api-utils";
 import { withSessionRoute } from "@/lib/hosts/route";
 
@@ -28,6 +28,7 @@ export const POST = withSessionRoute(async (
   const { id } = await params;
 
   try {
+
     const resolved = await resolveSessionPathOr404(id);
     if ("response" in resolved) return resolved.response;
     const filePath = resolved.filePath;
@@ -91,7 +92,7 @@ export const POST = withSessionRoute(async (
       }
     }
 
-    invalidateSessionListCache();
+    invalidateSessionCaches(filePath);
     return NextResponse.json({ title, usage: null });
   } catch (error) {
     const unavailable = error instanceof TitleGenerationUnavailableError;

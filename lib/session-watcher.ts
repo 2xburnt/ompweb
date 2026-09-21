@@ -5,7 +5,9 @@ import { listHosts, onHostRegistryChange, type Host } from "./hosts/registry";
 import { listSessionFileStats } from "./omp/session-files";
 import {
   getAgentDir,
+  invalidateSessionEntriesCache,
   invalidateSessionListCache,
+  invalidateSessionListMeta,
   listAllSessions,
   resolveSessionIdByPath,
 } from "./session-reader";
@@ -80,15 +82,19 @@ function flushLocal(host: Host, state: LocalWatch): void {
   state.pendingUnknown = false;
   if (paths.length === 0 && !hadUnknown) return;
 
-  // A changed file means the cached list's mtimes and message counts are stale.
-  invalidateSessionListCache();
-
   if (hadUnknown) {
     // filename was null — fs.watch coalesced the event or overflowed. We
-    // don't know which file changed, so rescan the whole tree.
+    // Unknown path: invalidate this host's caches, then rescan the inventory.
+    withHost(host, () => invalidateSessionListCache());
     emitAllSessions();
     return;
   }
+
+  // Known paths: refresh host metadata and invalidate only changed sessions.
+  withHost(host, () => {
+    invalidateSessionListMeta();
+    for (const path of paths) invalidateSessionEntriesCache(path);
+  });
 
   void Promise.all(paths.map((path) => resolveSessionIdByPath(path, host).catch(() => undefined)))
     .then((ids) => emit([...new Set(ids.filter((id): id is string => Boolean(id)))]))
@@ -174,9 +180,12 @@ async function pollRemote(host: Host, state: RemoteWatch): Promise<void> {
       if (!next.has(path)) removed = true;
     }
     if (changed.length === 0 && !removed) return;
-    invalidateSessionListCache();
+    withHost(host, () => {
+      invalidateSessionListCache();
+      for (const path of changed) invalidateSessionEntriesCache(path);
+    });
     if (removed) {
-      emitAllSessions();
+      withHost(host, () => emitAllSessions());
       return;
     }
     const ids = await Promise.all(changed.map((path) => resolveSessionIdByPath(path, host).catch(() => undefined)));

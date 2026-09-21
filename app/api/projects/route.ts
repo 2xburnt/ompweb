@@ -8,6 +8,7 @@ import { withHostRoute } from "@/lib/hosts/route";
 import { hostProjectKey } from "@/lib/paths";
 import {
   hideProject,
+  isReservedLaunchArg,
   mergeProjects,
   normalizeProjectCwd,
   ProjectPathError,
@@ -19,7 +20,28 @@ import {
 } from "@/lib/project-registry";
 import { listAllSessions } from "@/lib/session-reader";
 import { resolveProject } from "@/lib/worktree";
-import type { ManagedProject } from "@/lib/types";
+import type { ManagedProject, ProjectLaunchConfig } from "@/lib/types";
+const MAX_EXTRA_ARGS = 32;
+const MAX_EXTRA_ARG_LENGTH = 256;
+
+/** Validate the workspace-level omp launch config; reject overrides of web-managed session-boundary args. */
+function parseLaunchConfig(value: unknown): ProjectLaunchConfig | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new ProjectPathError("invalid_launch_config", "Launch config must be an object");
+  const raw = value as Record<string, unknown>;
+  const profile = raw.profile === undefined ? undefined : typeof raw.profile === "string" && raw.profile.trim() ? raw.profile.trim() : undefined;
+  if (raw.profile !== undefined && !profile) throw new ProjectPathError("invalid_profile", "Profile must be a non-empty string");
+  if (profile?.startsWith("-")) throw new ProjectPathError("invalid_profile", "Profile must not start with '-'");
+  const advisor = raw.advisor === undefined ? undefined : raw.advisor;
+  if (advisor !== undefined && typeof advisor !== "boolean") throw new ProjectPathError("invalid_advisor", "Advisor must be a boolean");
+  if (raw.extraArgs !== undefined && (!Array.isArray(raw.extraArgs) || raw.extraArgs.length > MAX_EXTRA_ARGS)) throw new ProjectPathError("invalid_extra_args", "Extra args must contain at most 32 arguments");
+  const extraArgs = raw.extraArgs === undefined ? undefined : (raw.extraArgs as unknown[]).map((arg) => {
+    if (typeof arg !== "string" || !arg || arg.length > MAX_EXTRA_ARG_LENGTH || isReservedLaunchArg(arg)) throw new ProjectPathError("invalid_extra_args", "Extra args contain an invalid or reserved argument");
+    return arg;
+  });
+  if (!profile && advisor === undefined && (!extraArgs || extraArgs.length === 0)) return undefined;
+  return { profile, advisor, extraArgs };
+}
 
 // Every handler here is scoped to one host (`?host=<id>` / x-omp-host, default
 // host otherwise): the registry lives in that host's omp agent dir, session
@@ -64,18 +86,19 @@ export const GET = withHostRoute(async () => {
 export const POST = withHostRoute(async (req: Request) => {
   try {
     const host = currentHost();
-    const body = await req.json() as { cwd?: unknown };
+    const body = await req.json() as { cwd?: unknown; launchConfig?: unknown };
     const cwd = typeof body.cwd === "string" ? body.cwd : "";
+    const launchConfig = parseLaunchConfig(body.launchConfig);
     const normalized = await validateProjectPath(cwd, host);
     const { projectRoot } = await resolveProject(normalized, host);
 
     const registry = await readProjectRegistry(host);
-    const next = upsertProject(registry, projectRoot);
+    const next = upsertProject(registry, projectRoot, new Date().toISOString(), launchConfig);
     await saveProjectRegistryOnHost(next, host);
     allowFileRoot(projectRoot, host);
 
-    const entry = next.projects.find((p) => comparableProjectPath(p.path) === comparableProjectPath(projectRoot))!;
-    return NextResponse.json({ project: withProjectKey(host, { path: entry.path, addedAt: entry.addedAt }) });
+    const entry = next.projects.find((project) => comparableProjectPath(project.path) === comparableProjectPath(projectRoot))!;
+    return NextResponse.json({ project: withProjectKey(host, entry) });
   } catch (error) {
     if (error instanceof ProjectPathError) {
       return NextResponse.json({ error: error.message, code: error.code }, { status: 400 });
@@ -100,12 +123,13 @@ export const PATCH = withHostRoute(async (req: Request) => {
       cwd?: unknown;
       alias?: unknown;
       sortOrder?: unknown;
+      launchConfig?: unknown;
       updates?: unknown;
     };
     const rawUpdates: unknown[] = Array.isArray(body.updates)
       ? body.updates
-      : body.cwd !== undefined || body.alias !== undefined || body.sortOrder !== undefined
-        ? [{ cwd: body.cwd, alias: body.alias, sortOrder: body.sortOrder }]
+      : body.cwd !== undefined || body.alias !== undefined || body.sortOrder !== undefined || body.launchConfig !== undefined
+        ? [{ cwd: body.cwd, alias: body.alias, sortOrder: body.sortOrder, launchConfig: body.launchConfig }]
         : [];
     if (rawUpdates.length === 0) {
       return NextResponse.json({ error: "Path is required", code: "path_required" }, { status: 400 });
@@ -144,16 +168,17 @@ export const PATCH = withHostRoute(async (req: Request) => {
       return match ? match.path : null;
     };
 
-    const parsed: Array<{ path: string; alias?: string | null; sortOrder?: number | null }> = [];
+    const parsed: Array<{ path: string; alias?: string | null; sortOrder?: number | null; launchConfig?: ProjectLaunchConfig | null }> = [];
     const skipped: Array<{ cwd: string; code: string; error: string }> = [];
     for (const [index, item] of rawUpdates.entries()) {
-      const entry = item as { cwd?: unknown; alias?: unknown; sortOrder?: unknown };
+      const entry = item as { cwd?: unknown; alias?: unknown; sortOrder?: unknown; launchConfig?: unknown };
       const cwd = typeof entry.cwd === "string" ? entry.cwd.trim() : "";
       if (!cwd) return NextResponse.json({ error: "Path is required", code: "path_required" }, { status: 400 });
       const alias = entry.alias === null ? null : typeof entry.alias === "string" ? entry.alias : undefined;
       const sortOrder = entry.sortOrder === null ? null : typeof entry.sortOrder === "number" && Number.isFinite(entry.sortOrder) ? entry.sortOrder : undefined;
       if (entry.alias !== undefined && alias === undefined) return NextResponse.json({ error: "Alias must be a string", code: "invalid_alias" }, { status: 400 });
       if (entry.sortOrder !== undefined && sortOrder === undefined) return NextResponse.json({ error: "Sort order must be a number", code: "invalid_sort_order" }, { status: 400 });
+      const launchConfig = entry.launchConfig === null ? null : parseLaunchConfig(entry.launchConfig);
       // Same existence/directory checks as POST: an auto-registering endpoint
       // must never persist ghost entries for deleted paths, plain files, or
       // unexpanded "~"/relative paths. For bulk reorder (multiple entries),
@@ -163,7 +188,7 @@ export const PATCH = withHostRoute(async (req: Request) => {
       // workspace stays reorderable/renamable even after its directory is removed.
       const managedPath = isAlreadyManaged(index);
       if (managedPath) {
-        parsed.push({ path: managedPath, alias, sortOrder });
+        parsed.push({ path: managedPath, alias, sortOrder, launchConfig });
         continue;
       }
       let normalized: string;
@@ -190,7 +215,7 @@ export const PATCH = withHostRoute(async (req: Request) => {
         }
         throw error;
       }
-      parsed.push({ path: projectRoot, alias, sortOrder });
+      parsed.push({ path: projectRoot, alias, sortOrder, launchConfig });
     }
     // Bulk path: every entry was a ghost — propagate the first failure so the
     // client gets a meaningful 400 instead of a misleading 200 with no changes.
@@ -201,7 +226,7 @@ export const PATCH = withHostRoute(async (req: Request) => {
 
     // Duplicate targets within one batch merge per-field (later defined
     // fields win) instead of the whole later update replacing the earlier.
-    const merged = new Map<string, { path: string; alias?: string | null; sortOrder?: number | null }>();
+    const merged = new Map<string, { path: string; alias?: string | null; sortOrder?: number | null; launchConfig?: ProjectLaunchConfig | null }>();
     for (const update of parsed) {
       const key = comparableProjectPath(update.path);
       const previous = merged.get(key);
@@ -209,6 +234,7 @@ export const PATCH = withHostRoute(async (req: Request) => {
         path: previous.path,
         alias: update.alias !== undefined ? update.alias : previous.alias,
         sortOrder: update.sortOrder !== undefined ? update.sortOrder : previous.sortOrder,
+        launchConfig: update.launchConfig !== undefined ? update.launchConfig : previous.launchConfig,
       } : update);
     }
 
@@ -236,9 +262,20 @@ export const PATCH = withHostRoute(async (req: Request) => {
     const updatedKeys = new Set(updates.map((update) => comparableProjectPath(update.path)));
     const projects = next.projects
       .filter((entry) => updatedKeys.has(comparableProjectPath(entry.path)))
-      .map((entry) => ({ ...withProjectKey(host, { path: entry.path, addedAt: entry.addedAt, alias: entry.alias, sortOrder: entry.sortOrder }), hidden: entry.hidden }));
+      .map((entry) => withProjectKey(host, {
+        path: entry.path,
+        addedAt: entry.addedAt,
+        alias: entry.alias,
+        sortOrder: entry.sortOrder,
+        launchConfig: entry.launchConfig,
+      }));
     return NextResponse.json({ projects, host: host.id });
-  } catch (error) { return apiErrorResponse(error); }
+  } catch (error) {
+    if (error instanceof ProjectPathError) {
+      return NextResponse.json({ error: error.message, code: error.code }, { status: 400 });
+    }
+    return apiErrorResponse(error);
+  }
 });
 
 // DELETE /api/projects[?host=<id>]  body: { cwd }  →  { success: true }

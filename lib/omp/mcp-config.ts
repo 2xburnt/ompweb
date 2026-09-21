@@ -283,11 +283,18 @@ async function projectRoot(host: Host, cwd: string): Promise<string> {
   const pathApi = host.pathApi;
   let root: string;
   try {
-    const result = await host.executor.exec(["git", "-C", cwd, "rev-parse", "--show-toplevel"], { timeoutMs: 15_000, allowFailure: true, env: { LC_ALL: "C" } });
+    const result = await host.executor.exec(["git", "-C", cwd, "rev-parse", "--show-toplevel"], {
+      timeoutMs: 15_000,
+      allowFailure: true,
+      env: { LC_ALL: "C" },
+    });
     const top = result.code === 0 ? result.stdout.toString("utf8").trim() : "";
-    root = top ? pathApi.resolve(top) : pathApi.resolve(cwd);
+    if (!top) return pathApi.resolve(cwd);
+    root = pathApi.resolve(top);
   } catch {
-    root = pathApi.resolve(cwd);
+    // Do not cache a fallback after transient git/SSH failures: the next call
+    // must retry rather than target the wrong directory for the full TTL.
+    return pathApi.resolve(cwd);
   }
   if (projectRootCache.size > 500) projectRootCache.clear();
   projectRootCache.set(key, { root, expiresAt: Date.now() + PROJECT_ROOT_TTL_MS });

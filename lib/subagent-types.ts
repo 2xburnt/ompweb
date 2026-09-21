@@ -119,7 +119,7 @@ export interface SubagentSnapshotLike {
   parentToolCallId?: string;
 }
 
-function asAgentSource(value: unknown): SubagentAgentSource | undefined {
+export function asAgentSource(value: unknown): SubagentAgentSource | undefined {
   return value === "bundled" || value === "user" || value === "project" ? value : undefined;
 }
 

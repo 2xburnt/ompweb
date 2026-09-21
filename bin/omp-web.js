@@ -9,6 +9,30 @@ if (!isNodeVersionSupported(process.versions.node)) {
   process.exit(1);
 }
 
+// Forward service subcommands from the main bin. This makes both
+// `npx @kahme247/ompweb@latest ompweb-launchd ...` and
+// `npx @kahme247/ompweb@latest ompweb-systemd ...` work without requiring
+// callers to know the path of the secondary executable.
+const forwardedServiceScripts = {
+  launchd: "omp-web-launchd.js",
+  "ompweb-launchd": "omp-web-launchd.js",
+  systemd: "omp-web-systemd.js",
+  "ompweb-systemd": "omp-web-systemd.js",
+};
+const forwardedServiceScript = forwardedServiceScripts[process.argv[2]];
+if (forwardedServiceScript) {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { spawnSync } = require("node:child_process");
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { join } = require("node:path");
+  const result = spawnSync(process.execPath, [join(__dirname, forwardedServiceScript), ...process.argv.slice(3)], { stdio: "inherit" });
+  if (result.error) {
+    console.error(`Failed to run ${process.argv[2]}: ${result.error.message}`);
+    process.exit(1);
+  }
+  process.exit(result.status ?? 1);
+}
+
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { spawn } = require("node:child_process");
 // eslint-disable-next-line @typescript-eslint/no-require-imports

@@ -55,6 +55,16 @@ const ADVISOR_PROMPT = (args: string) =>
     ? `Act as an independent advisor reviewing this work: ${args}. Assess the approach, point out risks, gaps, and better alternatives, and give concrete recommendations without changing any code.`
     : `Act as an independent advisor reviewing the current work. Assess the recent changes and overall direction, point out risks, gaps, and better alternatives, and give concrete recommendations without changing any code.`;
 
+const LOOP_MAX_ATTEMPTS = 10;
+const LOOP_DEFAULT_ATTEMPTS = 3;
+
+const LOOP_PROMPT = (args: string) => {
+  const match = args.match(/^(\d+)\s+([\s\S]+)$/);
+  const attempts = match ? Math.min(Math.max(parseInt(match[1], 10) || LOOP_DEFAULT_ATTEMPTS, 1), LOOP_MAX_ATTEMPTS) : LOOP_DEFAULT_ATTEMPTS;
+  const task = match ? match[2].trim() : args;
+  return `Attempt the following task, verifying the result concretely after each attempt (run the relevant checks or tests). If it is not fully done, try again from where it stands, building on what you learned — up to ${attempts} attempts in total. Stop early once it is done. Do not ask for confirmation between attempts.\n\nTask:\n\n${task}`;
+};
+
 export const WEB_SLASH_COMMANDS: readonly WebSlashCommandDef[] = [
   {
     name: "goal",
@@ -118,6 +128,13 @@ export const WEB_SLASH_COMMANDS: readonly WebSlashCommandDef[] = [
     argumentHintKey: "chatInput.cmdAdvisorArg",
     requiresArgs: false,
     buildPrompt: ADVISOR_PROMPT,
+  },
+  {
+    name: "loop",
+    descriptionKey: "chatInput.cmdLoop",
+    argumentHintKey: "chatInput.cmdLoopArg",
+    requiresArgs: true,
+    buildPrompt: LOOP_PROMPT,
   },
 ];
 const WEB_SLASH_COMMAND_LOOKUP = new Map(WEB_SLASH_COMMANDS.map((command) => [command.name, command]));

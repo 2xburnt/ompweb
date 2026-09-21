@@ -1,13 +1,22 @@
-import { existsSync } from "fs";
+import { randomUUID } from "crypto";
+import { existsSync, realpathSync } from "fs";
 import { homedir } from "os";
 import { currentHost } from "./hosts/context";
 import type { Host } from "./hosts/registry";
 import { validateAgentImages } from "./image-attachments";
+import { hasVisibleAssistantContent } from "./assistant-response";
 import { invalidateModelsCache } from "./models-cache";
 import { RpcCommandError, RpcCommandTimeoutError, RpcProcess, type RpcFrame } from "./omp/rpc-process";
 import { getCachedNativeSettings } from "./omp/settings-config";
-import { cacheSessionPath, invalidateSessionListCache } from "./session-reader";
+import {
+  cacheSessionPath,
+  invalidateSessionEntriesCache,
+  invalidateSessionListCache,
+  invalidateSessionListMeta,
+} from "./session-reader";
 import { PRESET_FULL } from "./tool-presets";
+import { comparableProjectPath } from "./comparable-path";
+import { isReservedLaunchArg, loadProjectRegistry } from "./project-registry";
 import type {
   BashResultInfo,
   OmpModel,
@@ -16,7 +25,8 @@ import type {
   SessionStatsInfo,
   WebSessionState,
 } from "./pi-types";
-import type { ExtensionWidgetItem } from "./types";
+import type { AgentMessage, ExtensionWidgetItem, ProjectLaunchConfig } from "./types";
+import type { SessionLiveSnapshot, SessionLiveToolEvent, SessionStreamCursor } from "./session-sync";
 
 // ============================================================================
 // Types
@@ -24,10 +34,12 @@ import type { ExtensionWidgetItem } from "./types";
 
 export interface AgentEvent {
   type: string;
+  web: SessionStreamCursor;
   [key: string]: unknown;
 }
 
 type EventListener = (event: AgentEvent) => void;
+type UnsequencedAgentEvent = { type: string; [key: string]: unknown };
 
 interface CompactionResultLike {
   summary?: string;
@@ -135,7 +147,7 @@ export function mapPresetToolNames(toolNames: string[]): string[] {
 const FULL_PRESET_KEY = [...PRESET_FULL].map((n) => n.toLowerCase()).sort().join(",");
 
 /** Extra CLI args for spawning `omp --mode rpc-ui` for a session. */
-export function buildSessionSpawnArgs(sessionFile: string, toolNames?: string[], advisor = false): string[] {
+export function buildSessionSpawnArgs(sessionFile: string, toolNames?: string[], advisor = false, launchConfig?: ProjectLaunchConfig): string[] {
   const args: string[] = [];
   if (sessionFile) {
     // An absolute path (or anything containing "/") resolves deterministically:
@@ -155,6 +167,12 @@ export function buildSessionSpawnArgs(sessionFile: string, toolNames?: string[],
     }
   }
   if (advisor) args.push("--advisor");
+  else if (launchConfig?.advisor) args.push("--advisor");
+  // Defense in depth: the registry is hand-editable, so re-strip reserved
+  // args and dash-leading profiles at the spawn boundary even though the
+  // API validates them on write.
+  if (launchConfig?.profile && !launchConfig.profile.startsWith("-")) args.push("--profile", launchConfig.profile);
+  if (launchConfig?.extraArgs) args.push(...launchConfig.extraArgs.filter((arg) => !isReservedLaunchArg(arg)));
   return args;
 }
 
@@ -227,7 +245,7 @@ function patchEstimatedTokensAfter(result: unknown): void {
 
 export class AgentSessionWrapper {
   private listeners: EventListener[] = [];
-  private pendingUiRequests = new Map<string, AgentEvent>();
+  private pendingUiRequests = new Map<string, UnsequencedAgentEvent>();
   private uiExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private extensionStatuses = new Map<string, string>();
   private extensionWidgets = new Map<string, ExtensionWidgetItem>();
@@ -239,6 +257,13 @@ export class AgentSessionWrapper {
   private bashRunning = false;
   private streaming = false;
   private compacting = false;
+  private streamId = randomUUID();
+  private streamSequence = 0;
+  private streamingMessage: Partial<AgentMessage> | null = null;
+  private liveToolEvents = new Map<string, SessionLiveToolEvent>();
+  /** Positive evidence for this run, retained after native completion but before disk append. */
+  private responseObserved = false;
+  private responseRunActive = false;
   private fastModeEnabled = false;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private onDestroyCallback: (() => void) | null = null;
@@ -255,11 +280,11 @@ export class AgentSessionWrapper {
   /** Host tools the web UI registered via set_host_tools (agent-callable). */
   private hostToolNames: Set<string> = new Set();
   /** host_tool_call ids awaiting a host_tool_result from the browser. */
-  private pendingHostTools: Map<string, AgentEvent> = new Map();
+  private pendingHostTools: Map<string, UnsequencedAgentEvent> = new Map();
   /** URI schemes the web UI registered via set_host_uri_schemes. */
   private hostUriSchemes: Map<string, { writable?: boolean }> = new Map();
   /** host_uri_request ids awaiting a host_uri_result from the browser. */
-  private pendingHostUris: Map<string, AgentEvent> = new Map();
+  private pendingHostUris: Map<string, UnsequencedAgentEvent> = new Map();
   /** Resolves once an in-flight destroyAndWait finishes; null when idle. Read
    * by startRpcSession so a replacement spawn awaits the old child's exit. */
   destroyPromise: Promise<void> | null = null;
@@ -284,7 +309,7 @@ export class AgentSessionWrapper {
   // runnable under Node's strip-only TypeScript mode for probes/tests.
   constructor(proc: RpcProcess, cwd: string, recordedCwd?: string | null, advisorSpawned = false) {
     this.proc = proc;
-    this.host = proc.host;
+    this.host = proc.host ?? currentHost();
     this.cwd = cwd;
     this.recordedCwd = recordedCwd ?? null;
     this.advisorSpawned = advisorSpawned;
@@ -304,6 +329,33 @@ export class AgentSessionWrapper {
 
   isRunning(): boolean {
     return this.isAlive() && (this.promptRunning || this.streaming || this.compacting || this.bashRunning);
+  }
+
+  /** NDJSON messages are fresh snapshots; copy containers, not token payloads. */
+  getStreamSnapshot(): SessionLiveSnapshot {
+    return {
+      cursor: { streamId: this.streamId, sequence: this.streamSequence },
+      isStreaming: this.streaming,
+      isPromptRunning: this.promptRunning,
+      isCompacting: this.compacting,
+      responseObserved: this.responseObserved,
+      streamingMessage: this.streamingMessage ? { ...this.streamingMessage } : null,
+      toolEvents: Array.from(this.liveToolEvents.values(), (event) => ({ ...event })),
+    };
+  }
+
+  private clearLiveSnapshots(): void {
+    this.streamingMessage = null;
+    this.liveToolEvents.clear();
+    this.streamSequence += 1;
+  }
+
+  private resetStream(): void {
+    this.clearLiveSnapshots();
+    this.responseObserved = false;
+    this.responseRunActive = false;
+    this.streamId = randomUUID();
+    this.streamSequence = 0;
   }
 
   start(): void {
@@ -343,6 +395,13 @@ export class AgentSessionWrapper {
   }
 
   private applyIdentity(state: RpcSessionState): void {
+    if (this._sessionId && (state.sessionId !== this._sessionId || (state.sessionFile && state.sessionFile !== this._sessionFile))) {
+      this.resetStream();
+      this.promptRunning = false;
+      this.awaitingAgentStart = false;
+      this.awaitingAgentStartDeadline = 0;
+      this.continuationGraceUntil = 0;
+    }
     this._sessionId = state.sessionId;
     this._sessionFile = state.sessionFile ?? "";
     this._sessionName = state.sessionName;
@@ -369,7 +428,7 @@ export class AgentSessionWrapper {
 
   private handleFrame(frame: RpcFrame): void {
     this.resetIdleTimer();
-    const event = frame as AgentEvent;
+    const event = frame;
     let refreshSessionList = false;
 
     switch (event.type) {
@@ -395,7 +454,7 @@ export class AgentSessionWrapper {
         // The session file can appear just after the prompt acknowledgement.
         // Invalidate and signal the sidebar now rather than waiting for the
         // agent's first reply or terminal event.
-        invalidateSessionListCache();
+        this.invalidateSessionLists();
         refreshSessionList = true;
         // If the file is not on disk yet, the sidebar refresh above may walk
         // the sessions dir before it exists — and the mtime-keyed walk cache
@@ -414,7 +473,7 @@ export class AgentSessionWrapper {
           this.awaitingAgentStart = false;
           this.awaitingAgentStartDeadline = 0;
           this.continuationGraceUntil = 0;
-          invalidateSessionListCache();
+          this.invalidateSessionLists();
         } else {
           this.continuationGraceUntil = Date.now() + NON_TERMINAL_CONTINUATION_GRACE_MS;
         }
@@ -433,21 +492,37 @@ export class AgentSessionWrapper {
         // Same patch the manual `compact` path applies — the client reads
         // event.result.estimatedTokensAfter for the banner.
         patchEstimatedTokensAfter(event.result);
-        invalidateSessionListCache();
+        this.invalidateSessionLists();
         break;
       case "session_info_update":
         if (typeof event.title === "string") this._sessionName = event.title;
-        invalidateSessionListCache();
+        this.invalidateSessionLists();
         refreshSessionList = true;
         break;
       case "response": {
         // Unsolicited failed responses surface async prompt failures (omp
-        // reuses the original command id after the immediate ack).
-        if (event.success === false && event.command === "prompt") {
+        // reuses the original command id after the immediate ack). Some omp
+        // versions omit `command` on that second response, so the active run
+        // is also a terminal-failure signal. Otherwise this frame would be
+        // ignored and the UI would stop with no explanation.
+        if (event.success === false) {
+          const promptFailure =
+            event.command === "prompt" ||
+            (!event.command && (this.promptRunning || this.streaming));
+          const detail = typeof event.error === "string"
+            ? event.error
+            : typeof event.message === "string"
+              ? event.message
+              : "RPC command failed";
+          if (!promptFailure) {
+            this.emit({ type: "error", error: event.error, message: detail, command: event.command });
+            notifyRunningChange();
+            return;
+          }
           this.promptRunning = false;
           this.awaitingAgentStart = false;
           this.awaitingAgentStartDeadline = 0;
-          this.emit({ type: "prompt_error", errorMessage: (event.error as string) ?? "Prompt failed" });
+          this.emit({ type: "prompt_error", errorMessage: detail, error: event.error, command: event.command });
           notifyRunningChange();
           return;
         }
@@ -541,7 +616,7 @@ export class AgentSessionWrapper {
     this.pendingUiRequests.clear();
   }
 
-  private trackExtensionUiRequest(event: AgentEvent): boolean {
+  private trackExtensionUiRequest(event: UnsequencedAgentEvent): boolean {
     const method = event.method as string;
     const id = event.id as string;
     if (method === "cancel") {
@@ -604,7 +679,7 @@ export class AgentSessionWrapper {
    * forever waiting for a response. Registered host tools are routed to
    * listeners in handleFrame (see the host_tool_call case).
    */
-  private rejectUnexpectedHostTool(event: AgentEvent): void {
+  private rejectUnexpectedHostTool(event: UnsequencedAgentEvent): void {
     const id = typeof event.id === "string" ? event.id : "";
     if (!id) return;
     const toolName = typeof event.toolName === "string" ? event.toolName : "unknown";
@@ -648,10 +723,65 @@ export class AgentSessionWrapper {
     this.pendingHostUris.clear();
   }
 
-  private emit(event: AgentEvent): void {
+  private emit(event: UnsequencedAgentEvent): void {
+    // `web` belongs to this wrapper, never to native/extension-supplied frames.
+    // Strip it before caching tool snapshots as well as before wire emission.
+    delete event.web;
+    switch (event.type) {
+      case "agent_start":
+        this.responseObserved = false;
+        this.responseRunActive = true;
+        this.clearLiveSnapshots();
+        break;
+      case "agent_end":
+        if (event.isTerminal === false) break;
+        this.responseRunActive = false;
+        this.streaming = false;
+        this.promptRunning = false;
+        this.compacting = false;
+        this.clearLiveSnapshots();
+        break;
+      case "prompt_error":
+      case "prompt_result":
+        this.responseRunActive = false;
+        this.streaming = false;
+        this.compacting = false;
+        this.promptRunning = false;
+        this.clearLiveSnapshots();
+        break;
+      case "message_start":
+      case "message_update": {
+        const message = event.message as Partial<AgentMessage> | undefined;
+        if (message && message.role !== "user") this.streamingMessage = message;
+        if (this.responseRunActive && hasVisibleAssistantContent(message)) this.responseObserved = true;
+        break;
+      }
+      case "message_end": {
+        const message = event.message as Partial<AgentMessage> | undefined;
+        if (this.responseRunActive && hasVisibleAssistantContent(message)) this.responseObserved = true;
+        if (message?.role && message.role === this.streamingMessage?.role) this.streamingMessage = null;
+        if (message?.role === "toolResult" && message.toolCallId) this.liveToolEvents.delete(message.toolCallId);
+        break;
+      }
+      case "tool_execution_start":
+      case "tool_execution_update":
+        if (typeof event.toolCallId === "string") {
+          this.liveToolEvents.set(event.toolCallId, {
+            ...this.liveToolEvents.get(event.toolCallId),
+            ...event,
+            type: event.type,
+            toolCallId: event.toolCallId,
+          });
+        }
+        break;
+      case "tool_execution_end":
+        if (typeof event.toolCallId === "string") this.liveToolEvents.delete(event.toolCallId);
+        break;
+    }
+    event.web = { streamId: this.streamId, sequence: ++this.streamSequence };
     for (const l of this.listeners) {
       try {
-        l(event);
+        l(event as AgentEvent);
       } catch {
         // A throwing subscriber (SSE encode failure, UI handler bug) must not
         // starve the remaining subscribers — same isolation RpcProcess and
@@ -661,6 +791,21 @@ export class AgentSessionWrapper {
   }
 
   private sessionFileSignalTimer: NodeJS.Timeout | null = null;
+
+  /** Invalidate session-list metadata plus ONLY this session's parse caches
+   * when the file path is known, else fall back to the full invalidation.
+   * Use this on the hot event paths (agent_end, auto_compaction_end,
+   * session_info_update, …) so a busy session does not flush every other
+   * open session's parsed-entry cache. List metadata (sidebar order/counts)
+   * still always refreshes. */
+  private invalidateSessionLists(): void {
+    if (this._sessionFile) {
+      invalidateSessionListMeta();
+      invalidateSessionEntriesCache(this._sessionFile);
+    } else {
+      invalidateSessionListCache();
+    }
+  }
 
   /** Poll briefly for the session file to appear after agent_start, then
    *  invalidate the session-list caches and re-signal the sidebar so the
@@ -685,7 +830,7 @@ export class AgentSessionWrapper {
           }
           return;
         }
-        invalidateSessionListCache();
+        this.invalidateSessionLists();
         notifyRunningChange({ refreshSessionList: true });
       });
     };
@@ -717,7 +862,7 @@ export class AgentSessionWrapper {
         this.forgetPendingUiRequest(id);
         continue;
       }
-      listener(event);
+      listener({ ...event, web: { streamId: this.streamId, sequence: ++this.streamSequence } });
     }
     return () => {
       const i = this.listeners.indexOf(listener);
@@ -789,13 +934,31 @@ export class AgentSessionWrapper {
     this.mcpListWaiter = waiter;
 
     try {
-      await this.proc.sendCommand({ type: "prompt", message: "/mcp list" });
+      // Bounded like the prompt ack: a child that accepts the frame but never
+      // acks it would otherwise suspend this call forever — the `finally` below
+      // would never run and the wrapper would keep reporting itself as busy
+      // (later calls fail with session_busy) until unrelated traffic cleared
+      // the wedge. The 15s output wait above stays a separate concern.
+      await this.proc.sendCommand({ type: "prompt", message: "/mcp list" }, PROMPT_ACK_TIMEOUT_MS);
       return await output;
     } catch (error) {
+      const expired = error instanceof RpcCommandTimeoutError;
       if (this.mcpListWaiter === waiter) {
         clearTimeout(waiter.timer);
         this.mcpListWaiter = null;
-        waiter.reject(error instanceof Error ? error : new Error(String(error)));
+        waiter.reject(
+          expired
+            ? new WebRpcError("The OMP session stopped responding and was reset.", "session_unresponsive")
+            : error instanceof Error
+              ? error
+              : new Error(String(error)),
+        );
+      }
+      if (expired) {
+        // Nothing on this child will ever resolve the waiter; recycle it like
+        // the prompt-ack timeout path so the next request gets a fresh child.
+        await this.destroyAndWait();
+        throw new WebRpcError("The OMP session stopped responding and was reset.", "session_unresponsive");
       }
       throw error;
     } finally {
@@ -812,13 +975,8 @@ export class AgentSessionWrapper {
     const wasRunning = this.isRunning();
 
     // Reconcile process-side flags with authoritative child state.
-    this.streaming = state.isStreaming;
-    this.compacting = state.isCompacting;
-    this._sessionName = state.sessionName;
-    if (state.sessionId) {
-      this._sessionId = state.sessionId;
-      this._sessionFile = state.sessionFile ?? this._sessionFile;
-    }
+    this.applyIdentity({ ...state, sessionFile: state.sessionFile ?? this._sessionFile });
+    this.streamSequence += 1;
 
     const awaitingExpired = !this.awaitingAgentStart || Date.now() >= this.awaitingAgentStartDeadline;
     const hasPendingWork =
@@ -838,6 +996,7 @@ export class AgentSessionWrapper {
       this.promptRunning = false;
       this.awaitingAgentStart = false;
       this.awaitingAgentStartDeadline = 0;
+      this.clearLiveSnapshots();
     }
 
     if (wasRunning && !this.isRunning()) {
@@ -850,6 +1009,7 @@ export class AgentSessionWrapper {
       isStreaming: state.isStreaming,
       isPromptRunning: this.promptRunning,
       isBashRunning: this.bashRunning,
+      responseObserved: this.responseObserved,
       isCompacting: state.isCompacting,
       autoCompactionEnabled: state.autoCompactionEnabled,
       autoRetryEnabled: state.autoRetryEnabled,
@@ -896,7 +1056,7 @@ export class AgentSessionWrapper {
     if (oldId && oldId !== this._sessionId) {
       this.onIdentityChangeCallback?.(oldId, this._sessionId);
     }
-    invalidateSessionListCache();
+    this.invalidateSessionLists();
     return this._sessionId;
   }
 
@@ -911,6 +1071,10 @@ export class AgentSessionWrapper {
     // Stays true for the whole restart so send() rejects commands that would
     // otherwise hit the disposed or half-built child.
     this.restarting = true;
+    this.resetStream();
+    this.streaming = false;
+    this.promptRunning = false;
+    this.compacting = false;
     this.unsubscribeFrames?.();
     try {
       await old.dispose();
@@ -930,7 +1094,7 @@ export class AgentSessionWrapper {
       const proc = new RpcProcess({
         host: this.host,
         cwd: this.cwd,
-        extraArgs: buildSessionSpawnArgs(resumable ? sessionFile : ""),
+        extraArgs: buildSessionSpawnArgs(resumable ? sessionFile : "", undefined, this.advisorSpawned, launchConfigForCwd(this.cwd)),
         onExit: ({ stderrTail }) => {
           if (this.proc === proc) this.handleProcessExit(stderrTail);
         },
@@ -945,6 +1109,14 @@ export class AgentSessionWrapper {
         await proc.sendCommand({ type: "set_subagent_subscription", level: "events" }).catch(() => {});
         const state = await proc.sendCommand<RpcSessionState>({ type: "get_state" }, GET_STATE_TIMEOUT_MS);
         this.applyIdentity(state);
+        // Same fresh-spawn guard as startRpcSession: a sessionless wrapper
+        // restarts bare, and omp's startup resume handling could land it on the
+        // cwd's most recent session. An on-disk session file is the resume
+        // signal (fresh children report a not-yet-created path).
+        if (!resumable && this._sessionFile && existsSync(this._sessionFile)) {
+          await proc.sendCommand({ type: "new_session" });
+          this.applyIdentity(await proc.sendCommand<RpcSessionState>({ type: "get_state" }, GET_STATE_TIMEOUT_MS));
+        }
       } catch (error) {
         // Never leave the replacement running with nobody reading its frames.
         this.unsubscribeFrames?.();
@@ -982,6 +1154,10 @@ export class AgentSessionWrapper {
         }
         const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
         if (!streamingBehavior) {
+          this.responseObserved = false;
+          this.responseRunActive = false;
+          if (!this.isRunning()) this.clearLiveSnapshots();
+          this.streamSequence += 1;
           this.promptRunning = true;
           this.promptDispatchPendingCount += 1;
           this.awaitingAgentStart = false;
@@ -1016,6 +1192,8 @@ export class AgentSessionWrapper {
           this.promptRunning = false;
           this.awaitingAgentStart = false;
           this.awaitingAgentStartDeadline = 0;
+          this.streaming = false;
+          this.clearLiveSnapshots();
           notifyRunningChange();
           if (error instanceof RpcCommandTimeoutError) {
             // The child took the frame but never acked it, so nothing will ever
@@ -1045,6 +1223,8 @@ export class AgentSessionWrapper {
       }
 
       case "abort":
+        this.responseObserved = false;
+        this.responseRunActive = false;
         await this.withFinalRunningNotification(async () => {
           await this.proc.sendCommand({ type: "abort" });
           // If the prompt was aborted before the agent loop started, no
@@ -1058,6 +1238,7 @@ export class AgentSessionWrapper {
           this.awaitingAgentStart = false;
           this.awaitingAgentStartDeadline = 0;
           this.continuationGraceUntil = 0;
+          this.clearLiveSnapshots();
         });
         return null;
 
@@ -1078,7 +1259,7 @@ export class AgentSessionWrapper {
         const { provider, modelId } = command as { provider: string; modelId: string };
         const model = await this.proc.sendCommand<OmpModel>({ type: "set_model", provider, modelId });
         invalidateModelsCache();
-        invalidateSessionListCache();
+        this.invalidateSessionLists();
         return { id: model.id, provider: model.provider };
       }
 
@@ -1119,6 +1300,7 @@ export class AgentSessionWrapper {
         try {
           return await this.withFinalRunningNotification(async () => {
             this.compacting = true;
+            this.streamSequence += 1;
             notifyRunningChange();
             try {
               const result = await this.proc.sendCommand<CompactionResultLike>({
@@ -1129,10 +1311,11 @@ export class AgentSessionWrapper {
               return result;
             } finally {
               this.compacting = false;
+              this.streamSequence += 1;
             }
           });
         } finally {
-          invalidateSessionListCache();
+          this.invalidateSessionLists();
         }
       }
 
@@ -1147,7 +1330,7 @@ export class AgentSessionWrapper {
         if (!name) throw new Error("Session name cannot be empty");
         await this.proc.sendCommand({ type: "set_session_name", name });
         this._sessionName = name;
-        invalidateSessionListCache();
+        this.invalidateSessionLists();
         return null;
       }
 
@@ -1197,7 +1380,7 @@ export class AgentSessionWrapper {
           return await this.proc.sendCommand<BashResultInfo>({ type: "bash", command: command.command as string });
         } finally {
           this.bashRunning = false;
-          invalidateSessionListCache();
+          this.invalidateSessionLists();
           notifyRunningChange();
         }
       }
@@ -1236,8 +1419,13 @@ export class AgentSessionWrapper {
 
       default: {
         if (PASSTHROUGH_COMMANDS.has(type)) {
+          if (type === "abort_and_prompt") {
+            this.responseObserved = false;
+            this.responseRunActive = false;
+            this.streamSequence += 1;
+          }
           const result: unknown = await this.proc.sendCommand(command as { type: string });
-          if (type === "set_thinking_level") invalidateSessionListCache();
+          if (type === "set_thinking_level") this.invalidateSessionLists();
           return result ?? null;
         }
         throw new Error(`Unsupported command: ${type}`);
@@ -1258,6 +1446,12 @@ export class AgentSessionWrapper {
     if (this.destroyPromise) return this.destroyPromise;
     if (!this._alive) return;
     this._alive = false;
+    this.streaming = false;
+    this.promptRunning = false;
+    this.compacting = false;
+    this.responseObserved = false;
+    this.responseRunActive = false;
+    this.clearLiveSnapshots();
     if (this.idleTimer) clearTimeout(this.idleTimer);
     if (this.sessionFileSignalTimer) {
       clearTimeout(this.sessionFileSignalTimer);
@@ -1397,6 +1591,18 @@ export function notifyRunningChange({ refreshSessionList = false }: { refreshSes
   }
 }
 
+/** Look up the workspace-registered launch config; unregistered projects attach none. */
+function launchConfigForCwd(cwd: string): ProjectLaunchConfig | undefined {
+  let canonical = cwd;
+  try { canonical = realpathSync(cwd); } catch {}
+  const key = comparableProjectPath(canonical);
+  return loadProjectRegistry().projects.find((project) => {
+    if (project.hidden) return false;
+    const projectKey = comparableProjectPath(project.path);
+    return projectKey === key || key.startsWith(`${projectKey}-worktrees/`);
+  })?.launchConfig;
+}
+
 /**
  * Get or create the omp RPC process for the given session.
  * For new sessions (sessionFile === ""), omp generates its own id.
@@ -1414,9 +1620,16 @@ export async function startRpcSession(
   /** The cwd recorded in the session file header, used to detect a spawn
    * fallback (recorded dir gone) and warn the user. Omit for new sessions. */
   recordedCwd?: string | null,
+  launchConfig?: ProjectLaunchConfig,
 ): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
   const registry = getRegistry();
   const locks = getLocks();
+  launchConfig = launchConfig ?? launchConfigForCwd(cwd);
+  // Union semantics, matching the spawn below and the wrapper identity:
+  // workspace advisor=true forces the flag on. The gate must compare this
+  // same effective value — comparing the raw toggle would destroy+respawn a
+  // workspace-forced child on every toggle-off prompt.
+  const effectiveAdvisor = advisor === true || launchConfig?.advisor === true;
 
   const existing = registry.get(sessionId);
   if (existing?.isAlive()) {
@@ -1426,7 +1639,7 @@ export async function startRpcSession(
     // children are kept (a mid-run swap would drop in-flight work) and pick
     // the new flag up at the next natural respawn; callers that pass no
     // advisor opinion (undefined) simply reuse whatever is running.
-    if (advisor === undefined || existing.advisorSpawned === advisor || existing.isRunning()) {
+    if (advisor === undefined || existing.advisorSpawned === effectiveAdvisor || existing.isRunning()) {
       return { session: existing, realSessionId: sessionId };
     }
     await existing.destroyAndWait();
@@ -1448,14 +1661,24 @@ export async function startRpcSession(
     const proc = new RpcProcess({
       host,
       cwd,
-      extraArgs: buildSessionSpawnArgs(sessionFile, toolNames, advisor === true),
+      extraArgs: buildSessionSpawnArgs(sessionFile, toolNames, advisor === true, launchConfig),
       onExit: ({ stderrTail }) => holder.wrapper?.handleProcessExit(stderrTail),
     });
-    const created = new AgentSessionWrapper(proc, cwd, recordedCwd, advisor === true);
+    const created = new AgentSessionWrapper(proc, cwd, recordedCwd, advisor === true || launchConfig?.advisor === true);
     holder.wrapper = created;
     created.start();
     try {
       await created.waitUntilReady();
+      // A fresh spawn (no --resume) must never land in an existing conversation:
+      // omp's startup resume handling can be config- or version-driven into
+      // continuing the cwd's most recent session, which would silently send the
+      // first prompt into an old .jsonl. The child's reported session file
+      // existing on disk is the resume signal — a genuinely fresh child reports
+      // a path it has not created yet (session files are written lazily on the
+      // first message), so this never fires for a real new session.
+      if (!sessionFile && created.sessionFile && existsSync(created.sessionFile)) {
+        await created.send({ type: "new_session" });
+      }
     } catch (error) {
       // Await the child's full exit before the `finally` releases the startup
       // lock: a fire-and-forget destroy() would let a retry spawn a second

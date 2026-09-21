@@ -4,6 +4,100 @@ All notable changes to **omp-web** (`@kahme247/ompweb`) are documented in this f
 
 ---
 
+## Unreleased
+
+### Added
+
+- Add **Copy** and **Copy as Markdown** below user messages and completed assistant replies, with keyboard access and touch-sized controls. Copy only message text, excluding thinking, tool output, and renderer controls; preserve full source for oversized raw-text messages.
+- Scope Ctrl+A / Cmd+A to the selected message, currently loaded chat, or active file contents instead of the whole page. Message selection includes collapsed extension previews and expanded details without toolbar labels. Newer pane focus takes precedence over retained child selections. Text fields and IME composition retain native behavior; browser-menu commands and embedded viewers remain browser-controlled.
+- Add an off-by-default **Scope native Select All (experimental)** switch in Settings → Interface & Behavior. The per-browser preference narrows whole-page selections from native menus while leaving keyboard scoping independent. Disable it if browser selection handles or menus behave unexpectedly; intentional whole-page selections can also be narrowed.
+- Play back a voice recording before transcribing or sending it. Pause keeps a left-side preview control; Stop opens a review deck with play, discard, and transcribe-and-send.
+
+### Fixes & Improvements
+
+- Refresh the OMP version shown in new sessions after a CLI update without requiring an omp-web server restart. Reuse results while executable metadata is unchanged, with a five-minute fallback expiry for launchers. Keep the last known version visible between visits and distinguish initial loading from an unavailable runtime.
+- Restore copy-success feedback after React Strict Mode re-runs effect setup.
+- Keep sent-message copy, edit, and fork actions visible without hover or a reveal tap. Also keep file mention/download, Git open-file actions, and sidebar menus visible alongside their metadata; wrap message actions on narrow screens.
+- Expand complete tool inputs inline, including multiline code and edit patches, while keeping command previews compact and output visibility unchanged.
+- Keep composer controls on one line, with equally sized Send, Stop, and Queue buttons and model names truncating before short effort labels.
+- Align the + button and primary action with matching composer insets.
+- Clearly dim Attach files while the agent is running; queued messages remain text-only.
+- Recover saved responses before reporting an empty agent reply after returning to a backgrounded page or PWA. Preserve provider errors and distinguish new runs from older answers.
+- Catch up missed conversation entries incrementally after reconnecting or returning to the page, including during active runs. Restore quiet partial responses and live tool output without duplicating history or overwriting newer updates.
+- Send prompts with image attachments in full again: commands reach OMP as one unchunked JSONL record. Protocol-v2 `rpc_chunk` framing is outbound-only, so any prompt over 1 MiB was rejected as `Unknown command: rpc_chunk` and reset the session after the prompt-ack timeout.
+- Show the **New session** fork action below agent replies as well as user prompts, so the newest message in a conversation can fork the session. omp's `branch` command accepts a user entry only, so each reply forks at the prompt that started its turn; replies with no earlier prompt keep no fork action.
+
+---
+
+## [v0.5.0] - 2026-09-12
+
+This release brings live tool-output streaming, a workspace picker for new sessions, voice dictation, new themes, an activity timeline with transcript export, and a redesigned settings experience.
+
+### Highlights
+
+- **Live tool output**: Tool calls now show a running indicator with streamed output while the tool executes, instead of a dead row awaiting the result.
+- **Workspace picker for new sessions**: Choose the destination workspace directly above the new-session composer, with workspace names, exact paths, and worktree preservation.
+- **Voice dictation**: Provider-agnostic speech-to-text dictation in the composer.
+- **New themes**: OMP Midnight plus popular light and dark palettes with previews and CommandPalette support.
+- **Activity timeline**: Activity group summaries, a minimap rail, and transcript export.
+- **Composer upgrades**: Plus menu, context-ring gauge, context detail panel, and a `/loop` command to repeat a task up to N attempts.
+- **Redesigned settings**: Full-page centered layout with a provider grid.
+- **Long-session stability**: Targeted cache invalidation, oversized-file handling, better error surfacing, and render optimization.
+
+### Fixes & Improvements
+
+- Keep Cancel and Submit reachable in mobile extension questions by scrolling long questions and answers above a fixed action row and sizing the editor for short viewports.
+- Confirm session deletion and workspace removal in dialogs on desktop and mobile. Cancel leaves data untouched; workspace removal keeps files and sessions.
+- Center the workspace/session breadcrumb over the conversation column, and keep mobile generation speed and file-panel controls clear of the panel toggle. Explorer actions now have a separate touch-sized toolbar on mobile.
+- Keep the top bar on one row with a fixed-width speed readout: compact units such as t/s, kt/s, and Mt/s, and a same-width ~ marker for average speed. The full rate remains in the tooltip; the whole pill hides when it cannot fit, without clipping or scrolling.
+- Keep the fixed-width speed readout visible on narrow screens, including 320px: show theme, language, history, branches, and system controls directly when their measured widths fit beside any visible speed readout, and use a More disclosure otherwise, without shrinking touch targets. New-session screens do not reserve space for an absent readout.
+- Open the language menu to the right of its left-side toolbar trigger so all options remain visible in the mobile More disclosure and the desktop header.
+- Keep resized file panels and their contents inside the window at intermediate widths and non-default interface scales, wrapping file and Explorer actions when space is tight.
+- Keep session action menus visible on touch devices beside fixed-width, right-aligned timestamps, with larger tap targets and titles using the remaining row width.
+- Keep workspace header action menus visible on touch devices without first selecting or expanding the workspace.
+- Keep provider and OMP System navigation in one horizontally scrollable row on narrow screens, and keep Save and Cancel in normal flow with inline save errors.
+- Hide the Steer action when the only queued message is already a steer, matching the expanded queue while keeping Edit and Delete available.
+- Keep the theme picker inside the mobile viewport by opening it to the right of its toolbar anchor.
+- Match browser and installed-app chrome to the selected theme, with OMP Midnight as the launch fallback.
+- Open the conversation sidebar on Back before leaving in narrow, overlay-sidebar layouts. On every layout, warn before Back, reload, or close can discard unsent text or attachments. Cancel keeps the current conversation and drafts; switching conversations still preserves drafts.
+- Keep unsent-content confirmation active across consecutive Back presses on Android Chrome, including after switching to a new session.
+- Some installed browsers cannot close a directly launched app programmatically. After confirming Leave, use native Back or Close if prompted. Chrome may bypass sidebar-first Back until the first interaction after launch, and Android process termination can bypass page warnings.
+- Show app-close guidance only in standalone installed apps, never in ordinary browser tabs.
+
+---
+
+## [v0.4.2] - 2026-09-02
+
+### Fixes & Improvements
+
+- Handle provider daily usage windows and Windows npm spawn shells in the self-update flow.
+
+---
+
+## [v0.4.1] - 2026-09-02
+
+### Fixes & Improvements
+
+- Surface quota 429 RESOURCE_EXHAUSTED errors persistently instead of stopping silently.
+- Pin the live agent status bar to the top edge of the composer.
+- Keep the running indicator visible on selected/hovered sessions.
+
+---
+
+## [v0.4.0] - 2026-09-02
+
+This release adds native autostart services, self-updates, a redesigned top bar, usage analytics, and composer upgrades.
+
+### Highlights
+
+- **Native autostart**: Windows Task Scheduler service, system tray manager, desktop shortcuts, and macOS launchd installer.
+- **Self-updates**: Durable auto-update for OMP and omp-web with unified notifications.
+- **Top bar redesign**: 3-zone layout with centered breadcrumb, provider cards, and zoom-aware menus.
+- **Usage analytics**: Dashboard with persistent SQLite store plus provider usage limits.
+- **Composer upgrades**: Tool preset picker, collapsible input, file search in the Explorer, and workspace-level OMP launch arguments.
+
+---
+
 ## [v0.3.6] - 2026-08-28
 
 This release adds workspace renaming and reordering, improved context compaction views, prompt queue expansion, and clear network startup banners.

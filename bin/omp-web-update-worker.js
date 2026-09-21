@@ -199,10 +199,11 @@ async function runManagerGate() {
   let retries = 0;
   let lastResult;
   while (retries <= 1) {
-    const result = cp.spawnSync(cmd, args, { timeout: 5 * 60 * 1000, windowsHide: true, env: process.env });
+    const result = cp.spawnSync(cmd, args, { timeout: 5 * 60 * 1000, windowsHide: true, env: process.env, shell: process.platform === "win32" });
     lastResult = result;
     const stderr = result.stderr ? result.stderr.toString() : "";
-    const isBusy = result.error && ["EBUSY", "EPERM"].includes(result.error.code || "") || /EBUSY|EPERM/.test(stderr);
+    const spawnError = result.error ? String(result.error.code || result.error.message || "") : "";
+    const isBusy = (result.error && ["EBUSY", "EPERM"].includes(result.error.code || "")) || /EBUSY|EPERM/.test(stderr) || /EBUSY|EPERM/.test(spawnError);
     if (isBusy && retries === 0) {
       retries++;
       await sleep(2000);
@@ -212,7 +213,9 @@ async function runManagerGate() {
   }
   if (lastResult && lastResult.status !== 0) {
     const stderr = lastResult.stderr ? lastResult.stderr.toString().trim().slice(0, 500) : "";
-    throw new Error(`package install failed (exit ${lastResult.status})${stderr ? `: ${stderr}` : ""}`);
+    const spawnErr = lastResult.error ? String(lastResult.error.message || lastResult.error.code || "").slice(0, 200) : "";
+    const detail = stderr || spawnErr;
+    throw new Error(`package install failed (exit ${lastResult.status})${detail ? `: ${detail}` : ""}`);
   }
 }
 

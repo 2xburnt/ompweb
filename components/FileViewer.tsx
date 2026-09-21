@@ -288,7 +288,7 @@ function diffLines(patch: string): DiffLine[] {
   }));
 }
 
-function DiffView({ patch }: { patch: string }) {
+export function DiffView({ patch }: { patch: string }) {
   const { t, tn } = useI18n();
   const diff = diffLines(patch);
 
@@ -1288,7 +1288,7 @@ function TextFileViewer({ filePath, cwd, hostId, sourceSessionId, onOpenFile, on
         </div>
       )}
 
-      <div ref={contentRef} className="file-viewer-content" style={{ flex: 1, overflow: "auto", background: "var(--bg)" }}>
+      <div ref={contentRef} data-selection-scope="document" className="file-viewer-content" style={{ flex: 1, overflow: "auto", background: "var(--bg)" }}>
         {displayMode === "source" && draft !== null ? (
           <textarea
             ref={editorRef}

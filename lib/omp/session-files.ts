@@ -1,7 +1,11 @@
 import { randomUUID } from "crypto";
 import {
+  closeSync,
   existsSync,
   mkdtempSync,
+  openSync,
+  readSync,
+  statSync,
   mkdirSync,
   readFileSync,
   lstatSync,
@@ -12,6 +16,7 @@ import {
 } from "fs";
 import * as path from "path";
 import { gunzipSync, gzipSync } from "zlib";
+import { StringDecoder } from "string_decoder";
 import { currentHost, withHost } from "../hosts/context";
 import type { FileSlices } from "../hosts/executor";
 import type { Host } from "../hosts/registry";
@@ -24,6 +29,7 @@ import type {
   SessionTreeNode,
 } from "../types";
 import { getArchivedSessionsDir, getBlobsDir, getSessionsDir, hostPath } from "./paths";
+import { sessionPathKey } from "../paths";
 
 /**
  * Reader/writer for oh-my-pi's session JSONL files (format v3) on any host.
@@ -318,7 +324,7 @@ async function resolveBlobsInValue(value: unknown, key: string | undefined, host
 }
 
 /** Cheap precheck so blob-free entries skip the resolution walk entirely. */
-function containsBlobRef(value: unknown): boolean {
+export function containsBlobRef(value: unknown): boolean {
   if (typeof value === "string") return isBlobRef(value);
   if (Array.isArray(value)) {
     for (const item of value) if (containsBlobRef(item)) return true;
@@ -352,6 +358,58 @@ export async function resolveBlobRefsInEntries(entries: SessionEntry[], options:
   }
 }
 
+function readBlobSync(hash: string): Buffer | null {
+  try {
+    return readFileSync(path.join(getBlobsDir(), hash));
+  } catch {
+    return null;
+  }
+}
+
+function resolveBlobsInValueSync(value: unknown, key?: string): void {
+  if (Array.isArray(value)) {
+    for (const item of value) resolveBlobsInValueSync(item, key);
+    return;
+  }
+  if (!isRecord(value)) return;
+  const record = value as Record<string, unknown>;
+  if (
+    isImageDataPayload(value) &&
+    isBlobRef(value.data) &&
+    ((key === "content" && isImageBlock(value)) || key === "images")
+  ) {
+    const hash = parseBlobRef(value.data);
+    if (!hash) return;
+    const blob = readBlobSync(hash);
+    if (blob) record.data = blob.toString("base64");
+    else degradeMissingBlobImage(record, hash);
+    return;
+  }
+  if (record.type === "image_generation_call" && typeof record.result === "string" && isBlobRef(record.result)) {
+    const hash = parseBlobRef(record.result);
+    const blob = hash ? readBlobSync(hash) : null;
+    if (blob) record.result = blob.toString("base64");
+  }
+  if (typeof record.image_url === "string" && isBlobRef(record.image_url)) {
+    const hash = parseBlobRef(record.image_url);
+    const blob = hash ? readBlobSync(hash) : null;
+    if (blob) record.image_url = blob.toString("utf8");
+  }
+  for (const [childKey, item] of Object.entries(record)) resolveBlobsInValueSync(item, childKey);
+}
+
+/** Local synchronous blob hydration used by the upstream seek reader. */
+export function resolveBlobRefsInEntriesSync(entries: SessionEntry[], options: ResolveBlobOptions = {}): void {
+  for (const entry of entries) {
+    if (
+      options.skipToolResultImages &&
+      entry.type === "message" &&
+      ((entry.message as { role?: string } | null | undefined)?.role === "toolResult")
+    ) continue;
+    if (containsBlobRef(entry)) resolveBlobsInValueSync(entry);
+  }
+}
+
 // ============================================================================
 // Session file loading
 // ============================================================================
@@ -369,6 +427,9 @@ export interface LoadedSession {
 export interface LoadSessionOptions extends ResolveBlobOptions {
   /** Resolve blob:sha256 image references to inline base64 for display. */
   resolveBlobs?: boolean;
+  /** Retain only an entry's indexing metadata while scanning. Runs before
+   * legacy migration; byte ranges exclude LF but include any CR. */
+  projectEntry?: (entry: SessionEntry, offset: number, length: number) => SessionEntry;
 }
 
 /**
@@ -378,13 +439,57 @@ export interface LoadSessionOptions extends ResolveBlobOptions {
  * the whole Next.js server. Refusing loudly beats taking the process down.
  */
 export const MAX_SESSION_LOAD_BYTES = 1024 * 1024 * 1024;
+const SESSION_READ_CHUNK_BYTES = 1024 * 1024;
 
 /**
  * Read a file line by line on the session's host without materializing the
  * whole file (a remote file streams through `cat` over ssh). Lines exclude the
  * newline; multi-byte characters are carried across chunk boundaries.
  */
-export function forEachFileLine(filePath: string, onLine: (line: string) => void, host: Host = currentHost()): Promise<void> {
+export function forEachFileLineSync(
+  filePath: string,
+  onLine: (line: string, offset: number, length: number) => void,
+): void {
+  const fd = openSync(filePath, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(SESSION_READ_CHUNK_BYTES);
+    const decoder = new StringDecoder("utf8");
+    const fragments: string[] = [];
+    let offset = 0;
+    let length = 0;
+    for (;;) {
+      const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      let start = 0;
+      while (start < bytesRead) {
+        const newline = buffer.indexOf(10, start);
+        const end = newline >= 0 && newline < bytesRead ? newline : bytesRead;
+        fragments.push(decoder.write(buffer.subarray(start, end)));
+        length += end - start;
+        if (end < bytesRead) {
+          fragments.push(decoder.end());
+          onLine(fragments.join(""), offset, length);
+          fragments.length = 0;
+          offset += length + 1;
+          length = 0;
+        }
+        start = end + 1;
+      }
+    }
+    if (length > 0) {
+      fragments.push(decoder.end());
+      onLine(fragments.join(""), offset, length);
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export function forEachFileLine(
+  filePath: string,
+  onLine: (line: string, offset: number, length: number) => void,
+  host: Host = currentHost(),
+): Promise<void> {
   return host.fs.forEachLine(filePath, onLine);
 }
 
@@ -411,7 +516,7 @@ export async function loadSessionFile(filePath: string, options: LoadSessionOpti
   const records: Record<string, unknown>[] = [];
   let isFirstLine = true;
   try {
-    await forEachFileLine(filePath, (rawLine) => {
+    await forEachFileLine(filePath, (rawLine, offset, length) => {
       if (isFirstLine) {
         isFirstLine = false;
         titleSlot = parseTitleSlotLine(rawLine);
@@ -419,11 +524,15 @@ export async function loadSessionFile(filePath: string, options: LoadSessionOpti
       }
       const line = rawLine.trim();
       if (!line) return;
+      let record: Record<string, unknown>;
       try {
-        records.push(JSON.parse(line) as Record<string, unknown>);
+        record = JSON.parse(line) as Record<string, unknown>;
       } catch {
-        // Skip malformed line (torn write).
+        return; // Skip malformed line (torn write).
       }
+      records.push(records.length > 0 && record.type !== "session" && options.projectEntry
+        ? options.projectEntry(record as unknown as SessionEntry, offset, length) as unknown as Record<string, unknown>
+        : record);
     }, host);
   } catch (error) {
     // A single line past the string cap, or an allocation failure part-way in.
@@ -456,6 +565,120 @@ export async function loadSessionFile(filePath: string, options: LoadSessionOpti
   }
 
   return { header, entries, titleSlot };
+}
+
+/** Local synchronous loader for seek-based history and compatibility callers. */
+export function loadSessionFileSync(filePath: string, options: LoadSessionOptions = {}): LoadedSession {
+  let size: number;
+  try {
+    size = statSync(filePath).size;
+  } catch {
+    return { header: null, entries: [], titleSlot: undefined };
+  }
+  if (size > MAX_SESSION_LOAD_BYTES) {
+    return { header: null, entries: [], titleSlot: undefined, error: "too_large" };
+  }
+
+  let titleSlot: SessionTitleSlot | undefined;
+  const records: Record<string, unknown>[] = [];
+  let isFirstLine = true;
+  try {
+    forEachFileLineSync(filePath, (rawLine, offset, length) => {
+      if (isFirstLine) {
+        isFirstLine = false;
+        titleSlot = parseTitleSlotLine(rawLine);
+        if (titleSlot) return;
+      }
+      const line = rawLine.trim();
+      if (!line) return;
+      let record: Record<string, unknown>;
+      try {
+        record = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      records.push(records.length > 0 && record.type !== "session" && options.projectEntry
+        ? options.projectEntry(record as unknown as SessionEntry, offset, length) as unknown as Record<string, unknown>
+        : record);
+    });
+  } catch (error) {
+    const tooLarge = error instanceof RangeError;
+    return { header: null, entries: [], titleSlot, ...(tooLarge ? { error: "too_large" as const } : {}) };
+  }
+
+  const headerRecord = records[0];
+  if (!headerRecord || headerRecord.type !== "session" || typeof headerRecord.id !== "string") {
+    return { header: null, entries: [], titleSlot };
+  }
+  const header = headerRecord as unknown as SessionHeader;
+  const entries = records.slice(1).filter((record) => record.type !== "session") as unknown as MutableEntry[];
+  migrateToCurrentVersion(header, entries);
+  if (titleSlot) {
+    if (titleSlot.title) {
+      header.title = titleSlot.title;
+      if (titleSlot.source) header.titleSource = titleSlot.source;
+      else delete header.titleSource;
+    } else {
+      delete header.title;
+      delete header.titleSource;
+    }
+  }
+  if (options.resolveBlobs) {
+    resolveBlobRefsInEntriesSync(entries, { skipToolResultImages: options.skipToolResultImages });
+  }
+  return { header, entries, titleSlot };
+}
+
+/** Local bounded, slot-aware synchronous header reader. */
+export function readSessionHeaderSync(filePath: string): SessionHeader | null {
+  const maxHeaderBytes = 64 * 1024 + SESSION_TITLE_SLOT_BYTES;
+  let fd: number;
+  try {
+    fd = openSync(filePath, "r");
+  } catch {
+    return null;
+  }
+  let head: string;
+  try {
+    const buffer = Buffer.allocUnsafe(maxHeaderBytes);
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+    head = buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+  let firstLineEnd = head.indexOf("\n");
+  if (firstLineEnd === -1) {
+    if (Buffer.byteLength(head, "utf8") >= maxHeaderBytes) return null;
+    firstLineEnd = head.length;
+  }
+  const firstLine = head.slice(0, firstLineEnd).trim();
+  if (!firstLine) return null;
+  const slot = parseTitleSlotLine(firstLine);
+  let headerLine: string;
+  if (slot) {
+    const rest = head.slice(firstLineEnd + 1);
+    const secondLineEnd = rest.indexOf("\n");
+    if (secondLineEnd === -1 && Buffer.byteLength(rest, "utf8") + firstLineEnd >= maxHeaderBytes) return null;
+    headerLine = (secondLineEnd === -1 ? rest : rest.slice(0, secondLineEnd)).trim();
+  } else {
+    headerLine = firstLine;
+  }
+  if (!headerLine) return null;
+  let header: SessionHeader;
+  try {
+    header = JSON.parse(headerLine) as SessionHeader;
+  } catch {
+    return null;
+  }
+  if (header.type !== "session") return null;
+  if (slot?.title) {
+    header.title = slot.title;
+    if (slot.source) header.titleSource = slot.source;
+  } else if (slot) {
+    delete header.title;
+    delete header.titleSource;
+  }
+  return header;
 }
 
 /**
@@ -882,7 +1105,20 @@ function getSessionScanCache(): Map<string, SessionScanCacheEntry> {
 }
 
 function scanCacheKey(host: Host, filePath: string): string {
-  return `${host.id}\0${filePath}`;
+  return `${host.id}\0${sessionPathKey(filePath)}`;
+}
+
+/** Invalidate one host-scoped prefix/suffix scan memo. */
+export function invalidateSessionScanCache(filePath: string, host: Host = currentHost()): void {
+  globalThis.__ompSessionScanCache?.delete(scanCacheKey(host, filePath));
+}
+
+/** Clear scan memos for one host without evicting other machines. */
+export function invalidateAllSessionScanCaches(host: Host = currentHost()): void {
+  const prefix = `${host.id}\0`;
+  for (const key of globalThis.__ompSessionScanCache?.keys() ?? []) {
+    if (key.startsWith(prefix)) globalThis.__ompSessionScanCache?.delete(key);
+  }
 }
 
 function trimScanCache(cache: Map<string, SessionScanCacheEntry>): void {

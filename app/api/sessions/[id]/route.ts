@@ -16,9 +16,12 @@ import {
   resolveSessionIdByPath,
   resolveSessionPath,
   invalidateSessionPathCache,
-  invalidateSessionListCache,
+  invalidateSessionCaches,
+  invalidateSessionListMeta,
+  getSessionEntriesForDisplayAsync,
   buildSessionContext,
   readSessionHeader,
+  SessionFileTooLargeError,
 } from "@/lib/session-reader";
 import { resolveSessionPathOr404 } from "@/lib/api-utils";
 import { parseJsonWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
@@ -31,6 +34,12 @@ import { getRpcSession } from "@/lib/rpc-manager";
 /** Stable, client-safe error body for catch-all handlers: details go to the
  *  server log only, never to the browser. */
 function sessionsErrorResponse(error: unknown): NextResponse {
+  if (error instanceof SessionFileTooLargeError) {
+    return NextResponse.json(
+      { error: "Session file is too large to open in omp-web", code: "session_file_too_large" },
+      { status: 413 },
+    );
+  }
   if (error instanceof RequestBodyTooLargeError) {
     return NextResponse.json({ error: "Request body is too large", code: "request_too_large" }, { status: 413 });
   }
@@ -181,22 +190,24 @@ export const GET = withSessionRoute(async (
     const deferToolResultImages = searchParams.has("deferMedia");
     const includeState = searchParams.has("includeState");
 
-    const { header, entries, error: loadError } = await loadSessionFile(filePath, {
-      resolveBlobs: true,
-      skipToolResultImages: deferToolResultImages,
-    });
-    if (loadError === "too_large") {
-      return NextResponse.json(
-        { error: "Session file is too large to open in omp-web", code: "session_file_too_large" },
-        { status: 413 },
-      );
-    }
-    if (!header) {
+    // Unified cached read path: unchanged files are served from memory and
+    // blob resolution runs on per-entry copies. The bounded fallback only
+    // distinguishes an oversized file from a malformed header.
+    const header = await readSessionHeader(filePath);
+    if (header === null) {
+      const loaded = await loadSessionFile(filePath, { resolveBlobs: false });
+      if (loaded.error === "too_large") {
+        return NextResponse.json(
+          { error: "Session file is too large to open in omp-web", code: "session_file_too_large" },
+          { status: 413 },
+        );
+      }
       return NextResponse.json({ error: "Session file is missing or malformed", code: "session_file_malformed" }, { status: 404 });
     }
-    const leafId = getLeafEntryId(entries);
-    const tree = projectTreeForResponse(buildSessionTree(entries));
-    const context = buildSessionContext(entries, leafId, { deferThinking, deferToolResultImages });
+    const displayEntries = await getSessionEntriesForDisplayAsync(filePath, { skipToolResultImages: deferToolResultImages });
+    const leafId = getLeafEntryId(displayEntries);
+    const tree = projectTreeForResponse(buildSessionTree(displayEntries));
+    const context = buildSessionContext(displayEntries, leafId, { deferThinking, deferToolResultImages });
 
     let modified = header.timestamp ?? new Date().toISOString();
     try { modified = new Date((await host.fs.stat(filePath)).mtimeMs).toISOString(); } catch { /* use header timestamp */ }
@@ -271,11 +282,13 @@ export const PATCH = withSessionRoute(async (
     // before the path check because omp does not create the session file until
     // the history holds an assistant message.
     let renamed = false;
+    let renamedFilePath: string | undefined;
     const rpc = getRpcSession(id);
     if (rpc?.isAlive?.() && typeof rpc.send === "function") {
       try {
         await rpc.send({ type: "set_session_name", name: name.trim() });
         renamed = true;
+        renamedFilePath = rpc.sessionFile || undefined;
       } catch {
         // Fall back to the on-disk title slot below.
       }
@@ -283,10 +296,11 @@ export const PATCH = withSessionRoute(async (
     if (!renamed) {
       const resolved = await resolveSessionPathOr404(id);
       if ("response" in resolved) return resolved.response;
-      const filePath = resolved.filePath;
-      await setSessionTitle(filePath, name.trim(), "user");
+      renamedFilePath = resolved.filePath;
+      await setSessionTitle(renamedFilePath, name.trim(), "user");
     }
-    invalidateSessionListCache();
+    if (renamedFilePath) invalidateSessionCaches(renamedFilePath);
+    else invalidateSessionListMeta();
     return NextResponse.json({ ok: true });
   } catch (error) {
     return sessionsErrorResponse(error);
@@ -402,7 +416,7 @@ export const DELETE = withSessionRoute(async (
     await getRpcSession(id)?.destroyAndWait?.();
     await deleteSessionFileWithArtifacts(filePath);
     invalidateSessionPathCache(id);
-    invalidateSessionListCache();
+    invalidateSessionCaches(); // deletion drops the file: full flush is correct
     return NextResponse.json({
       ok: true,
       ...(skippedChildren.length > 0 ? { skippedChildren } : {}),

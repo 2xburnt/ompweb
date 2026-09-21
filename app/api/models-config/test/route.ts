@@ -10,16 +10,13 @@ import {
 } from "@/lib/omp/models-config";
 import { hostTmpdir } from "@/lib/omp/paths";
 import { type OmpModel, runIsolatedUtilityCommand } from "@/lib/omp/rpc-utility";
+import { isRecord } from "@/lib/type-guards";
 
 export const dynamic = "force-dynamic";
 
 // Registry resolution (spawn + model discovery), not a completion round-trip:
 // omp-web cannot send test prompts without going through a full agent session.
 const TEST_TIMEOUT_MS = 60_000;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);

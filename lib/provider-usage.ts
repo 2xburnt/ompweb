@@ -25,14 +25,17 @@ function nonEmptyString(value: unknown): string | undefined {
 }
 function normalizeWindowId(scope: Record<string, unknown>, window: Record<string, unknown>): ProviderUsageWindowId | undefined {
   const windowId = nonEmptyString(scope.windowId);
-  if (windowId === "5h" || windowId === "7d" || windowId === "monthly" || windowId === "30d") {
-    return windowId === "30d" ? "monthly" : windowId;
+  if (windowId === "5h" || windowId === "7d" || windowId === "monthly" || windowId === "30d" || windowId === "daily") {
+    if (windowId === "30d") return "monthly";
+    if (windowId === "daily") return "5h";
+    return windowId;
   }
   const durationMs = asNumber(window.durationMs);
   if (durationMs === undefined) return undefined;
   if (Math.abs(durationMs - 5 * 60 * 60 * 1000) <= 60_000) return "5h";
   if (Math.abs(durationMs - 7 * 24 * 60 * 60 * 1000) <= 60_000) return "7d";
   if (Math.abs(durationMs - 30 * 24 * 60 * 60 * 1000) <= 60 * 60 * 1000) return "monthly";
+  if (Math.abs(durationMs - 24 * 60 * 60 * 1000) <= 60_000) return "5h";
   return undefined;
 }
 

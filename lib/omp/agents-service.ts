@@ -88,7 +88,6 @@ export async function buildAgentScanRoots(cwd?: string, host: Host = currentHost
 export async function getAgentScanRootDirs(cwd?: string, host: Host = currentHost()): Promise<string[]> {
   return (await buildAgentScanRoots(cwd, host)).map((root) => root.dir);
 }
-
 function asStringArray(value: unknown, field: string): string[] | undefined {
   if (value === undefined) return undefined;
   if (Array.isArray(value) && value.every((item) => typeof item === "string")) return value.map((item) => item.trim()).filter(Boolean);

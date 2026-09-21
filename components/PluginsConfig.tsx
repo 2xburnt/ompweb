@@ -245,7 +245,7 @@ function Toggle({
         border: "none",
         padding: 0,
         cursor: loading ? "wait" : "pointer",
-        background: enabled ? "var(--accent)" : "var(--border)",
+        background: enabled ? "var(--accent-strong)" : "var(--border)",
         position: "relative",
         transition: "background var(--dur-med) var(--ease-out-warm)",
         opacity: loading ? 0.65 : 1,
@@ -386,9 +386,9 @@ function AddPluginPanel({
           disabled={busy || !source.trim()}
           style={{
             ...buttonStyle(busy || !source.trim()),
-            background: "var(--accent)",
+            background: "var(--accent-strong)",
             color: "white",
-            borderColor: "var(--accent)",
+            borderColor: "var(--accent-strong)",
           }}
         >
           {busy ? t("pluginsConfig.installing") : t("pluginsConfig.install")}

@@ -18,8 +18,8 @@ import type { Host } from "./hosts/registry";
 import { getSessionEntries, entryToUiMessage } from "./session-reader";
 import { hostPath } from "./omp/paths";
 import { parseJsonlLenient } from "./omp/session-files";
-import { parseSubagentProgress } from "./subagent-types";
-import type { SubagentHistoryEntry, SubagentHistoryResult, SubagentAgentSource } from "./subagent-types";
+import { asAgentSource, parseSubagentProgress } from "./subagent-types";
+import type { SubagentHistoryEntry, SubagentHistoryResult } from "./subagent-types";
 import type { AgentMessage, SessionEntry } from "./types";
 import { asNumber, asString, isRecord } from "./type-guards";
 import { taskResultStructuredOutput, taskResultUsageCost } from "./task-result-details";
@@ -67,10 +67,6 @@ export async function resolveSubagentArtifact(
     return null;
   }
   return realCandidate;
-}
-
-function asAgentSource(value: unknown): SubagentAgentSource | undefined {
-  return value === "bundled" || value === "user" || value === "project" ? value : undefined;
 }
 
 const SUBAGENT_ID_RE = /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;

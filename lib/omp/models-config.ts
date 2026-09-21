@@ -28,7 +28,6 @@ export const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "m
 
 // models.yml is hand-sized; a larger file is not something the editor should load.
 const MAX_MODELS_CONFIG_BYTES = 8 * 1024 * 1024;
-
 export interface ModelThinkingConfig {
   mode?: string;
   efforts?: string[];

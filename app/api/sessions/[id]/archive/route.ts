@@ -37,6 +37,7 @@ export const POST = withSessionRoute(async (
     await getRpcSession(id)?.destroyAndWait?.();
     const archivedPath = await archiveSessionFileWithArtifacts(filePath);
     invalidateSessionPathCache(id);
+    // The file is gone: full flush is correct (drops its caches + refreshes list).
     invalidateSessionListCache();
     return NextResponse.json({ ok: true, archived: true, archivedPath });
   } catch (error) {

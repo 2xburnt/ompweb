@@ -104,6 +104,10 @@ export interface ToolResultMessage {
   isError?: boolean;
   details?: unknown;
   timestamp?: number;
+  /** Live snapshot of a tool that is still executing (omp's
+   * `tool_execution_update`), not a committed result. Rendering treats it as
+   * "running" and keeps it out of the session's toolResult list. */
+  partial?: boolean;
 }
 
 export interface CustomMessage {
@@ -449,19 +453,29 @@ export interface ArchivedSessionInfo {
   status?: "complete" | "interrupted" | "aborted" | "error" | "pending" | "unknown";
 }
 
+/** Workspace-level omp launch configuration; only affects omp children spawned for that workspace. */
+export interface ProjectLaunchConfig {
+  /** The OMP profile to use. */
+  profile?: string;
+  /** Whether to launch with advisor mode. */
+  advisor?: boolean;
+  /** Extra OMP CLI args, stored as an array. */
+  extraArgs?: string[];
+}
+
 /** A project in the sidebar: an explicitly added directory (registered in the
  *  on-disk registry) or one discovered from existing sessions. Paths are the
  *  canonical projectRoot — worktrees resolve to their main repository. */
 export interface ManagedProject {
   path: string;
-  /** ISO timestamp of the last explicit add; present only for registered
-   *  projects and used to order the project list (most recently added
-   *  first). The order is stable and never driven by session activity. */
+  /** ISO timestamp of the last explicit add. */
   addedAt?: string;
   /** User-defined display name; never changes the directory path. */
   alias?: string;
   /** Explicit sidebar position for registered projects. */
   sortOrder?: number;
+  /** Workspace-level omp launch configuration. */
+  launchConfig?: ProjectLaunchConfig;
 }
 
 export interface SessionContext {

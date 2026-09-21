@@ -15,11 +15,10 @@ import {
 import { execFileSync, spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { homedir, tmpdir } from "os";
-import { delimiter, dirname, isAbsolute, join, posix, resolve, win32 } from "path";
+import { delimiter, dirname, join, posix, resolve, win32 } from "path";
 import { checkNpmUpdate, detectInstallMethod, getPackageDir, type InstallMethod } from "./npm-update";
 import { checkOmpUpdate } from "./omp/updates";
 
-export const SELF_UPDATE_PACKAGE = "@kahme247/ompweb";
 const LEASE_MS = 30 * 60 * 1000;
 const TERMINAL_STATUS_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -119,13 +118,6 @@ function atomicWrite(path: string, value: string): void {
   } catch (error) {
     rmSync(temporary, { force: true });
     throw error;
-  }
-}
-function readJson<T>(path: string): T | null {
-  try {
-    return JSON.parse(readFileSync(path, "utf8")) as T;
-  } catch {
-    return null;
   }
 }
 function readStateJson<T>(path: string): T | null {
@@ -368,7 +360,7 @@ function gitUpstreamSync(packageDir: string): { remote: string; branch: string }
 
 export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResult> {
   cleanupStaleSelfUpdate(Date.now(), kind);
-  const root = ensureSecureRoot(kind, true)!;
+  ensureSecureRoot(kind, true);
   const leaseFile = leasePath(kind);
   const statusFile = statusPath(kind);
   const existingLease = readStateJson<{ attemptId?: string; expiresAt?: number }>(leaseFile);
@@ -591,15 +583,3 @@ export function acknowledgeSelfUpdate(attemptId: string, kind: Kind = "app"): { 
   pruneEmptyRoot(kind);
   return { acknowledged: true, attemptId };
 }
-
-// helpers exported for tests
-export function __test__reset() {
-  // for tests
-}
-export const _internal = {
-  isMissing,
-  isBusy,
-  secureDirectory,
-  atomicWrite,
-  cleanupStaleSelfUpdate,
-};

@@ -3,12 +3,11 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useTransition, cloneElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import { getSubmitDuringRunBehavior, setSubmitDuringRunBehavior, type SubmitDuringRunBehavior } from "@/lib/composer-prefs";
 import dynamic from "next/dynamic";
-import { Copy, Download, ExternalLink, RefreshCw, RotateCcw, Search, AlertCircle, Monitor, Play, Square, Trash2 } from "lucide-react";
+import { ArrowLeft, Copy, Download, ExternalLink, RefreshCw, RotateCcw, Search, Monitor, Play, Square, Trash2, X } from "lucide-react";
 import { Alert } from "@/components/ui/field";
 import { toast } from "@/components/ui/toast";
 import { useI18n } from "@/lib/i18n";
 import { useIsMobile } from "@/hooks/useIsMobile";
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/primitives";
 import { SettingsTabs, type SettingsTab, SETTINGS_CATEGORIES, getNormalizedActive } from "./SettingsTabs";
 import { copyText } from "@/lib/clipboard";
 import type { AppUpdateInfo } from "./AppUpdateDialog";
@@ -16,6 +15,7 @@ import { useFontSize, type FontSizePreference } from "@/hooks/useFontSize";
 import { useUiScale, type UiScalePreference } from "@/hooks/useUiScale";
 import { hostFetch, useHosts } from "@/lib/hosts/client";
 import { MachineScopeNote } from "./MachineScopeNote";
+import { useSpeechSynthesis } from "@/hooks/useSpeechSynthesis";
 const SettingsTabLoading = () => {
   const { t } = useI18n();
   return <div role="status" style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 12 }}>{t("settingsConfig.loadingSettings")}</div>;
@@ -132,9 +132,12 @@ type SettingIndexEntry = {
 
 const SETTING_INDEX: SettingIndexEntry[] = [
   // Interface & Behavior
-  { id: "keep-tool-calls-collapsed", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.keepToolCallsCollapsed", descKey: "settingsConfig.keepToolCallsCollapsedDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Keep tool calls collapsed", fallbackDesc: "Show only compact headers while tools execute.", scope: "UI" },
   { id: "completion-sound", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.completionSound", descKey: "settingsConfig.completionSoundDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Completion sound", fallbackDesc: "Play a tone when the agent completes a run.", scope: "UI" },
-  { id: "provider-usage", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.providerUsage", descKey: "settingsConfig.providerUsageDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Provider usage limits", fallbackDesc: "Show the current model's provider usage limits in the top bar.", scope: "UI" },
+  { id: "keep-tool-calls-collapsed", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.keepToolCallsCollapsed", descKey: "settingsConfig.keepToolCallsCollapsedDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Keep tool calls collapsed", fallbackDesc: "Show only compact headers while tools execute.", scope: "UI" },
+  { id: "scope-native-select-all", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.scopeNativeSelectAll", descKey: "settingsConfig.scopeNativeSelectAllDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Scope native Select All (experimental)", fallbackDesc: "Limit whole-page selections from browser or touch menus to the active message, chat, or file. May also narrow deliberate whole-page selections. Turn off if selection handles or menus misbehave. Keyboard shortcuts are unaffected.", scope: "UI" },
+  { id: "tts-autoplay", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.ttsAutoplay", descKey: "settingsConfig.ttsAutoplayDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Auto-read assistant responses", fallbackDesc: "Automatically read aloud new assistant replies when completed.", scope: "UI" },
+  { id: "tts-voice", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.ttsVoice", descKey: "settingsConfig.ttsVoiceDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Speech Voice", fallbackDesc: "Select the browser voice for text-to-speech reading.", scope: "UI" },
+  { id: "provider-usage", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.providerUsage", descKey: "settingsConfig.providerUsageDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Provider usage limits", fallbackDesc: "Show provider usage in the sidebar, above Settings.", scope: "UI" },
   { id: "chat-font-size", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.chatFontSize", descKey: "settingsConfig.chatFontSizeDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Chat Font Size", fallbackDesc: "Adjust text size for conversation messages, code blocks, and markdown output.", scope: "UI" },
   { id: "ui-scale", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.uiScale", descKey: "settingsConfig.uiScaleDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Interface Scale", fallbackDesc: "Adjust overall UI zoom and display density across sidebars, dialogs, buttons, and toolbars.", scope: "UI" },
   { id: "message-during-active-run", tab: "general", sectionKey: "settingsConfig.interfaceBehavior", labelKey: "settingsConfig.messageDuringActiveRun", descKey: "settingsConfig.messageDuringActiveRunDesc", fallbackSection: "Interface & Behavior", fallbackLabel: "Message during active run", fallbackDesc: "What composer does on submit while agent runs. Steer interrupts; Queue follow-up delivers after finish.", scope: "UI" },
@@ -187,6 +190,7 @@ const SETTING_INDEX: SettingIndexEntry[] = [
 
 function SearchResultsList({ results, query, onSelect }: { results: SearchResult[]; query: string; onSelect: (result: SearchResult) => void }) {
   const { t, tn } = useI18n();
+  const isMobile = useIsMobile();
   const formatScope = (s?: string) => {
     if (s === "UI") return t("settingsConfig.chipUI");
     if (s === "Native OMP") return t("settingsConfig.chipNativeOMP");
@@ -195,42 +199,45 @@ function SearchResultsList({ results, query, onSelect }: { results: SearchResult
   };
 
   return (
-    <div style={{ flex: 1, minHeight: 0, overflowY: "auto", background: "var(--bg)", padding: 16, display: "flex", flexDirection: "column", gap: 10 }}>
-      <div style={{ fontSize: 12.5, color: "var(--text-muted)" }}>
-        {results.length === 0 ? t("settingsConfig.noSettingsMatch", { query }) : tn("settingsConfig.searchResults", results.length, { count: results.length, query })}
+    <div style={{ flex: 1, minHeight: 0, overflowY: "auto", background: "var(--bg)", padding: isMobile ? "16px 14px 32px" : "32px 24px 64px" }}>
+      <div className="settings-panel-inner" style={{ gap: 12 }}>
+        <div style={{ fontSize: 13, color: "var(--text-muted)", marginBottom: 4 }}>
+          {results.length === 0 ? t("settingsConfig.noSettingsMatch", { query }) : tn("settingsConfig.searchResults", results.length, { count: results.length, query })}
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
+          {results.map((result) => (
+            <button
+              key={result.id}
+              type="button"
+              onClick={() => onSelect(result)}
+              className="settings-card"
+              style={{
+                textAlign: "left",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "flex-start",
+                gap: 4,
+                padding: "14px 18px",
+                width: "100%",
+                boxSizing: "border-box",
+                cursor: "pointer",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 13.5, fontWeight: 600, color: "var(--text)" }}>{result.label}</span>
+                {result.kind === "category" && (
+                  <span style={chipStyle}>{t("settingsConfig.chipSection")}</span>
+                )}
+                {result.scope && (
+                  <span style={chipStyle}>{formatScope(result.scope)}</span>
+                )}
+              </div>
+              <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.45 }}>{result.description}</div>
+              {result.section && <div style={{ fontSize: 10.5, color: "var(--text-dim)", fontFamily: "var(--font-mono)" }}>{result.section}</div>}
+            </button>
+          ))}
+        </div>
       </div>
-      {results.map((result) => (
-        <button
-          key={result.id}
-          type="button"
-          onClick={() => onSelect(result)}
-          style={{
-            textAlign: "left",
-            display: "flex",
-            flexDirection: "column",
-            gap: 4,
-            padding: "10px 12px",
-            border: "1px solid var(--border)",
-            borderRadius: "var(--radius-card)",
-            background: "var(--bg-panel)",
-            color: "var(--text)",
-            cursor: "pointer",
-            transition: "border-color var(--dur-fast), background var(--dur-fast)",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <span style={{ fontSize: 12.5, fontWeight: 600 }}>{result.label}</span>
-            {result.kind === "category" && (
-              <span style={chipStyle}>{t("settingsConfig.chipSection")}</span>
-            )}
-            {result.scope && (
-              <span style={chipStyle}>{formatScope(result.scope)}</span>
-            )}
-          </div>
-          <div style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.45 }}>{result.description}</div>
-          {result.section && <div style={{ fontSize: 10, color: "var(--text-dim)" }}>{result.section}</div>}
-        </button>
-      ))}
     </div>
   );
 }
@@ -272,7 +279,7 @@ function ToggleSwitch({
         height: 24,
         borderRadius: 12,
         border: "none",
-        background: checked ? "var(--accent)" : "var(--border)",
+        background: checked ? "var(--accent-strong)" : "var(--border)",
         cursor: disabled ? "not-allowed" : "pointer",
         transition: "background var(--dur-fast)",
         padding: 2,
@@ -332,46 +339,46 @@ function NativeSetting({ label, description, scope, searchId, children }: { labe
     <div
       ref={ref}
       data-search-id={settingSlug}
+      className="settings-card"
       style={{
         minWidth: 0,
-        padding: "12px 14px",
-        border: "1px solid var(--border)",
-        borderRadius: "var(--radius-card)",
-        background: "var(--bg-panel)",
-        display: "flex",
-        flexDirection: "column",
-        gap: 8,
+        width: "100%",
+        boxSizing: "border-box",
+        marginBottom: 10,
         transition: "box-shadow var(--dur-fast), border-color var(--dur-fast)",
         ...(highlighted ? { borderColor: "var(--accent)", boxShadow: "0 0 0 2px var(--accent)" } : {}),
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <label id={labelId} htmlFor={settingId} style={{ fontSize: 12.5, fontWeight: 600, color: "var(--text)", cursor: "pointer" }}>{label}</label>
+      <div className="settings-card-text">
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <label id={labelId} htmlFor={settingId} className="settings-card-title" style={{ cursor: "pointer" }}>{label}</label>
           {scope && (
             <span style={chipStyle}>
               {formatScope(scope)}
             </span>
           )}
         </div>
-        <span style={{ flexShrink: 0 }}>{enhancedChild}</span>
+        <span id={descId} className="settings-card-desc">{description}</span>
       </div>
-      <span id={descId} style={{ color: "var(--text-muted)", fontSize: 11, lineHeight: 1.45 }}>{description}</span>
+      <span style={{ flexShrink: 0 }}>{enhancedChild}</span>
     </div>
   );
 }
 
-export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCallsDefaultCollapsedChange, providerUsageVisible, onProviderUsageVisibleChange, cwd, sessionId, onModelsSaved, onPluginsReloaded, appUpdate, onRefreshAppUpdate, onOmpUpdateAvailabilityChange, onRequestAppUpdate, onSelectTab, onClose }: {
+export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCallsDefaultCollapsedChange, providerUsageVisible, onProviderUsageVisibleChange, scopeNativeSelectAll, onScopeNativeSelectAllChange, cwd, sessionId, onModelsSaved, onPluginsReloaded, appUpdate, ompUpdateAvailable, onRefreshAppUpdate, onOmpUpdateAvailabilityChange, onRequestAppUpdate, onSelectTab, onClose }: {
   activeTab: SettingsTab;
   toolCallsDefaultCollapsed: boolean;
   onToolCallsDefaultCollapsedChange: (collapsed: boolean) => void;
   providerUsageVisible: boolean;
   onProviderUsageVisibleChange: (visible: boolean) => void;
+  scopeNativeSelectAll: boolean;
+  onScopeNativeSelectAllChange: (enabled: boolean) => void;
   cwd: string | null;
   sessionId: string | null;
   onModelsSaved: () => void;
   onPluginsReloaded: () => void;
   appUpdate: AppUpdateInfo | null;
+  ompUpdateAvailable?: boolean;
   onRefreshAppUpdate: (force?: boolean) => Promise<AppUpdateInfo | null>;
   onOmpUpdateAvailabilityChange: (available: boolean) => void;
   onRequestAppUpdate: () => void;
@@ -389,6 +396,14 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
   const workspaceReady = cwd !== null;
   const { fontSize, setFontSize } = useFontSize();
   const { uiScale, setUiScale } = useUiScale();
+  const {
+    isSupported: ttsSupported,
+    autoPlayEnabled: ttsAutoPlay,
+    setAutoPlay: setTtsAutoPlay,
+    voices: ttsVoices,
+    selectedVoiceURI: ttsVoiceURI,
+    setSelectedVoiceURI: setTtsVoiceURI,
+  } = useSpeechSynthesis();
   const [searchQuery, setSearchQuery] = useState("");
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const [submitBehavior, setSubmitBehavior] = useState<SubmitDuringRunBehavior>(() => getSubmitDuringRunBehavior());
@@ -414,6 +429,18 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
   const [windowsService, setWindowsService] = useState<WindowsServiceStatus | null>(null);
   const [loadingWindowsService, setLoadingWindowsService] = useState(false);
   const [windowsServiceActionPending, setWindowsServiceActionPending] = useState(false);
+
+  const ompUpdateIsAvailable = Boolean(ompUpdateAvailable || update?.updateAvailable);
+  const appUpdateIsAvailable = Boolean(appUpdate?.updateAvailable);
+  const systemNeedsAttention = appUpdateIsAvailable || ompUpdateIsAvailable;
+
+  const attentionTabs = useMemo<Partial<Record<SettingsTab, boolean | string>>>(() => {
+    const tabs: Partial<Record<SettingsTab, boolean | string>> = {};
+    if (systemNeedsAttention) {
+      tabs.system = t("settingsTabs.updateAvailable");
+    }
+    return tabs;
+  }, [systemNeedsAttention, t]);
 
   const fetchWindowsServiceStatus = useCallback(async () => {
     try {
@@ -683,53 +710,101 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
     transition: isPending ? "opacity 80ms ease-out" : "opacity 120ms ease-out",
   }), [isPending]);
 
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        const target = e.target as HTMLElement | null;
+        if (target?.tagName === "INPUT" && (target as HTMLInputElement).value) return;
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
   return (
-    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
-      <DialogContent ariaLabel={t("settingsConfig.title")} style={{ width: isMobile ? "calc(100vw - 16px)" : 940, maxWidth: "calc(100vw - 16px)", height: isMobile ? "calc(100dvh - 16px)" : "82vh", maxHeight: "calc(100dvh - 16px)", padding: 0, display: "flex", flexDirection: "column", overflow: "hidden", animation: "none" }}>
-        <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, padding: "12px 18px", borderBottom: "1px solid var(--border)", background: "var(--bg-panel)" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <DialogTitle style={{ fontSize: 16, margin: 0, fontWeight: 600 }}>{t("settingsConfig.title")}</DialogTitle>
-            {nativeSavesInFlight > 0 ? (
-              <span style={{ fontSize: 11, color: "var(--accent)", padding: "2px 8px", borderRadius: 10, background: "var(--bg-subtle)", display: "inline-flex", alignItems: "center", gap: 4 }}>
-                <RefreshCw size={11} className="spin" aria-hidden="true" /> {t("settingsConfig.saving")}
-              </span>
-            ) : (
-              <span style={{ fontSize: 11, color: "var(--text-dim)", padding: "2px 8px", borderRadius: 10, background: "var(--bg-subtle)" }}>
-                {t("settingsConfig.autoSaved")}
-              </span>
-            )}
-          </div>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, maxWidth: 360, justifyContent: "flex-end" }}>
-            <div style={{ position: "relative", width: "100%", maxWidth: 260 }}>
-              <Search size={13} aria-hidden="true" style={{ position: "absolute", left: 9, top: "50%", transform: "translateY(-50%)", color: "var(--text-muted)", pointerEvents: "none" }} />
-              <input
-                type="text"
-                aria-label={t("settingsConfig.searchPlaceholder")}
-                placeholder={t("settingsConfig.searchPlaceholder")}
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape") {
+    <div className="settings-view" role="region" aria-label={t("settingsConfig.title")}>
+      <header className="settings-header">
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <button
+            type="button"
+            className="settings-back"
+            onClick={onClose}
+            aria-label={t("settingsConfig.back")}
+            title={`${t("settingsConfig.back")} (Esc)`}
+          >
+            <ArrowLeft size={15} aria-hidden="true" />
+            <span>{t("settingsConfig.back")}</span>
+          </button>
+          <span style={{ width: 1, height: 18, background: "var(--border)", opacity: 0.8 }} aria-hidden="true" />
+          <h1 style={{ fontSize: 15, margin: 0, fontWeight: 600, letterSpacing: "-0.01em", color: "var(--text)" }}>
+            {t("settingsConfig.title")}
+          </h1>
+          {nativeSavesInFlight > 0 ? (
+            <span style={{ fontSize: 11, color: "var(--accent)", padding: "2px 8px", borderRadius: 10, background: "var(--bg-subtle)", display: "inline-flex", alignItems: "center", gap: 4 }}>
+              <RefreshCw size={11} className="spin" aria-hidden="true" /> {t("settingsConfig.saving")}
+            </span>
+          ) : (
+            <span style={{ fontSize: 11, color: "var(--text-dim)", padding: "2px 8px", borderRadius: 10, background: "var(--bg-subtle)" }}>
+              {t("settingsConfig.autoSaved")}
+            </span>
+          )}
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, maxWidth: 380, justifyContent: "flex-end" }}>
+          <div style={{ position: "relative", width: "100%", maxWidth: 280 }}>
+            <Search size={13} aria-hidden="true" style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "var(--text-muted)", pointerEvents: "none" }} />
+            <input
+              type="text"
+              aria-label={t("settingsConfig.searchPlaceholder")}
+              placeholder={t("settingsConfig.searchPlaceholder")}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  if (searchQuery) {
+                    e.stopPropagation();
                     setSearchQuery("");
                     setHighlightId(null);
-                    (e.target as HTMLInputElement).blur();
+                  } else {
+                    onClose();
                   }
-                }}
-                style={{ width: "100%", height: 28, padding: "0 8px 0 28px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg)", color: "var(--text)", fontSize: 12, outline: "none" }}
-              />
-            </div>
-            <button type="button" onClick={onClose} aria-label={t("settingsConfig.closeSettings")} title={t("settingsConfig.closeSettings")} className="ui-focus-ring" style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", fontSize: 20, lineHeight: 1, padding: "4px 8px", minWidth: 28, minHeight: 28, display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "var(--radius-control)" }}>×</button>
+                  (e.target as HTMLInputElement).blur();
+                }
+              }}
+              style={{ width: "100%", height: 30, padding: "0 28px 0 30px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg)", color: "var(--text)", fontSize: 12, outline: "none" }}
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => { setSearchQuery(""); setHighlightId(null); }}
+                style={{ position: "absolute", right: 6, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", padding: 2, display: "flex", alignItems: "center", justifyContent: "center" }}
+                aria-label="Clear search"
+              >
+                <X size={12} aria-hidden="true" />
+              </button>
+            )}
           </div>
-        </header>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label={t("settingsConfig.closeSettings")}
+            title={`${t("settingsConfig.closeSettings")} (Esc)`}
+            className="settings-close-btn ui-focus-ring"
+          >
+            <X size={16} aria-hidden="true" />
+          </button>
+        </div>
+      </header>
 
-        <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: isMobile ? "column" : "row", overflow: "hidden" }}>
-          {searchActive ? (
-            <SearchResultsList results={searchResults} query={searchQuery.trim()} onSelect={openSearchResult} />
-          ) : (
-            <SettingsHighlightContext.Provider value={highlightId}>
-              <SettingsTabs active={currentTab} onSelect={handleSelectTab} workspaceReady={workspaceReady} layout={isMobile ? "horizontal" : "vertical"} />
+      <div className="settings-body">
+        {searchActive ? (
+          <SearchResultsList results={searchResults} query={searchQuery.trim()} onSelect={openSearchResult} />
+        ) : (
+          <SettingsHighlightContext.Provider value={highlightId}>
+            <SettingsTabs active={currentTab} onSelect={handleSelectTab} workspaceReady={workspaceReady} layout={isMobile ? "horizontal" : "vertical"} attentionTabs={attentionTabs} />
 
-              <div style={contentStyle}>
+            <div className="settings-content" style={contentStyle}>
             {nativeSettingsError && (
               <div style={{ margin: 16 }}>
                 <Alert variant="error" description={nativeSettingsError} onDismiss={() => setNativeSettingsError(null)} />
@@ -738,14 +813,17 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
 
             {/* GENERAL & UI TAB */}
             {currentTab === "general" && (
-              <div role="tabpanel" id="settings-panel-general" aria-labelledby="settings-tab-general" style={{ padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
-                <div>
-                  <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>{t("settingsConfig.interfaceBehavior")}</h3>
-                  <p style={{ margin: "4px 0 0", fontSize: 12, color: "var(--text-muted)" }}>{t("settingsConfig.interfaceBehaviorDesc")}</p>
+              <div role="tabpanel" id="settings-panel-general" aria-labelledby="settings-tab-general" className="settings-panel-inner" style={{ padding: isMobile ? "16px 14px 32px" : "32px 24px 64px", gap: 16 }}>
+                <div style={{ marginBottom: 4 }}>
+                  <h2 className="display-serif" style={{ fontSize: 22, fontWeight: 600, margin: 0, color: "var(--text)", letterSpacing: "-0.01em" }}>{t("settingsConfig.interfaceBehavior")}</h2>
+                  <p className="settings-content-subtitle" style={{ margin: "4px 0 16px", fontSize: 13, color: "var(--text-muted)", lineHeight: 1.45 }}>{t("settingsConfig.interfaceBehaviorDesc")}</p>
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
                   <NativeSetting searchId="keep-tool-calls-collapsed" label={t("settingsConfig.keepToolCallsCollapsed")} description={t("settingsConfig.keepToolCallsCollapsedDesc")} scope="UI">
                     <ToggleSwitch checked={toolCallsDefaultCollapsed} onChange={onToolCallsDefaultCollapsedChange} />
+                  </NativeSetting>
+                  <NativeSetting searchId="scope-native-select-all" label={t("settingsConfig.scopeNativeSelectAll")} description={t("settingsConfig.scopeNativeSelectAllDesc")} scope="UI">
+                    <ToggleSwitch checked={scopeNativeSelectAll} onChange={onScopeNativeSelectAllChange} />
                   </NativeSetting>
                   <NativeSetting searchId="completion-sound" label={t("settingsConfig.completionSound")} description={t("settingsConfig.completionSoundDesc")} scope="UI">
                     <ToggleSwitch
@@ -756,6 +834,38 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                         window.dispatchEvent(new CustomEvent("omp-sound-pref-change", { detail: next }));
                       }}
                     />
+                  </NativeSetting>
+                  <NativeSetting
+                    searchId="tts-autoplay"
+                    label={t("settingsConfig.ttsAutoplay") || "Auto-read assistant responses"}
+                    description={ttsSupported ? (t("settingsConfig.ttsAutoplayDesc") || "Automatically read aloud new assistant replies when completed.") : `${t("settingsConfig.ttsAutoplayDesc") || "Automatically read aloud new assistant replies when completed."} (${t("settingsConfig.ttsNotSupported") || "Not supported in this browser"})`}
+                    scope="UI"
+                  >
+                    <ToggleSwitch
+                      checked={ttsSupported ? ttsAutoPlay : false}
+                      disabled={!ttsSupported}
+                      onChange={setTtsAutoPlay}
+                    />
+                  </NativeSetting>
+                  <NativeSetting
+                    searchId="tts-voice"
+                    label={t("settingsConfig.ttsVoice") || "Speech Voice"}
+                    description={ttsSupported ? (t("settingsConfig.ttsVoiceDesc") || "Select the browser voice for text-to-speech reading.") : `${t("settingsConfig.ttsVoiceDesc") || "Select the browser voice for text-to-speech reading."} (${t("settingsConfig.ttsNotSupported") || "Not supported in this browser"})`}
+                    scope="UI"
+                  >
+                    <select
+                      style={nativeSelectStyle}
+                      value={ttsVoiceURI || ""}
+                      disabled={!ttsSupported || ttsVoices.length === 0}
+                      onChange={(e) => setTtsVoiceURI(e.target.value || null)}
+                    >
+                      <option value="">{t("settingsConfig.defaultVoice") || "Default system voice"}</option>
+                      {ttsVoices.map((v) => (
+                        <option key={v.voiceURI} value={v.voiceURI}>
+                          {v.name} ({v.lang})
+                        </option>
+                      ))}
+                    </select>
                   </NativeSetting>
                   <NativeSetting searchId="provider-usage" label={t("settingsConfig.providerUsage")} description={t("settingsConfig.providerUsageDesc")} scope="UI">
                     <ToggleSwitch checked={providerUsageVisible} onChange={onProviderUsageVisibleChange} />
@@ -784,33 +894,33 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                       <option value="large" style={nativeOptionStyle}>{t("settingsConfig.uiScaleLarge")}</option>
                     </select>
                   </NativeSetting>
+                  <NativeSetting searchId="message-during-active-run" label={t("settingsConfig.messageDuringActiveRun")} description={t("settingsConfig.messageDuringActiveRunDesc")} scope="UI">
+                    <select
+                      style={nativeSelectStyle}
+                      value={submitBehavior}
+                      onChange={(event) => {
+                        const next = event.target.value as SubmitDuringRunBehavior;
+                        setSubmitDuringRunBehavior(next);
+                        setSubmitBehavior(next);
+                      }}
+                    >
+                      <option value="steer" style={nativeOptionStyle}>{t("settingsConfig.steerCurrentRun")}</option>
+                      <option value="queue" style={nativeOptionStyle}>{t("settingsConfig.queueFollowUp")}</option>
+                    </select>
+                  </NativeSetting>
                 </div>
-                <NativeSetting searchId="message-during-active-run" label={t("settingsConfig.messageDuringActiveRun")} description={t("settingsConfig.messageDuringActiveRunDesc")} scope="UI">
-                  <select
-                    style={nativeSelectStyle}
-                    value={submitBehavior}
-                    onChange={(event) => {
-                      const next = event.target.value as SubmitDuringRunBehavior;
-                      setSubmitDuringRunBehavior(next);
-                      setSubmitBehavior(next);
-                    }}
-                  >
-                    <option value="steer" style={nativeOptionStyle}>{t("settingsConfig.steerCurrentRun")}</option>
-                    <option value="queue" style={nativeOptionStyle}>{t("settingsConfig.queueFollowUp")}</option>
-                  </select>
-                </NativeSetting>
               </div>
             )}
 
             {/* SAFETY & APPROVALS TAB */}
             {currentTab === "safety" && (
-              <div role="tabpanel" id="settings-panel-safety" aria-labelledby="settings-tab-safety" style={{ padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
-                <div>
-                  <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>{t("settingsConfig.toolSafetyApprovals")}</h3>
-                  <p style={{ margin: "4px 0 0", fontSize: 12, color: "var(--text-muted)" }}>{t("settingsConfig.toolSafetyApprovalsDesc")}</p>
-                  <MachineScopeNote style={{ marginTop: 8 }} />
+              <div role="tabpanel" id="settings-panel-safety" aria-labelledby="settings-tab-safety" className="settings-panel-inner" style={{ padding: isMobile ? "16px 14px 32px" : "32px 24px 64px", gap: 16 }}>
+                <div style={{ marginBottom: 4 }}>
+                  <h2 className="display-serif" style={{ fontSize: 22, fontWeight: 600, margin: 0, color: "var(--text)", letterSpacing: "-0.01em" }}>{t("settingsConfig.toolSafetyApprovals")}</h2>
+                  <p className="settings-content-subtitle" style={{ margin: "4px 0 16px", fontSize: 13, color: "var(--text-muted)", lineHeight: 1.45 }}>{t("settingsConfig.toolSafetyApprovalsDesc")}</p>
+                  <MachineScopeNote />
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
                   <NativeSetting searchId="approval-mode" label={t("settingsConfig.approvalMode")} description={t("settingsConfig.approvalModeDesc")} scope="Native OMP">
                     <select
                       style={nativeSelectStyle}
@@ -849,13 +959,13 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
 
             {/* AI MODEL DEFAULTS TAB */}
             {currentTab === "models" && (
-              <div role="tabpanel" id="settings-panel-models" aria-labelledby="settings-tab-models" style={{ padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
-                <div>
-                  <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>{t("settingsConfig.modelDefaults")}</h3>
-                  <p style={{ margin: "4px 0 0", fontSize: 12, color: "var(--text-muted)" }}>{t("settingsConfig.modelDefaultsDesc")}</p>
-                  <MachineScopeNote style={{ marginTop: 8 }} />
+              <div role="tabpanel" id="settings-panel-models" aria-labelledby="settings-tab-models" className="settings-panel-inner" style={{ padding: isMobile ? "16px 14px 32px" : "32px 24px 64px", gap: 16 }}>
+                <div style={{ marginBottom: 4 }}>
+                  <h2 className="display-serif" style={{ fontSize: 22, fontWeight: 600, margin: 0, color: "var(--text)", letterSpacing: "-0.01em" }}>{t("settingsConfig.modelDefaults")}</h2>
+                  <p className="settings-content-subtitle" style={{ margin: "4px 0 16px", fontSize: 13, color: "var(--text-muted)", lineHeight: 1.45 }}>{t("settingsConfig.modelDefaultsDesc")}</p>
+                  <MachineScopeNote />
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
                   <NativeSetting searchId="reasoning" label={t("settingsConfig.reasoning")} description={t("settingsConfig.reasoningDesc")} scope="Native OMP">
                     <select
                       style={nativeSelectStyle}
@@ -908,7 +1018,11 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
 
             {/* API KEYS & PROVIDERS TAB */}
             {currentTab === "providers" && (
-              <div role="tabpanel" id="settings-panel-providers" aria-labelledby="settings-tab-providers" style={{ display: currentTab === "providers" ? "flex" : "none", height: "100%", minHeight: 0, flexDirection: "column" }}>
+              <div role="tabpanel" id="settings-panel-providers" aria-labelledby="settings-tab-providers" className="settings-panel-inner" style={{ display: currentTab === "providers" ? "flex" : "none", width: "100%", maxWidth: 940, minHeight: 0, flexDirection: "column", padding: isMobile ? "16px 14px 32px" : "32px 24px 64px" }}>
+                <div style={{ marginBottom: 12 }}>
+                  <h2 className="display-serif" style={{ fontSize: 22, fontWeight: 600, margin: 0, color: "var(--text)", letterSpacing: "-0.01em" }}>{t("settingsTabs.providers.label")}</h2>
+                  <p className="settings-content-subtitle" style={{ margin: "4px 0 16px", fontSize: 13, color: "var(--text-muted)", lineHeight: 1.45 }}>{t("settingsTabs.providers.description")}</p>
+                </div>
                 <ModelsConfig embedded onClose={onClose} onSaved={onModelsSaved} />
               </div>
             )}
@@ -931,13 +1045,14 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                 role="tabpanel"
                 id="settings-panel-usage"
                 aria-labelledby="settings-tab-usage"
+                className="settings-panel-inner"
                 style={{
                   display: currentTab === "usage" ? "flex" : "none",
-                  height: "100%",
+                  width: "100%",
+                  maxWidth: 940,
                   minHeight: 0,
                   flexDirection: "column",
-                  overflowY: "auto",
-                  padding: 20,
+                  padding: isMobile ? "16px 14px 32px" : "32px 24px 64px",
                 }}
               >
                 <UsageConfig />
@@ -946,13 +1061,17 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
 
             {/* AGENT INTELLIGENCE TAB */}
             {currentTab === "intelligence" && (
-              <div role="tabpanel" id="settings-panel-intelligence" aria-labelledby="settings-tab-intelligence" style={{ padding: 20, display: "flex", flexDirection: "column", gap: 18 }}>
+              <div role="tabpanel" id="settings-panel-intelligence" aria-labelledby="settings-tab-intelligence" className="settings-panel-inner" style={{ padding: isMobile ? "16px 14px 32px" : "32px 24px 64px", gap: 20 }}>
+                <div style={{ marginBottom: 4 }}>
+                  <h2 className="display-serif" style={{ fontSize: 22, fontWeight: 600, margin: 0, color: "var(--text)", letterSpacing: "-0.01em" }}>{t("settingsTabs.intelligence.label")}</h2>
+                  <p className="settings-content-subtitle" style={{ margin: "4px 0 16px", fontSize: 13, color: "var(--text-muted)", lineHeight: 1.45 }}>{t("settingsTabs.intelligence.description")}</p>
+                </div>
                 <MachineScopeNote />
                 {/* Context Compaction Section */}
-                <section style={{ display: "flex", flexDirection: "column", gap: 10, borderTop: "1px solid var(--border)", paddingTop: 16 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600 }}>{t("settingsConfig.contextCompaction")}</div>
-                  <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 12 }}>{t("settingsConfig.contextCompactionDesc")}</p>
-                  <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+                <section style={{ display: "flex", flexDirection: "column", gap: 10, borderTop: "1px solid var(--border)", paddingTop: 18, width: "100%" }}>
+                  <div className="settings-section-title" style={{ fontSize: 13.5, fontWeight: 600, margin: 0 }}>{t("settingsConfig.contextCompaction")}</div>
+                  <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 12.5, lineHeight: 1.45 }}>{t("settingsConfig.contextCompactionDesc")}</p>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 4, width: "100%" }}>
                     <NativeSetting searchId="automatic-compaction" label={t("settingsConfig.automaticCompaction")} description={t("settingsConfig.automaticCompactionDesc")} scope="Native OMP">
                       <ToggleSwitch
                         checked={nativeSettings?.compaction?.enabled ?? true}
@@ -988,10 +1107,10 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                 </section>
 
                 {/* Memory & Auto-Learn Section */}
-                <section style={{ display: "flex", flexDirection: "column", gap: 10, borderTop: "1px solid var(--border)", paddingTop: 16 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600 }}>{t("settingsConfig.memoryAutoLearn")}</div>
-                  <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 12 }}>{t("settingsConfig.memoryAutoLearnDesc")}</p>
-                  <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+                <section style={{ display: "flex", flexDirection: "column", gap: 10, borderTop: "1px solid var(--border)", paddingTop: 18, width: "100%" }}>
+                  <div className="settings-section-title" style={{ fontSize: 13.5, fontWeight: 600, margin: 0 }}>{t("settingsConfig.memoryAutoLearn")}</div>
+                  <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 12.5, lineHeight: 1.45 }}>{t("settingsConfig.memoryAutoLearnDesc")}</p>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 4, width: "100%" }}>
                     <NativeSetting searchId="memory-backend" label={t("settingsConfig.memoryBackend")} description={t("settingsConfig.memoryBackendDesc")} scope="Native OMP">
                       <select
                         style={nativeSelectStyle}
@@ -1043,10 +1162,10 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                 </section>
 
                 {/* Retry Section */}
-                <section style={{ display: "flex", flexDirection: "column", gap: 10, borderTop: "1px solid var(--border)", paddingTop: 16 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600 }}>{t("settingsConfig.automaticRetry")}</div>
-                  <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 12 }}>{t("settingsConfig.automaticRetryDesc")}</p>
-                  <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+                <section style={{ display: "flex", flexDirection: "column", gap: 10, borderTop: "1px solid var(--border)", paddingTop: 18, width: "100%" }}>
+                  <div className="settings-section-title" style={{ fontSize: 13.5, fontWeight: 600, margin: 0 }}>{t("settingsConfig.automaticRetry")}</div>
+                  <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 12.5, lineHeight: 1.45 }}>{t("settingsConfig.automaticRetryDesc")}</p>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 4, width: "100%" }}>
                     <NativeSetting searchId="automatic-retry" label={t("settingsConfig.retryToggle")} description={t("settingsConfig.retryToggleDesc")} scope="Native OMP">
                       <ToggleSwitch
                         checked={nativeSettings?.retry?.enabled ?? true}
@@ -1077,14 +1196,14 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
 
             {/* EXTENSIONS & TOOLS TAB (MCP, SKILLS, PLUGINS) */}
             {currentTab === "mcp" && (
-              <div role="tabpanel" id="settings-panel-mcp" aria-labelledby="settings-tab-mcp" style={{ display: currentTab === "mcp" ? "flex" : "none", height: "100%", minHeight: 0, flexDirection: "column", overflowY: "auto", padding: 20, gap: 16 }}>
-                <div>
-                  <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>{t("settingsConfig.extensionsTools")}</h3>
-                  <p style={{ margin: "4px 0 0", fontSize: 12, color: "var(--text-muted)" }}>{t("settingsConfig.extensionsToolsDesc")}</p>
-                  <MachineScopeNote style={{ marginTop: 8 }} />
+              <div role="tabpanel" id="settings-panel-mcp" aria-labelledby="settings-tab-mcp" className="settings-panel-inner" style={{ display: currentTab === "mcp" ? "flex" : "none", width: "100%", maxWidth: 940, minHeight: 0, flexDirection: "column", padding: isMobile ? "16px 14px 32px" : "32px 24px 64px", gap: 16 }}>
+                <div style={{ marginBottom: 4 }}>
+                  <h2 className="display-serif" style={{ fontSize: 22, fontWeight: 600, margin: 0, color: "var(--text)", letterSpacing: "-0.01em" }}>{t("settingsConfig.extensionsTools")}</h2>
+                  <p className="settings-content-subtitle" style={{ margin: "4px 0 16px", fontSize: 13, color: "var(--text-muted)", lineHeight: 1.45 }}>{t("settingsConfig.extensionsToolsDesc")}</p>
+                  <MachineScopeNote />
                 </div>
                 {cwd && (
-                  <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "repeat(2, minmax(0, 1fr))", gap: 10 }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
                     <NativeSetting searchId="load-project-mcp-servers" label={t("settingsConfig.loadProjectMcp")} description={t("settingsConfig.loadProjectMcpDesc")} scope="Native OMP">
                       <ToggleSwitch
                         checked={nativeSettings?.mcp?.enableProjectConfig ?? true}
@@ -1112,14 +1231,14 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
 
             {/* SKILLS SUB-PANEL CONTRACT MATCH */}
             {cwd && currentTab === "skills" && (
-              <div role="tabpanel" id="settings-panel-skills" aria-labelledby="settings-tab-skills" style={{ display: currentTab === "skills" ? "flex" : "none", height: "100%", minHeight: 0, flexDirection: "column" }}>
+              <div role="tabpanel" id="settings-panel-skills" aria-labelledby="settings-tab-skills" className="settings-panel-inner" style={{ display: currentTab === "skills" ? "flex" : "none", width: "100%", maxWidth: 940, minHeight: isMobile ? undefined : 600, flexDirection: "column", padding: isMobile ? "16px 14px 32px" : "32px 24px 64px" }}>
                 <SkillsConfig embedded cwd={cwd} onClose={onClose} />
               </div>
             )}
 
             {/* PLUGINS SUB-PANEL CONTRACT MATCH */}
             {cwd && currentTab === "plugins" && (
-              <div role="tabpanel" id="settings-panel-plugins" aria-labelledby="settings-tab-plugins" style={{ display: currentTab === "plugins" ? "flex" : "none", height: "100%", minHeight: 0, flexDirection: "column" }}>
+              <div role="tabpanel" id="settings-panel-plugins" aria-labelledby="settings-tab-plugins" className="settings-panel-inner" style={{ display: currentTab === "plugins" ? "flex" : "none", width: "100%", maxWidth: 940, minHeight: isMobile ? undefined : 600, flexDirection: "column", padding: isMobile ? "16px 14px 32px" : "32px 24px 64px" }}>
                 <PluginsConfig embedded cwd={cwd} sessionId={sessionId} onClose={onClose} onReloaded={onPluginsReloaded} />
               </div>
             )}
@@ -1130,22 +1249,23 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                 role="tabpanel"
                 id="settings-panel-agents"
                 aria-labelledby="settings-tab-agents"
+                className="settings-panel-inner"
                 style={{
                   display: currentTab === "agents" ? "flex" : "none",
-                  height: "100%",
+                  width: "100%",
+                  maxWidth: 940,
                   minHeight: 0,
                   flexDirection: "column",
-                  overflowY: "auto",
-                  padding: 20,
+                  padding: isMobile ? "16px 14px 32px" : "32px 24px 64px",
                   gap: 16,
                   ...(highlightId && ["agent-roster", "agent-model", "agent-tools"].includes(highlightId)
                     ? { border: "1px solid var(--accent)", boxShadow: "0 0 0 2px var(--accent)" }
                     : {}),
                 }}
               >
-                <div>
-                  <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>{t("settingsConfig.agentsTitle")}</h3>
-                  <p style={{ margin: "4px 0 0", fontSize: 12, color: "var(--text-muted)" }}>
+                <div style={{ marginBottom: 4 }}>
+                  <h2 className="display-serif" style={{ fontSize: 22, fontWeight: 600, margin: 0, color: "var(--text)", letterSpacing: "-0.01em" }}>{t("settingsConfig.agentsTitle")}</h2>
+                  <p className="settings-content-subtitle" style={{ margin: "4px 0 16px", fontSize: 13, color: "var(--text-muted)", lineHeight: 1.45 }}>
                     {t("settingsConfig.agentsDesc")}
                   </p>
                   <MachineScopeNote style={{ marginTop: 8 }} />
@@ -1156,18 +1276,28 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
 
             {/* SYSTEM & UPDATES TAB */}
             {currentTab === "system" && (
-              <div role="tabpanel" id="settings-panel-system" aria-labelledby="settings-tab-system" style={{ padding: 20, display: "flex", flexDirection: "column", gap: 18 }}>
-                <div>
-                  <h3 style={{ fontSize: 14, fontWeight: 600, margin: 0 }}>{t("settingsConfig.systemUpdates")}</h3>
-                  <p style={{ margin: "4px 0 0", fontSize: 12, color: "var(--text-muted)" }}>{t("settingsConfig.systemUpdatesDescription")}</p>
+              <div role="tabpanel" id="settings-panel-system" aria-labelledby="settings-tab-system" className="settings-panel-inner" style={{ padding: isMobile ? "16px 14px 32px" : "32px 24px 64px", display: "flex", flexDirection: "column", gap: 18 }}>
+                <div style={{ marginBottom: 4 }}>
+                  <h2 className="display-serif" style={{ fontSize: 22, fontWeight: 600, margin: 0, color: "var(--text)", letterSpacing: "-0.01em" }}>{t("settingsConfig.systemUpdates")}</h2>
+                  <p className="settings-content-subtitle" style={{ margin: "4px 0 16px", fontSize: 13, color: "var(--text-muted)", lineHeight: 1.45 }}>{t("settingsConfig.systemUpdatesDescription")}</p>
                 </div>
 
                 {/* ompweb app update card */}
-                <section style={{ padding: 14, border: "1px solid var(--border)", borderRadius: "var(--radius-card)", background: "var(--bg-panel)", display: "flex", flexDirection: "column", gap: 10 }}>
+                <section style={{ padding: 14, border: appUpdateIsAvailable ? "1px solid color-mix(in srgb, var(--accent) 45%, var(--border))" : "1px solid var(--border)", borderRadius: "var(--radius-card)", background: "var(--bg-panel)", display: "flex", flexDirection: "column", gap: 10 }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
                     <div>
-                      <div style={{ fontSize: 13, fontWeight: 600 }}>{t("settingsConfig.appLabel")}</div>
-                      <div style={{ marginTop: 4, color: appUpdate?.updateAvailable ? "var(--accent)" : "var(--text-muted)", fontFamily: "var(--font-mono)", fontSize: 12 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ fontSize: 13, fontWeight: 600 }}>{t("settingsConfig.appLabel")}</span>
+                        {appUpdateIsAvailable && (
+                          <span
+                            role="status"
+                            aria-label={t("settingsTabs.updateAvailable")}
+                            title={t("settingsTabs.updateAvailable")}
+                            style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--accent)", flexShrink: 0 }}
+                          />
+                        )}
+                      </div>
+                      <div style={{ marginTop: 4, color: appUpdateIsAvailable ? "var(--accent)" : "var(--text-muted)", fontFamily: "var(--font-mono)", fontSize: 12 }}>
                         {checkingAppUpdate ? t("settingsConfig.checkingUpdates") : appUpdate?.updateAvailable ? t("appShell.updateVersion", { current: appUpdate.currentVersion ?? "?", available: appUpdate.availableVersion ?? "?" }) : appUpdate?.currentVersion ? t("settingsConfig.upToDate", { version: appUpdate.currentVersion }) : t("settingsConfig.versionUnavailable")}
                       </div>
                     </div>
@@ -1213,13 +1343,24 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
                 </section>
 
                 {/* OMP runtime update card */}
-                <section style={{ padding: 14, border: "1px solid var(--border)", borderRadius: "var(--radius-card)", background: "var(--bg-panel)", display: "flex", flexDirection: "column", gap: 10 }}>
+                <section style={{ padding: 14, border: ompUpdateIsAvailable ? "1px solid color-mix(in srgb, var(--accent) 45%, var(--border))" : "1px solid var(--border)", borderRadius: "var(--radius-card)", background: "var(--bg-panel)", display: "flex", flexDirection: "column", gap: 10 }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
                     <div>
-                      <div style={{ fontSize: 13, fontWeight: 600 }}>{t("settingsConfig.ompLabel")}</div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ fontSize: 13, fontWeight: 600 }}>{t("settingsConfig.ompLabel")}</span>
+                        {ompUpdateIsAvailable && (
+                          <span
+                            role="status"
+                            aria-label={t("settingsTabs.updateAvailable")}
+                            title={t("settingsTabs.updateAvailable")}
+                            style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--accent)", flexShrink: 0 }}
+                          />
+                        )}
+                      </div>
                       <MachineScopeNote style={{ marginTop: 5 }} />
-                      <div style={{ marginTop: 4, color: update?.updateAvailable ? "var(--accent)" : "var(--text-muted)", fontFamily: "var(--font-mono)", fontSize: 12 }}>
-                        {checking ? t("settingsConfig.checkingUpdates") : update?.updateAvailable ? t("appShell.updateVersion", { current: update.currentVersion ?? "?", available: update.availableVersion ?? "?" }) : update?.currentVersion ? t("settingsConfig.upToDate", { version: update.currentVersion }) : t("settingsConfig.versionUnavailable")}
+                      <div style={{ marginTop: 4, color: ompUpdateIsAvailable ? "var(--accent)" : "var(--text-muted)", fontFamily: "var(--font-mono)", fontSize: 12 }}>
+                        {checking || (checkedUpdatesHost !== hostId && !update) ? t("settingsConfig.checkingUpdates") : update?.updateAvailable ? t("appShell.updateVersion", { current: update.currentVersion ?? "?", available: update.availableVersion ?? "?" }) : update?.currentVersion ? t("settingsConfig.upToDate", { version: update.currentVersion }) : t("settingsConfig.versionUnavailable")}
+
                       </div>
                     </div>
                     <button type="button" onClick={() => void checkForUpdate(true)} disabled={checking} aria-label={t("settingsConfig.checkOmpUpdates")} style={{ padding: "6px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "transparent", color: "var(--text)", cursor: checking ? "wait" : "pointer", fontSize: 12, display: "inline-flex", alignItems: "center", gap: 5 }}>
@@ -1395,7 +1536,6 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
             </SettingsHighlightContext.Provider>
           )}
         </div>
-      </DialogContent>
-    </Dialog>
+      </div>
   );
 }

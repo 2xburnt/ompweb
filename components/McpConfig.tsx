@@ -61,7 +61,14 @@ export function McpConfig({ cwd, sessionId }: { cwd: string | null; sessionId?: 
     try {
       const params = new URLSearchParams();
       if (cwd) params.set("cwd", cwd);
-      if (sessionId) params.set("sessionId", sessionId);
+      if (sessionId) {
+        params.set("sessionId", sessionId);
+        try {
+          if (localStorage.getItem(`omp-advisor-enabled:${sessionId}`) === "true") params.set("advisor", "1");
+        } catch {
+          // Private mode: omit the opinion, spawn defaults apply.
+        }
+      }
       const response = await hostFetch(`/api/mcp?${params}`, undefined, targetHost ?? undefined);
       const data = await response.json() as { servers?: McpServer[]; user?: McpUserConfig; inventory?: McpLiveServer[]; liveServers?: McpLiveServer[]; liveError?: string; path?: string; error?: string };
       if (hostRef.current !== targetHost) return;
@@ -274,7 +281,7 @@ export function McpConfig({ cwd, sessionId }: { cwd: string | null; sessionId?: 
           <button type="button" onClick={() => void check()} disabled={saving} style={{ display: "inline-flex", alignItems: "center", gap: 4, padding: "6px 9px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "transparent", color: "var(--text)", cursor: saving ? "wait" : "pointer", fontSize: 11 }}>
             <Check size={13} /> {t("mcpConfig.check")}
           </button>
-          <button type="button" onClick={() => void save()} disabled={saving || !name.trim()} style={{ padding: "6px 9px", border: "none", borderRadius: "var(--radius-control)", background: "var(--accent)", color: "var(--on-accent)", cursor: saving || !name.trim() ? "default" : "pointer", fontSize: 11 }}>
+          <button type="button" onClick={() => void save()} disabled={saving || !name.trim()} style={{ padding: "6px 9px", border: "none", borderRadius: "var(--radius-control)", background: "var(--accent-strong)", color: "var(--on-accent)", cursor: saving || !name.trim() ? "default" : "pointer", fontSize: 11 }}>
             {saving ? t("mcpConfig.saving") : t("mcpConfig.saveServer")}
           </button>
           {selected && (

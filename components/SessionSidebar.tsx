@@ -1,23 +1,36 @@
 "use client";
 
 import { memo, useEffect, useLayoutEffect, useState, useCallback, useRef, useMemo, useDeferredValue, type CSSProperties, type Dispatch, type ReactNode, type RefObject, type SetStateAction } from "react";
-import type { ManagedProject, SessionInfo } from "@/lib/types";
+import type { ManagedProject, ProjectLaunchConfig, SessionInfo } from "@/lib/types";
 import { useI18n } from "@/lib/i18n";
 import { formatApiError } from "@/lib/i18n/api-error";
 import { DirectoryPicker } from "./DirectoryPicker";
-import { FileExplorer, type FileExplorerHandle } from "./FileExplorer";
+import { ProjectLaunchConfigDialog } from "./ProjectLaunchConfigDialog";
 import { SidebarPortalMenu } from "./SidebarPortalMenu";
 import { Tooltip } from "./ui/primitives";
 import { toast } from "./ui/toast";
+import { ProviderUsageBar } from "./ProviderUsageBar";
 import { usePrefersReducedMotion } from "@/hooks/usePrefersReducedMotion";
+import {
+  INITIAL_RESTORE_MAX_ATTEMPTS,
+  INITIAL_RESTORE_RETRY_MS,
+  MAX_PROJECT_SESSIONS,
+  loadUnreadSessionIds,
+  normalizeProjectKey,
+  saveUnreadSessionIds,
+  type WorktreeEntry,
+  type WorktreeState,
+} from "./SessionSidebar-helpers";
 import { clearLastOpenSession, setLastOpenSession, workspaceKeyOf } from "@/lib/workspace-memory";
 import { sortManagedProjects } from "@/lib/project-ordering";
 import { comparableProjectPath } from "@/lib/comparable-path";
-import { Archive, Check, ChevronDown, ChevronRight, FileUp, Folder, GitBranch, MoreHorizontal, Plus, RefreshCw, Search, Server, Settings2, SlidersHorizontal, Trash2, Upload } from "lucide-react";
+import { Archive, Check, ChevronDown, ChevronRight, FileUp, Folder, GitBranch, MoreHorizontal, Plus, RefreshCw, Search, Server, Settings2, SlidersHorizontal, Trash2 } from "lucide-react";
 import { publishSessionsChanged } from "@/lib/session-change-bus";
 import { hostFetch, useHosts, worthAsking } from "@/lib/hosts/client";
 import { MachineSwitcher } from "./MachineSwitcher";
 import { groupSessionsByMachine, projectActivityByKey, projectExpansionKey, sessionHostId, sessionProjectPath, type MachineGroup } from "./machine-groups";
+
+const SESSIONS_FETCH_TIMEOUT_MS = 15_000;
 
 declare global {
   interface Window {
@@ -41,13 +54,11 @@ interface Props {
   selectedCwd?: string | null;
   /** Effective cwd changed. `hostId` is the machine the cwd lives on. */
   onCwdChange?: (cwd: string | null, projectRoot?: string | null, hostId?: string | null) => void;
-  onOpenFile?: (filePath: string, fileName: string) => void;
-  explorerRefreshKey?: number;
-  onExplorerRefresh?: () => void;
-  explorerRefreshing?: boolean;
-  onExplorerRefreshDone?: () => void;
-  onAtMention?: (relativePath: string, isDir: boolean) => void;
-  onAtMentions?: (relativePaths: string[]) => void;
+  onWorkspaceOptionsChange?: (projects: ManagedProject[], selectedProject: string | null, cwd: string | null) => void;
+  addProjectOpen: boolean;
+  setAddProjectOpen: (open: boolean) => void;
+  /** Shows the provider usage bar above Settings; toggle lives in Settings. */
+  usageVisible?: boolean;
   /** Opens the app settings (pinned sidebar footer row). */
   onOpenSettings?: () => void;
   /** True when an omp/ompweb update is available — shows a badge on the gear. */
@@ -56,70 +67,16 @@ interface Props {
   onOpenArchive?: () => void;
   /** Opens Settings → Machines (from the machine switcher). */
   onManageMachines?: () => void;
+  /** True when settings full-page view is currently open. */
+  settingsOpen?: boolean;
 }
 
-interface WorktreeEntry {
-  path: string;
-  branch: string | null;
-  isMain: boolean;
-}
 
-interface WorktreeState {
-  /** The cwd this data was fetched for — guards against stale responses */
-  forCwd: string;
-  projectRoot: string;
-  isGit: boolean;
-  /** False when forCwd is a repo subdirectory — the switcher is hidden there
-   *  because subdir sessions keep their own project identity */
-  isTopLevel: boolean;
-  worktrees: WorktreeEntry[];
-}
 
-/** Normalize a repository/project path for use as a Git-state map key. The
- *  same physical repo may be reached via different path spellings (forward /
- *  back slashes, drive-letter casing); folding them makes distinct spellings
- *  resolve to one shared Git context, while genuinely different repos stay
- *  separate. */
-function normalizeProjectKey(value: string): string {
-  // Clip trailing separators and unify separators. Fold case when the path is
-  // Windows-style (drive-letter rooted or backslash-y) so Drive:\ vs C:\ and
-  // path casing variants map to the same repository, while preserving
-  // case-sensitivity for POSIX paths (client has no process.platform).
-  const isWindowsPath = /^[a-zA-Z]:/.test(value) || value.includes("\\");
-  const normalized = value.replace(/[\/]+$/, "").replace(/\\/g, "/");
-  return isWindowsPath ? normalized.toLowerCase() : normalized;
-}
 
-// Bounded retry window for restoring a brand-new session from its URL before
-// omp flushes the JSONL (typically appears within a second or two of the
-// first prompt, so 8 × 1s covers it without hanging a dead link forever).
-const INITIAL_RESTORE_RETRY_MS = 1000;
-const INITIAL_RESTORE_MAX_ATTEMPTS = 8;
 
-const UNREAD_SESSIONS_STORAGE_KEY = "omp-web:unread-session-ids";
 
-function loadUnreadSessionIds(): Set<string> {
-  if (typeof window === "undefined") return new Set();
-  try {
-    const raw = window.localStorage.getItem(UNREAD_SESSIONS_STORAGE_KEY);
-    if (!raw) return new Set();
-    const parsed = JSON.parse(raw) as unknown;
-    if (Array.isArray(parsed)) return new Set(parsed.filter((id): id is string => typeof id === "string"));
-    return new Set();
-  } catch {
-    return new Set();
-  }
-}
 
-function saveUnreadSessionIds(ids: Set<string>): void {
-  if (typeof window === "undefined") return;
-  try {
-    if (ids.size === 0) window.localStorage.removeItem(UNREAD_SESSIONS_STORAGE_KEY);
-    else window.localStorage.setItem(UNREAD_SESSIONS_STORAGE_KEY, JSON.stringify([...ids]));
-  } catch {
-    // ignore storage quota / privacy-mode errors
-  }
-}
 
 const EXPANDED_PROJECTS_STORAGE_KEY = "omp-web:expanded-projects";
 
@@ -420,7 +377,7 @@ function OmpWebTitle() {
     </button>
   );
 }
-export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, optimisticSession, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onOpenFile, explorerRefreshKey, onExplorerRefresh, explorerRefreshing, onExplorerRefreshDone, onAtMention, onAtMentions, onOpenSettings, onOpenArchive, updateAvailable, onManageMachines }: Props) {
+export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, optimisticSession, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onWorkspaceOptionsChange, addProjectOpen, setAddProjectOpen, usageVisible = true, onOpenSettings, onOpenArchive, updateAvailable, settingsOpen = false, onManageMachines }: Props) {
   const { t } = useI18n();
   // Machines: the selected machine scopes projects, worktrees, the explorer
   // and New Session; sessions from every machine are listed together.
@@ -464,13 +421,13 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   const activeHostRef = useRef<string | null>(null);
 
   // Add-project picker state.
-  const [addProjectOpen, setAddProjectOpen] = useState(false);
   const [addProjectBusy, setAddProjectBusy] = useState(false);
   const [addProjectError, setAddProjectError] = useState<string | null>(null);
   // Per-project expansion, persisted to localStorage (null = nothing stored).
   const [expandedProjects, setExpandedProjects] = useState<Set<string> | null>(() => loadExpandedProjects());
   // Project currently being removed (hide) — serializes remove requests.
   const [removeProjectPath, setRemoveProjectPath] = useState<string | null>(null);
+  const [launchConfigProject, setLaunchConfigProject] = useState<{ project: ManagedProject; host: string | null } | null>(null);
   // Worktree/branch/Git state is scoped per repository. It is cached in a
   // map keyed by the normalized repository root so switching workspaces never
   // leaks one project's branch/worktree data into another's UI (each project
@@ -485,10 +442,6 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   const [wtConfirmRemove, setWtConfirmRemove] = useState<string | null>(null);
   const wtToggleRef = useRef<HTMLButtonElement>(null);
   const wtNewInputRef = useRef<HTMLInputElement>(null);
-  const [explorerOpen, setExplorerOpen] = useState(true);
-  const [explorerKey, setExplorerKey] = useState(0);
-  const [explorerUploadBusy, setExplorerUploadBusy] = useState(false);
-  const [fileSearchOpen, setFileSearchOpen] = useState(false);
   const [sessionRefreshDone, setSessionRefreshDone] = useState(false);
   const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set());
   const [runningSessionCwds, setRunningSessionCwds] = useState<Record<string, string>>({});
@@ -511,7 +464,6 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   // running state; late /api/sessions responses must not overwrite it.
   const sseAuthoritativeRef = useRef(false);
   const sessionRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const fileExplorerRef = useRef<FileExplorerHandle>(null);
 
   const sessionsEtagRef = useRef<string | null>(null);
   const sessionsAbortRef = useRef<AbortController | null>(null);
@@ -522,6 +474,12 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     sessionsAbortRef.current?.abort();
     const controller = new AbortController();
     sessionsAbortRef.current = controller;
+    // A wedged-but-listening server (the long-idle failure mode) accepts the
+    // TCP connection and never answers: without a deadline the fetch pends
+    // forever and the sidebar shows its initial spinner indefinitely. Abort
+    // with a TimeoutError so the catch surfaces an error and the
+    // visibility/online recovery below can retry later.
+    const timeout = setTimeout(() => controller.abort(new DOMException("Session list request timed out", "TimeoutError")), SESSIONS_FETCH_TIMEOUT_MS);
     try {
       if (showLoading) setLoading(true);
       const headers: Record<string, string> = {};
@@ -571,6 +529,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       if ((e as Error)?.name === "AbortError") return;
       setError(t("sessionSidebar.loadFailed", { detail: e instanceof Error ? e.message : String(e) }));
     } finally {
+      clearTimeout(timeout);
       initialLoadedRef.current = true;
       if (showLoading) setLoading(false);
     }
@@ -759,6 +718,22 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       source.close();
     };
   }, [loadSessions, scheduleRefresh]);
+  // Long-idle recovery: while the tab is hidden the SSE connection can die
+  // (laptop sleep, network change, tab freeze) and its EventSource reconnect
+  // carries no list invalidation. Refresh whenever the user actually comes
+  // back or the network returns, so the list is never left stale/empty.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void loadSessions(false);
+    };
+    const onOnline = () => void loadSessions(false);
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("online", onOnline);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("online", onOnline);
+    };
+  }, [loadSessions]);
 
   useEffect(() => {
     const previous = previousRunningSessionIdsRef.current;
@@ -795,9 +770,6 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     });
   }, [selectedSessionId]);
 
-  useEffect(() => {
-    if (explorerRefreshKey !== undefined) setExplorerKey((k) => k + 1);
-  }, [explorerRefreshKey]);
 
   // Home directory of every enabled machine: seeded from the probe result,
   // fetched from /api/home for machines the probe has not reached yet.
@@ -934,7 +906,15 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   // their containing project.
   const lastSyncedCwdPropRef = useRef<string | null>(null);
   useEffect(() => {
-    if (selectedCwdProp && selectedCwdProp !== lastSyncedCwdPropRef.current) {
+    // A withdrawn command must not swallow the next one: without this reset,
+    // re-commanding a cwd the sidebar already synced (A -> sidebar B -> A)
+    // stays stuck on B.
+    if (!selectedCwdProp) {
+      lastSyncedCwdPropRef.current = null;
+      return;
+    }
+    if (selectedCwdProp !== lastSyncedCwdPropRef.current) {
+      provisionalSelectionRef.current = false;
       lastSyncedCwdPropRef.current = selectedCwdProp;
       setSelectedCwd(selectedCwdProp);
       const project = projectRootFor(selectedCwdProp);
@@ -1151,6 +1131,9 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     sortedProjectsRef.current = sortedProjectsBase;
     return sortedProjectsBase;
   }, [sortedProjectsBase, hasPendingNewSession]);
+  useEffect(() => {
+    onWorkspaceOptionsChange?.(sortedProjects, selectedProject, selectedCwd);
+  }, [onWorkspaceOptionsChange, sortedProjects, selectedProject, selectedCwd]);
   // Every machine's project list in display order; the selected machine uses
   // the order-frozen list above so a pending new session does not reshuffle.
   const sortedProjectsByHost = useMemo(() => {
@@ -1318,7 +1301,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
 
   // A workspace is a machine and a folder, both chosen in the picker, so the
   // machine no longer has to be selected before adding one.
-  const commitAddProject = useCallback(async (candidate?: string, candidateHost?: string | null) => {
+  const commitAddProject = useCallback(async (candidate?: string, candidateHost?: string | null, launchConfig?: ProjectLaunchConfig) => {
     const path = (candidate ?? "").trim();
     if (!path || addProjectBusy) return;
     const targetHost = candidateHost ?? hostId;
@@ -1329,7 +1312,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       const res = await hostFetch("/api/projects", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd: path }),
+        body: JSON.stringify({ cwd: path, launchConfig }),
       }, targetHost);
       const data = await res.json().catch(() => ({})) as { project?: ManagedProject; error?: string; code?: string };
       if (!res.ok || data.error || !data.project) {
@@ -1348,9 +1331,9 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     } finally {
       setAddProjectBusy(false);
     }
-  }, [addProjectBusy, loadProjects, expandProject, adoptHost, hostId]);
+  }, [addProjectBusy, loadProjects, expandProject, adoptHost, hostId, setAddProjectOpen]);
 
-  const handleUpdateProjectPresentation = useCallback(async (projectPath: string, updates: { alias?: string | null; sortOrder?: number | null }, host: string | null = hostId) => {
+  const handleUpdateProjectPresentation = useCallback(async (projectPath: string, updates: { alias?: string | null; sortOrder?: number | null; launchConfig?: ProjectLaunchConfig | null }, host: string | null = hostId) => {
     try {
       const response = await hostFetch("/api/projects", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd: projectPath, ...updates }) }, host);
       if (!response.ok) throw new Error(t("projects.updateFailed"));
@@ -1704,7 +1687,22 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             setAddProjectError(null);
           }}
           allowHostChange
-          onSelect={(path, pickedHost) => void commitAddProject(path, pickedHost)}
+          onSelect={(path, pickedHost, launchConfig) => void commitAddProject(path, pickedHost, launchConfig)}
+        />
+      )}
+      {launchConfigProject && (
+        <ProjectLaunchConfigDialog
+          projectPath={launchConfigProject.project.path}
+          initialConfig={launchConfigProject.project.launchConfig}
+          onClose={() => setLaunchConfigProject(null)}
+          onSave={async (launchConfig) => {
+            await handleUpdateProjectPresentation(
+              launchConfigProject.project.path,
+              { launchConfig },
+              launchConfigProject.host,
+            );
+            toast.info(t("sessionSidebar.launchConfigSaved"));
+          }}
         />
       )}
       {/* Header: branding + quiet utilities + New Session */}
@@ -1895,8 +1893,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       {/* Workspaces */}
         <div
           style={{
-            flex: explorerOpen && (selectedCwdProp || selectedCwd) ? "1 1 0" : "1 1 auto",
-            transition: "flex var(--dur-med) var(--ease-out-warm)",
+            flex: "1 1 auto",
             overflowY: "auto",
             padding: "2px 10px 10px",
             minHeight: 80,
@@ -1966,6 +1963,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                       onNewSession={(path) => handleNewSessionForProject(path, group.hostId)}
                       onToggleExpand={(path) => toggleProjectExpanded(path, group.hostId)}
                       onRemoveProject={(path) => void handleRemoveProject(path, group.hostId)}
+                      onEditLaunchConfig={(project) => setLaunchConfigProject({ project, host: group.hostId })}
                       onUpdatePresentation={(path, updates) => void handleUpdateProjectPresentation(path, updates, group.hostId)}
                       onDragPathChange={(path) => setDraggedProject(path ? { host: group.hostId, path } : null)}
                       onDropProject={(path) => void handleProjectDrop(path, group.hostId)}
@@ -1990,169 +1988,13 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
           })}
         </div>
 
-      {/* File Explorer section */}
-      {(selectedCwdProp || selectedCwd) && (
-        <div
-          style={{
-            borderTop: "1px solid var(--border)",
-            display: "flex",
-            flexDirection: "column",
-            flex: explorerOpen ? "1 1 0" : "0 0 auto",
-            minHeight: 0,
-            overflow: "hidden",
-            transition: "flex var(--dur-med) var(--ease-out-warm)",
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", flexShrink: 0 }}>
-            <button
-              onClick={() => setExplorerOpen((v) => !v)}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                flex: 1,
-                padding: "6px 10px",
-                background: "none",
-                border: "none",
-                color: "var(--text-muted)",
-                cursor: "pointer",
-                fontSize: 11,
-                fontWeight: 600,
-                letterSpacing: "0.05em",
-                textTransform: "uppercase",
-                textAlign: "left",
-              }}
-            >
-              <ChevronRight
-                size={12}
-                strokeWidth={1.8}
-                style={{
-                  transform: explorerOpen ? "rotate(90deg)" : "none",
-                  transition: "transform var(--dur-med) var(--ease-out-warm)",
-                  flexShrink: 0,
-                }}
-                aria-hidden="true"
-              />
-              {t("sessionSidebar.explorer")}
-            </button>
-            <div
-              inert={!explorerOpen ? true : undefined}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                opacity: explorerOpen ? 1 : 0,
-                pointerEvents: explorerOpen ? "auto" : "none",
-                transition: "opacity var(--dur-fast) var(--ease-out-warm)",
-              }}
-            >
-              <Tooltip content={t("fileExplorer.searchFiles")} side="top">
-                <button
-                  onClick={() => setFileSearchOpen((open) => !open)}
-                  title={t("fileExplorer.searchFiles")}
-                  aria-label={t("fileExplorer.searchFiles")}
-                  aria-pressed={fileSearchOpen}
-                  style={{
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    width: 26, height: 26, padding: 0,
-                    background: fileSearchOpen ? "var(--bg-hover)" : "none",
-                    border: "none",
-                    color: fileSearchOpen ? "var(--accent)" : "var(--text-dim)",
-                    cursor: "pointer",
-                    borderRadius: "var(--radius-control)",
-                    flexShrink: 0,
-                    transition: "color var(--dur-fast) var(--ease-out-warm), background var(--dur-fast) var(--ease-out-warm)",
-                  }}
-                  onMouseEnter={(e) => { if (fileSearchOpen) return; e.currentTarget.style.color = "var(--text-muted)"; e.currentTarget.style.background = "var(--bg-hover)"; }}
-                  onMouseLeave={(e) => { if (fileSearchOpen) return; e.currentTarget.style.color = "var(--text-dim)"; e.currentTarget.style.background = "none"; }}
-                >
-                  <Search size={13} strokeWidth={2} aria-hidden="true" />
-                </button>
-              </Tooltip>
-              <Tooltip content={t("sessionSidebar.uploadFilesTitle")} side="top">
-                <button
-                  onClick={() => fileExplorerRef.current?.openUploadPicker()}
-                  disabled={explorerUploadBusy}
-                  title={t("sessionSidebar.uploadFilesTitle")}
-                  aria-label={t("sessionSidebar.uploadFiles")}
-                  style={{
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    width: 26, height: 26, padding: 0,
-                    background: "none",
-                    border: "none",
-                    color: "var(--text-dim)",
-                    cursor: explorerUploadBusy ? "default" : "pointer",
-                    borderRadius: "var(--radius-control)",
-                    flexShrink: 0,
-                    opacity: explorerUploadBusy ? 0.6 : 1,
-                    transition: "color var(--dur-fast) var(--ease-out-warm), background var(--dur-fast) var(--ease-out-warm)",
-                  }}
-                  onMouseEnter={(e) => { if (explorerUploadBusy) return; e.currentTarget.style.color = "var(--text-muted)"; e.currentTarget.style.background = "var(--bg-hover)"; }}
-                  onMouseLeave={(e) => { if (explorerUploadBusy) return; e.currentTarget.style.color = "var(--text-dim)"; e.currentTarget.style.background = "none"; }}
-                >
-                  <Upload size={13} strokeWidth={2} aria-hidden="true" />
-                </button>
-              </Tooltip>
-            </div>
-            <Tooltip content={t("sessionSidebar.refreshExplorer")} side="top">
-              <button
-                aria-label={t("sessionSidebar.refreshExplorer")}
-                onClick={() => {
-                  if (onExplorerRefresh) onExplorerRefresh();
-                  else setExplorerKey((k) => k + 1);
-                }}
-                title={t("sessionSidebar.refreshExplorer")}
-                style={{
-                  display: "flex", alignItems: "center", justifyContent: "center",
-                  width: 26, height: 26, padding: 0, marginRight: 6,
-                  background: "none",
-                  border: "none",
-                  color: explorerRefreshing ? "var(--accent)" : "var(--text-dim)",
-                  cursor: "pointer",
-                  borderRadius: "var(--radius-control)",
-                  flexShrink: 0,
-                  transition: "color var(--dur-fast) var(--ease-out-warm), background var(--dur-fast) var(--ease-out-warm)",
-                }}
-                onMouseEnter={(e) => { if (explorerRefreshing) return; e.currentTarget.style.color = "var(--text-muted)"; e.currentTarget.style.background = "var(--bg-hover)"; }}
-                onMouseLeave={(e) => { if (explorerRefreshing) return; e.currentTarget.style.color = "var(--text-dim)"; e.currentTarget.style.background = "none"; }}
-              >
-                {explorerRefreshing ? (
-                  <RefreshCw size={13} strokeWidth={2} aria-hidden="true" className="icon-spin" />
-                ) : (
-                  <RefreshCw size={13} strokeWidth={2} aria-hidden="true" />
-                )}
-              </button>
-            </Tooltip>
-          </div>
-          <div
-            className={"accordion-flow " + (explorerOpen ? "is-open" : "")}
-            inert={!explorerOpen ? true : undefined}
-            style={{
-              flex: explorerOpen ? "1 1 auto" : "0 0 0px",
-              minHeight: 0,
-            }}
-          >
-            <div className="accordion-flow-inner" style={{ height: "100%", overflowY: "auto", overflowX: "hidden" }}>
-              <FileExplorer
-                ref={fileExplorerRef}
-                cwd={selectedCwd ?? selectedCwdProp!}
-                onOpenFile={onOpenFile ?? (() => {})}
-                refreshKey={explorerKey}
-                onAtMention={onAtMention}
-                onAtMentions={onAtMentions}
-                onUploadBusyChange={setExplorerUploadBusy}
-                onRefreshDone={onExplorerRefreshDone}
-                fileSearchOpen={fileSearchOpen}
-                onFileSearchOpenChange={setFileSearchOpen}
-              />
-            </div>
-          </div>
-        </div>
-      )}
-
+      {/* Provider usage bar — pinned above Settings */}
+      {usageVisible && <ProviderUsageBar />}
       {/* Pinned footer: Settings */}
       <div style={{ borderTop: "1px solid var(--border)", flexShrink: 0 }}>
         <button
           className="sidebar-settings-row"
+          data-active={settingsOpen}
           onClick={onOpenSettings}
           title={t("chatInput.settings")}
           aria-label={t("chatInput.settings")}
@@ -2164,15 +2006,15 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             alignItems: "center",
             gap: 9,
             padding: "0 12px",
-            background: "none",
+            background: settingsOpen ? "var(--bg-selected)" : "none",
             border: "none",
-            color: "var(--text-muted)",
+            color: settingsOpen ? "var(--text)" : "var(--text-muted)",
             cursor: "pointer",
             textAlign: "left",
             transition: SIDEBAR_BUTTON_TRANSITION,
           }}
-          onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text)"; }}
-          onMouseLeave={(e) => { e.currentTarget.style.background = "none"; e.currentTarget.style.color = "var(--text-muted)"; }}
+          onMouseEnter={(e) => { e.currentTarget.style.background = settingsOpen ? "var(--bg-selected)" : "var(--bg-hover)"; e.currentTarget.style.color = "var(--text)"; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = settingsOpen ? "var(--bg-selected)" : "none"; e.currentTarget.style.color = settingsOpen ? "var(--text)" : "var(--text-muted)"; }}
         >
           <span style={{ position: "relative", display: "inline-flex", flexShrink: 0, color: "var(--accent)" }}>
             <Settings2 size={14} strokeWidth={2} aria-hidden="true" />
@@ -2194,7 +2036,6 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   );
 });
 
-const MAX_PROJECT_SESSIONS = 5;
 
 
 interface ProjectRowProps {
@@ -2213,7 +2054,8 @@ interface ProjectRowProps {
   onNewSession: (path: string) => void;
   onToggleExpand: (path: string) => void;
   onRemoveProject: (path: string) => void;
-  onUpdatePresentation: (path: string, updates: { alias?: string | null; sortOrder?: number | null }) => void;
+  onEditLaunchConfig: (project: ManagedProject) => void;
+  onUpdatePresentation: (path: string, updates: { alias?: string | null; sortOrder?: number | null; launchConfig?: ProjectLaunchConfig | null }) => void;
   onDragPathChange: (path: string | null) => void;
   onDropProject: (path: string) => void;
   onMoveProject: (path: string, delta: -1 | 1) => void;
@@ -2252,6 +2094,7 @@ function ProjectRow({
   onNewSession,
   onToggleExpand,
   onRemoveProject,
+  onEditLaunchConfig,
   onUpdatePresentation,
   onDragPathChange,
   onDropProject,
@@ -2380,6 +2223,18 @@ function ProjectRow({
             />
           </div>
         ) : (
+          <Tooltip
+            content={(
+              <span style={{ display: "grid", gap: 3, maxWidth: 360, whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontFamily: "var(--font-mono)", fontSize: 11 }}>
+                <strong style={{ fontFamily: "inherit", fontSize: 11 }}>{t("sessionSidebar.launchConfigDirectory")}</strong>
+                <span>{project.path}</span>
+                {project.launchConfig?.profile && <span>profile: {project.launchConfig.profile}</span>}
+                {project.launchConfig?.advisor && <span>--advisor</span>}
+                {project.launchConfig?.extraArgs?.map((arg, index) => <span key={`${arg}-${index}`}>{arg}</span>)}
+              </span>
+            )}
+            side="right"
+          >
           <button
             className="sidebar-project-identity"
             onClick={() => onActivate(project.path)}
@@ -2421,6 +2276,7 @@ function ProjectRow({
               {displayLabel}
             </span>
           </button>
+          </Tooltip>
         )}
         {worktreeBranch && worktreeToggleRef && (
           <button
@@ -2516,6 +2372,9 @@ function ProjectRow({
           >
             <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { startAliasEdit(); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
               {project.alias ? t("projects.editAlias") : t("projects.nameAlias")}
+            </button>
+            <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { onEditLaunchConfig(project); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
+              {project.launchConfig ? t("sessionSidebar.editLaunchConfig") : t("sessionSidebar.configureLaunchConfig")}
             </button>
             <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { setActionMenuOpen(false); void onMoveProject(project.path, -1); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
               {t("projects.moveUp")}

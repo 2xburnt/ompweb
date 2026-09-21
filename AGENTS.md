@@ -6,8 +6,8 @@
 npm run dev   # port 30178
 ```
 
-Typecheck: `node_modules/.bin/tsc --noEmit`  
-Lint: `npm run lint`  
+Typecheck: `node_modules/.bin/tsc --noEmit`
+Lint: `npm run lint`
 **Never run `next build` during dev** — pollutes `.next/` and breaks `npm run dev`.
 
 The dev server needs the `omp` binary installed (on `PATH`, or set `OMP_WEB_OMP_BIN`).
@@ -73,7 +73,7 @@ request against the host's own filesystem and every write goes straight back.
 
 **Session browsing** (read-only): bounded parsing of omp session `.jsonl` files
 via `lib/session-reader.ts` over the host filesystem — a directory walk plus
-4 KiB/32 KiB prefix/suffix windows per changed file, no child process.  
+4 KiB/32 KiB prefix/suffix windows per changed file, no child process.
 **Sending a message**: `startRpcSession()` in `lib/rpc-manager.ts` spawns
 `omp --mode rpc-ui` (one process per active session) through
 `lib/omp/rpc-process.ts`.
@@ -81,7 +81,7 @@ via `lib/session-reader.ts` over the host filesystem — a directory walk plus
 Shared foundations in `lib/omp/`:
 
 - `paths.ts` — Node port of omp's directory resolution (`~/.omp/agent`,
-  profiles, XDG, session dir slugs).
+  XDG, session dir slugs).
 - `omp-cli.ts` — locate/probe the installed `omp` binary (`resolveOmpBin`,
   `getOmpVersion`), per host.
 - `rpc-process.ts` — process + NDJSON protocol layer (`RpcProcess`).
@@ -188,6 +188,29 @@ hooks/
 
 ### ToolCall field normalization
 Sessions store toolCall blocks as `{type:"toolCall", id, name, arguments}` but `ToolCallContent` uses `{toolCallId, toolName, input}`. `normalizeToolCalls()` in `lib/normalize.ts` handles this — called in both `session-reader.ts` (file load) and streaming event handling.
+
+### Live tool execution (`tool_execution_start/update/end`)
+omp announces a tool the moment it starts, streams the tool's output while it
+runs, and only commits the `toolResult` message at the end. The UI must not
+wait for that commit:
+- `useAgentSession` keeps a `liveToolResults` map keyed by `toolCallId`
+  (seeded on `tool_execution_start` with `partial: true`, refreshed on
+  `tool_execution_update` — omp sends the FULL accumulated partial result per
+  chunk, latest wins — and released on `_end`/the committed toolResult).
+  Committed results always win over live entries (`ChatWindow` merges them), so
+  a reload never shows a stale snapshot.
+- `ToolCallBlock` renders a `partial` result as **running** (spinner, and
+  "Running tool…" instead of the "(no output)" marker when nothing has been
+  printed yet), and opens the row while it runs when the "Keep tool calls
+  collapsed" setting is off — that is what that setting means. `AppShell` must
+  pass `toolCallsDefaultCollapsed` into `ChatWindow`; without it the setting is
+  inert (the chat then always collapses).
+- `tool_execution_update` is coalesced per tool call at display rate in
+  `lib/message-update-coalescer.ts` (chatty commands emit ~10-100+ frames/s).
+  `message_end` drops the pending `message_update` (the committed message
+  supersedes it) but must NOT drop buffered tool updates.
+- Live entries are cleared on `agent_start`, terminal `agent_end`, prompt
+  send/settlement failure — a tool must never leak into the next run.
 
 ### Event protocol differences vs pi
 omp emits no `prompt_done` / `prompt_error` / `queue_update` /

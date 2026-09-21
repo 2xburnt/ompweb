@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import "../tests/setup-dom.mjs";
+import test, { afterEach } from "node:test";
 import React from "react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react/pure.js";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createJiti } from "jiti";
 
@@ -8,8 +10,117 @@ const jiti = createJiti(import.meta.url, {
   jsx: { runtime: "automatic" },
   tsconfigPaths: true,
 });
-const { MessageView, SafeMarkdownBody, TaskResultPanel } = await jiti.import("./MessageView.tsx");
+const { MessageView, SafeMarkdownBody, TaskResultPanel, isInterruptedMessage } = await jiti.import("./MessageView.tsx");
 const { CodeBlock } = await jiti.import("./MermaidBlock.tsx");
+afterEach(cleanup);
+
+test("sent messages without timestamps or branch metadata still offer copy", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    message: { role: "user", content: "Keep this message copyable." },
+  }));
+  assert.match(html, /<button[^>]*aria-label="Copy message"/);
+});
+
+// Plain Copy needs the browser's layout-aware innerText (not implemented by
+// jsdom). Verify code gutters, math, tables, images and spacing in Chromium;
+// do not substitute textContent and claim equivalent coverage here.
+test("message Markdown copy preserves source, excludes activity, and confirms success in Strict Mode", async (t) => {
+  let clipboard = "";
+  const originalMatchMedia = window.matchMedia;
+  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText: async (text) => { clipboard = text; } },
+  });
+  t.after(() => {
+    delete navigator.clipboard;
+    if (originalMatchMedia) window.matchMedia = originalMatchMedia;
+    else delete window.matchMedia;
+  });
+  const source = "# Heading\n\n**Bold** and [link](https://example.com)\n\n```js\n  code();\n```";
+  const messages = [
+    { role: "user", content: source },
+    { role: "assistant", content: [
+      { type: "text", text: source },
+      { type: "thinking", thinking: "Do not copy thinking" },
+      { type: "toolCall", toolCallId: "copy-tool", toolName: "read", input: { path: "not copied" } },
+      { type: "text", text: "## Conclusion\n\nDone." },
+    ] },
+  ];
+  for (const message of messages) {
+    const view = render(React.createElement(React.StrictMode, null, React.createElement(MessageView, { message })));
+    const button = view.getByRole("button", { name: "Copy as Markdown" });
+    await act(async () => { fireEvent.click(button); });
+    assert.equal(clipboard, message.role === "user" ? source : `${source}\n\n## Conclusion\n\nDone.`);
+    assert.equal(button.textContent, "Copied");
+    view.unmount();
+  }
+});
+
+test("plain Copy keeps full oversized message source instead of the reveal control", async (t) => {
+  let clipboard = "";
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText: async (text) => { clipboard = text; } },
+  });
+  t.after(() => { delete navigator.clipboard; });
+  const source = "# Keep the full raw source\n\n".repeat(5000);
+  for (const message of [
+    { role: "user", content: source },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "Do not copy thinking" },
+      { type: "text", text: source },
+    ] },
+  ]) {
+    const view = render(React.createElement(MessageView, { message }));
+    await act(async () => { fireEvent.click(view.getByRole("button", { name: "Copy message" })); });
+    assert.equal(clipboard, source);
+    view.unmount();
+  }
+});
+
+test("expanded grouped tool inputs follow streaming arguments without toggling output", () => {
+  const code = "print('first')\nprint('complete')";
+  const editInput = { path: "/tmp/example.ts", patch: "-old\n+new", options: { dryRun: false } };
+  const toolResults = new Map([["edit-call", {
+    role: "toolResult", toolCallId: "edit-call", content: [{ type: "text", text: "Edit complete" }],
+  }]]);
+  const props = (input) => ({
+    isStreaming: true,
+    toolCallsDefaultCollapsed: false,
+    toolResults,
+    message: {
+      role: "assistant", model: "test", provider: "test",
+      content: [
+        { type: "toolCall", toolCallId: "eval-call", toolName: "eval", input: { language: "py", code: input } },
+        { type: "toolCall", toolCallId: "edit-call", toolName: "edit", input: editInput },
+      ],
+    },
+  });
+  const { container, rerender } = render(React.createElement(MessageView, props("print('first')")));
+  // Open both tool rows through their disclosure triggers. The collapsible
+  // group header is not a row, so only the group-item triggers are clicked.
+  const rowTriggers = () => [...container.querySelectorAll("button.activity-group-item-trigger")];
+  assert.equal(rowTriggers().length, 2);
+  for (const trigger of rowTriggers()) fireEvent.click(trigger);
+  const toggles = (label) => [...container.querySelectorAll("button.tool-call-input-toggle")]
+    .filter((button) => (button.textContent ?? "").includes(label));
+  const inputPanels = () => [...container.querySelectorAll("div.tool-call-input")];
+  const pres = (panel) => [...panel.querySelectorAll("pre")];
+  assert.equal(toggles("Show full input").length, 2);
+  assert.ok(inputPanels().every((panel) => panel.hidden));
+  for (const toggle of toggles("Show full input")) fireEvent.click(toggle);
+  assert.equal(pres(inputPanels()[0])[1].textContent, "print('first')");
+  assert.equal(pres(inputPanels()[1])[1].textContent, editInput.patch);
+  assert.deepEqual(JSON.parse(pres(inputPanels()[1])[2].textContent ?? ""), editInput.options);
+  rerender(React.createElement(MessageView, props(code)));
+  assert.equal(pres(inputPanels()[0])[1].textContent, code);
+  const output = () => [...container.querySelectorAll('pre[data-tool-output="true"]')].map((node) => node.textContent);
+  assert.deepEqual(output(), ["Edit complete"]);
+  for (const toggle of toggles("Collapse input")) fireEvent.click(toggle);
+  assert.ok(inputPanels().every((panel) => panel.hidden));
+  assert.deepEqual(output(), ["Edit complete"]);
+});
 
 test("large message content avoids the markdown pipeline until requested", () => {
   const largeMessage = "x".repeat(100_001);
@@ -70,6 +181,31 @@ test("expanded tool calls show the compact command header", () => {
   assert.match(html, /aria-expanded="true"/);
   assert.match(html, /tool-call-details/);
   assert.match(html, /\$<\/span><code>read foo\.ts<\/code>/);
+});
+
+test("ask tool previews question prompts instead of object coercion", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    isStreaming: true,
+    toolCallsDefaultCollapsed: true,
+    message: {
+      role: "assistant",
+      content: [{
+        type: "toolCall",
+        toolCallId: "call-ask",
+        toolName: "ask",
+        input: {
+          questions: [
+            { header: "Color", question: "Which color do you prefer?", options: [{ label: "Blue" }], multiSelect: false },
+            { header: "Features", question: "Which features should be enabled?", options: [{ label: "Search" }], multiSelect: true },
+          ],
+        },
+      }],
+    },
+  }));
+
+  assert.match(html, /Color: Which color do you prefer\?/);
+  assert.match(html, /Features: Which features should be enabled\?/);
+  assert.doesNotMatch(html, /\[object Object\]/);
 });
 
 test("expanded read output uses compact terminal text without line gutters", () => {
@@ -159,6 +295,85 @@ test("irc:incoming custom messages title with the sender name", () => {
   assert.doesNotMatch(html, /Incoming IRC message from agent/);
 });
 
+test("hub send renders as an IRC row with the steered message", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    isStreaming: true,
+    toolCallsDefaultCollapsed: false,
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", toolCallId: "call-hub-1", toolName: "hub", input: { op: "send", to: "VisualFix", message: "Please ensure the readout path is fixed.\nThanks." } }],
+    },
+    toolResults: new Map([[
+      "call-hub-1",
+      {
+        role: "toolResult",
+        toolCallId: "call-hub-1",
+        toolName: "hub",
+        content: [{ type: "text", text: "Delivered to 1 peer(s):\n- VisualFix: injected" }],
+        details: { op: "send", to: ["VisualFix"], receipts: [{ to: "VisualFix", outcome: "injected" }] },
+      },
+    ]]),
+  }));
+
+  assert.match(html, /IRC → VisualFix injected/);
+  assert.match(html, /Please ensure the readout path is fixed/);
+  assert.doesNotMatch(html, /Delivered to 1 peer/);
+});
+
+test("hub jobs renders the waiting roster instead of raw markdown", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    isStreaming: true,
+    toolCallsDefaultCollapsed: false,
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", toolCallId: "call-hub-2", toolName: "hub", input: { op: "jobs" } }],
+    },
+    toolResults: new Map([[
+      "call-hub-2",
+      {
+        role: "toolResult",
+        toolCallId: "call-hub-2",
+        toolName: "hub",
+        content: [{ type: "text", text: "## Still Running (2)\n\n- `VisualFix` [task]" }],
+        details: {
+          op: "jobs",
+          jobs: [
+            { id: "VisualFix", type: "task", status: "running", label: "VisualFix", durationMs: 1890000 },
+            { id: "VisualTrace", type: "task", status: "running", label: "VisualTrace", durationMs: 1890000 },
+          ],
+        },
+      },
+    ]]),
+  }));
+
+  assert.match(html, /waiting on 2 jobs/);
+  assert.match(html, /VisualTrace/);
+  assert.match(html, /31m30s/);
+  assert.doesNotMatch(html, /Still Running/);
+});
+
+test("hub jobs without structured details keeps the raw result", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    isStreaming: true,
+    toolCallsDefaultCollapsed: false,
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", toolCallId: "call-hub-3", toolName: "hub", input: { op: "jobs" } }],
+    },
+    toolResults: new Map([[
+      "call-hub-3",
+      {
+        role: "toolResult",
+        toolCallId: "call-hub-3",
+        toolName: "hub",
+        content: [{ type: "text", text: "## Still Running (1)" }],
+      },
+    ]]),
+  }));
+
+  assert.match(html, /Still Running/);
+});
+
 test("advisor custom messages use the localized advisor label", () => {
   const html = renderToStaticMarkup(React.createElement(MessageView, {
     message: { role: "custom", customType: "advisor", content: "Consider handling the edge case.", display: true },
@@ -168,6 +383,77 @@ test("advisor custom messages use the localized advisor label", () => {
   assert.doesNotMatch(html, /customType/);
 });
 
+
+test("a running tool call shows a spinner instead of the no-result marker", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", toolCallId: "call-1", toolName: "bash", input: { command: "long-job" } }],
+    },
+    toolResults: new Map([[
+      "call-1",
+      { role: "toolResult", toolCallId: "call-1", toolName: "bash", content: [], partial: true },
+    ]]),
+  }));
+
+  assert.match(html, /activity-row-spinner/);
+  assert.doesNotMatch(html, /lucide-check/);
+  assert.doesNotMatch(html, /lucide-circle-slash/);
+});
+
+test("a running tool with no output yet says so instead of reporting no output", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    toolCallsDefaultCollapsed: false,
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", toolCallId: "call-1", toolName: "bash", input: { command: "long-job" } }],
+    },
+    toolResults: new Map([[
+      "call-1",
+      { role: "toolResult", toolCallId: "call-1", toolName: "bash", content: [], partial: true },
+    ]]),
+  }));
+
+  assert.match(html, /data-tool-running="true"/);
+  assert.doesNotMatch(html, /No output/);
+});
+
+test("a running tool streams its output before the result is committed", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    toolCallsDefaultCollapsed: false,
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", toolCallId: "call-1", toolName: "bash", input: { command: "long-job" } }],
+    },
+    toolResults: new Map([[
+      "call-1",
+      { role: "toolResult", toolCallId: "call-1", toolName: "bash", content: [{ type: "text", text: "line-1\nline-2" }], partial: true },
+    ]]),
+  }));
+
+  assert.match(html, /data-tool-output="true"/);
+  assert.match(html, /line-1/);
+  assert.match(html, /line-2/);
+  assert.doesNotMatch(html, /data-tool-running="true"/);
+});
+
+test("a committed tool result replaces the running affordances", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    toolCallsDefaultCollapsed: false,
+    message: {
+      role: "assistant",
+      content: [{ type: "toolCall", toolCallId: "call-1", toolName: "bash", input: { command: "long-job" } }],
+    },
+    toolResults: new Map([[
+      "call-1",
+      { role: "toolResult", toolCallId: "call-1", toolName: "bash", content: [{ type: "text", text: "done" }], timestamp: 3000 },
+    ]]),
+  }));
+
+  assert.doesNotMatch(html, /activity-row-spinner/);
+  assert.doesNotMatch(html, /data-tool-running="true"/);
+  assert.match(html, /lucide-check/);
+});
 
 test("expanded edit results with a patch render the split diff view", () => {
   const html = renderToStaticMarkup(React.createElement(MessageView, {
@@ -195,4 +481,189 @@ test("expanded edit results with a patch render the split diff view", () => {
   assert.match(html, /added const here = 2;/);
   assert.match(html, /dropped const gone = 1;/);
   assert.doesNotMatch(html, /<pre/);
+});
+
+test("consecutive tool calls group into an activity group summary", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    isStreaming: true,
+    toolCallsDefaultCollapsed: true,
+    message: {
+      role: "assistant",
+      content: [
+        { type: "toolCall", toolCallId: "call-1", toolName: "read", input: { path: "a.ts" } },
+        { type: "toolCall", toolCallId: "call-2", toolName: "read", input: { path: "b.ts" } },
+        { type: "toolCall", toolCallId: "call-3", toolName: "grep", input: { pattern: "test" } },
+      ],
+    },
+  }));
+
+  assert.match(html, /activity-group/);
+  assert.match(html, /Read 2 files and searched 1 time/);
+});
+
+test("bash (local) rows count as terminal commands in group summaries", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    isStreaming: true,
+    toolCallsDefaultCollapsed: true,
+    message: {
+      role: "assistant",
+      content: [
+        { type: "toolCall", toolCallId: "call-1", toolName: "bash", input: { command: "go vet ./..." } },
+        { type: "toolCall", toolCallId: "call-2", toolName: "bash (local)", input: { command: "go test ./..." } },
+      ],
+    },
+  }));
+
+  assert.match(html, /Ran 2 commands/);
+});
+
+test("todo tool calls render clean status badge with action and task name", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    isStreaming: true,
+    toolCallsDefaultCollapsed: false,
+    message: {
+      role: "assistant",
+      content: [
+        { type: "toolCall", toolCallId: "call-1", toolName: "todo", input: { op: "done", task: "Build redesigned component" } },
+      ],
+    },
+  }));
+
+  assert.match(html, /tool-call-todo-badge/);
+  assert.match(html, /Completed/);
+  assert.match(html, /Build redesigned component/);
+});
+
+test("isInterruptedMessage identifies user interruptions accurately", () => {
+  assert.equal(isInterruptedMessage("Interrupted by user"), true);
+  assert.equal(isInterruptedMessage("interrupted by user"), true);
+  assert.equal(isInterruptedMessage("Interrupted"), true);
+  assert.equal(isInterruptedMessage("Request aborted"), true);
+  assert.equal(isInterruptedMessage("Aborted"), true);
+  assert.equal(isInterruptedMessage(null, "aborted"), true);
+  assert.equal(isInterruptedMessage("Generation stopped by user"), true);
+  assert.equal(isInterruptedMessage("429 Too Many Requests"), false);
+  assert.equal(isInterruptedMessage("Provider connection failed"), false);
+  assert.equal(isInterruptedMessage(null), false);
+});
+
+test("interrupted assistant message renders user-friendly status badge without responseError prefix", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    toolCallsDefaultCollapsed: false,
+    message: {
+      role: "assistant",
+      errorMessage: "Interrupted by user",
+      content: [],
+    },
+  }));
+
+  assert.match(html, /role="status"/);
+  assert.match(html, /Generation stopped by user/);
+  assert.doesNotMatch(html, /messageView\.responseError/);
+  assert.doesNotMatch(html, /Response error/);
+  assert.doesNotMatch(html, /role="alert"/);
+});
+
+test("actual error assistant message renders alert badge without responseError prefix", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    toolCallsDefaultCollapsed: false,
+    message: {
+      role: "assistant",
+      errorMessage: "429 Too Many Requests: Rate limit exceeded",
+      content: [],
+    },
+  }));
+
+  assert.match(html, /role="alert"/);
+  assert.match(html, /429 Too Many Requests: Rate limit exceeded/);
+  assert.doesNotMatch(html, /messageView\.responseError/);
+  assert.doesNotMatch(html, /Response error:/);
+});
+
+test("interrupted message with partial content renders content before interrupted badge", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    toolCallsDefaultCollapsed: false,
+    message: {
+      role: "assistant",
+      errorMessage: "Interrupted by user",
+      content: [
+        { type: "text", text: "Partial generated response text" },
+      ],
+    },
+  }));
+
+  const contentIdx = html.indexOf("Partial generated response text");
+  const statusIdx = html.indexOf("Generation stopped by user");
+  assert.ok(contentIdx !== -1, "partial content must be rendered");
+  assert.ok(statusIdx !== -1, "status badge must be rendered");
+  assert.ok(contentIdx < statusIdx, "content must precede the interrupted status badge");
+});
+
+const FORK_LABEL = "Fork a new session from this point";
+
+test("agent replies offer copy and fork, forking at the turn's user message", async (t) => {
+  const originalMatchMedia = window.matchMedia;
+  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+  t.after(() => {
+    if (originalMatchMedia) window.matchMedia = originalMatchMedia;
+    else delete window.matchMedia;
+  });
+  const forked = [];
+  const view = render(React.createElement(MessageView, {
+    message: { role: "assistant", model: "test", provider: "test", content: [{ type: "text", text: "Done." }] },
+    entryId: "assistant-1",
+    // Resolved by resolveForkEntryIds: omp's `branch` accepts a user entry only.
+    forkEntryId: "user-1",
+    onFork: (entryId) => forked.push(entryId),
+  }));
+  assert.ok(view.getByRole("button", { name: "Copy message" }));
+  await act(async () => { fireEvent.click(view.getByRole("button", { name: FORK_LABEL })); });
+  assert.deepEqual(forked, ["user-1"]);
+  view.unmount();
+});
+
+test("agent replies without text still offer the new-session action", () => {
+  const html = renderToStaticMarkup(React.createElement(MessageView, {
+    message: {
+      role: "assistant", model: "test", provider: "test",
+      content: [{ type: "toolCall", toolCallId: "tool-1", toolName: "read", input: { path: "a.ts" } }],
+    },
+    entryId: "assistant-2",
+    forkEntryId: "user-1",
+    onFork: () => {},
+  }));
+  assert.doesNotMatch(html, /aria-label="Copy message"/);
+  assert.match(html, new RegExp(`aria-label="${FORK_LABEL}"`));
+});
+
+test("a streaming reply and an unforkable row keep no fork action", () => {
+  const reply = { role: "assistant", model: "test", provider: "test", content: [{ type: "text", text: "Streaming" }] };
+  const streaming = renderToStaticMarkup(React.createElement(MessageView, {
+    message: reply, entryId: "assistant-3", forkEntryId: "user-1", onFork: () => {}, isStreaming: true,
+  }));
+  assert.doesNotMatch(streaming, new RegExp(`aria-label="${FORK_LABEL}"`));
+
+  const noTarget = renderToStaticMarkup(React.createElement(MessageView, {
+    message: reply, entryId: "assistant-4", onFork: () => {},
+  }));
+  assert.doesNotMatch(noTarget, new RegExp(`aria-label="${FORK_LABEL}"`));
+});
+
+test("user messages still fork at their own entry", async (t) => {
+  const originalMatchMedia = window.matchMedia;
+  window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+  t.after(() => {
+    if (originalMatchMedia) window.matchMedia = originalMatchMedia;
+    else delete window.matchMedia;
+  });
+  const forked = [];
+  const view = render(React.createElement(MessageView, {
+    message: { role: "user", content: "Keep this forkable." },
+    entryId: "user-7",
+    forkEntryId: "user-7",
+    onFork: (entryId) => forked.push(entryId),
+  }));
+  await act(async () => { fireEvent.click(view.getByRole("button", { name: FORK_LABEL })); });
+  assert.deepEqual(forked, ["user-7"]);
+  view.unmount();
 });

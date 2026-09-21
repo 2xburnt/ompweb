@@ -4,7 +4,6 @@ import { createReadStream, mkdirSync } from "fs";
 import * as fsp from "fs/promises";
 import { homedir as osHomedir, tmpdir as osTmpdir } from "os";
 import path from "path";
-import { createInterface } from "readline";
 import { sanitizeProjectCommandEnvironment } from "../project-command-env";
 import { getOmpWebHome } from "./config";
 import { shellJoin, shellQuote } from "./shell";
@@ -147,8 +146,8 @@ export interface HostFs {
   readHead(filePath: string, bytes: number): Promise<Buffer>;
   /** Prefix + suffix windows of many files in one round trip. Missing files are absent from the result. */
   readSlices(paths: readonly string[], prefixBytes: number, suffixBytes: number): Promise<Map<string, FileSlices>>;
-  /** Stream a file line by line without materializing it. */
-  forEachLine(filePath: string, onLine: (line: string) => void): Promise<void>;
+  /** Stream physical lines with exact byte offsets; LF is excluded from length. */
+  forEachLine(filePath: string, onLine: (line: string, offset: number, length: number) => void): Promise<void>;
   /** Atomic replace (temp file + rename in the target directory). */
   writeFile(filePath: string, data: string | Buffer, options?: { mode?: number }): Promise<void>;
   /** Overwrite bytes at an offset without truncating. */
@@ -191,6 +190,42 @@ export interface HostExecutor {
 const DEFAULT_MAX_BUFFER = 64 * 1024 * 1024;
 const STDERR_CAP = 64 * 1024;
 const SESSION_READ_CHUNK_BYTES = 1024 * 1024;
+
+async function forEachStreamLine(
+  input: AsyncIterable<Buffer | string>,
+  onLine: (line: string, offset: number, length: number) => void,
+): Promise<void> {
+  let fragments: Buffer[] = [];
+  let length = 0;
+  let offset = 0;
+  for await (const value of input) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    let start = 0;
+    while (start < chunk.length) {
+      const newline = chunk.indexOf(10, start);
+      const end = newline === -1 ? chunk.length : newline;
+      if (end > start) {
+        fragments.push(chunk.subarray(start, end));
+        length += end - start;
+      }
+      if (newline === -1) break;
+      const line = fragments.length === 1
+        ? fragments[0].toString("utf8")
+        : Buffer.concat(fragments, length).toString("utf8");
+      onLine(line, offset, length);
+      fragments = [];
+      offset += length + 1;
+      length = 0;
+      start = newline + 1;
+    }
+  }
+  if (length > 0) {
+    const line = fragments.length === 1
+      ? fragments[0].toString("utf8")
+      : Buffer.concat(fragments, length).toString("utf8");
+    onLine(line, offset, length);
+  }
+}
 
 // ============================================================================
 // Shared process runner
@@ -462,13 +497,11 @@ class LocalFs implements HostFs {
     return result;
   }
 
-  async forEachLine(filePath: string, onLine: (line: string) => void): Promise<void> {
+  async forEachLine(filePath: string, onLine: (line: string, offset: number, length: number) => void): Promise<void> {
     const stream = createReadStream(filePath, { highWaterMark: SESSION_READ_CHUNK_BYTES });
-    const rl = createInterface({ input: stream, crlfDelay: Infinity });
     try {
-      for await (const line of rl) onLine(line);
+      await forEachStreamLine(stream, onLine);
     } finally {
-      rl.close();
       stream.destroy();
     }
   }
@@ -846,20 +879,22 @@ export class SshFs implements HostFs {
     return result;
   }
 
-  async forEachLine(filePath: string, onLine: (line: string) => void): Promise<void> {
+  async forEachLine(filePath: string, onLine: (line: string, offset: number, length: number) => void): Promise<void> {
     const child = this.executor.spawn(["cat", "--", filePath]);
     let stderr = "";
     child.stderr.on("data", (chunk: Buffer) => {
       if (stderr.length < STDERR_CAP) stderr += chunk.toString("utf8");
     });
     const exit = new Promise<number | null>((resolve) => child.once("close", (code) => resolve(code)));
-    const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
+    let parseError: unknown;
     try {
-      for await (const line of rl) onLine(line);
-    } finally {
-      rl.close();
+      await forEachStreamLine(child.stdout, onLine);
+    } catch (error) {
+      parseError = error;
+      child.kill("SIGTERM");
     }
     const code = await exit;
+    if (parseError) throw parseError;
     if (code !== 0) {
       throw toFsError(new ExecError(["cat", filePath], { stdout: Buffer.alloc(0), stderr, code, signal: null }), filePath);
     }
