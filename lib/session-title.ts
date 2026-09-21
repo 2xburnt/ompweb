@@ -1,8 +1,9 @@
 /**
- * Session title derivation. omp auto-generates titles itself (persisted in the
- * fixed-width title slot), so unlike pi-web there is no in-process LLM title
- * run here — the auto-name endpoint returns the stored/live title when one
- * exists and otherwise derives a fallback from the first user message.
+ * Session title sanitizing and the first-message fallback title.
+ *
+ * The actual model-written title comes from `lib/omp/title-generate.ts`
+ * (a headless `omp --print` run); these helpers clean its output and provide
+ * the fallback used when that run yields nothing usable.
  */
 
 const MAX_DERIVED_TITLE_LENGTH = 60;
