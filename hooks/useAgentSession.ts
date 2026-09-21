@@ -1028,6 +1028,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     try {
       if (showLoading) setLoading(true);
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
+      // Fold the live-state fetch into the transcript request: the GET route
+      // runs get_state server-side in the same round trip, so a switch to a
+      // running session connects its event stream one hop sooner instead of
+      // waiting for a second /state request to compile/resolve.
+      if (includeState) params.set("includeState", "1");
       const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`);
       if (res.status === 404) {
         if (showLoading) {
@@ -1039,7 +1044,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         return null;
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as SessionData;
+      const d = await res.json() as SessionData & { agent?: { running: boolean; state?: AgentStateResponse } };
       if (sessionIdRef.current !== sid) return null;
       // A terminal reload for a finished run must not overwrite the messages
       // of a run that started while this fetch was in flight (it would delete
@@ -1071,13 +1076,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (isInitialHydration) initialHydrationPendingRef.current = true;
 
       try {
-        // Capture the sequence token BEFORE the fetch: a response snapshotted
-        // earlier must not mint a fresh token on arrival and clobber a newer
-        // sync that started while this request was in flight.
+        // State was folded into the transcript response (?includeState=1). If
+        // the RPC get_state failed server-side the field is omitted; fall back
+        // to a standalone /state fetch so a busy child still eventually syncs.
         const token = beginAuthoritativeModelSync();
-        const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
-        if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
-        const agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
+        let agentState = d.agent;
+        if (!agentState) {
+          const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
+          if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
+          agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
+        }
         if (sessionIdRef.current !== sid) {
           if (showLoading) setLoading(false);
           return null;
