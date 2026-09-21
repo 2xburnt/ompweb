@@ -71,6 +71,18 @@ function readPersisted(): PersistedState {
   }
 }
 
+/**
+ * The cwd stored with a tab is only a valid place to open a *new* shell when
+ * the tab is on the current workspace's machine; on any other machine (or after
+ * the workspace has moved on) that path need not exist, and the shell's `cd`
+ * would fail. Tabs already attached to a live shell keep their cwd verbatim —
+ * it is only a title for a directory the shell is demonstrably already in.
+ */
+function pendingTabCwd(tab: TerminalTab, workspaceHostId: string | null, workspaceCwd: string | null): string | null {
+  if (tab.sessionId) return tab.cwd;
+  return tab.hostId === workspaceHostId ? workspaceCwd : null;
+}
+
 export function TerminalTabs({
   hostId,
   cwd,
@@ -89,7 +101,9 @@ export function TerminalTabs({
   // take their full timeout to fail — and waiting on it left the pane reading
   // "no terminals open" for several seconds every time the page loaded.
   const [initial] = useState(readPersisted);
-  const [tabs, setTabs] = useState<TerminalTab[]>(initial.tabs);
+  const [tabs, setTabs] = useState<TerminalTab[]>(() =>
+    initial.tabs.map((tab) => ({ ...tab, cwd: pendingTabCwd(tab, hostId, cwd ?? null) })),
+  );
   const [activeKey, setActiveKey] = useState<string | null>(initial.activeKey);
   const [picking, setPicking] = useState(false);
   const pickerRef = useRef<HTMLDivElement | null>(null);
@@ -147,7 +161,7 @@ export function TerminalTabs({
         // A session the server no longer has is not worth reattaching to; the
         // tab stays and opens a new shell when it is next shown.
         tab.sessionId && knowable.has(tab.sessionId) && !liveIds.has(tab.sessionId)
-          ? { ...tab, sessionId: null }
+          ? { ...tab, sessionId: null, cwd: pendingTabCwd({ ...tab, sessionId: null }, hostId, cwd ?? null) }
           : tab
       ));
 
