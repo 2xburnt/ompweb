@@ -839,6 +839,7 @@
   "projects.emptyProject": "此项目中暂无会话",
   "projects.expandProject": "展开 {name}",
   "projects.expandProjectTitle": "展开项目 {path}",
+  "projects.newSessionHere": "在 {name} 新建会话",
   "projects.heading": "工作区",
   "projects.loadFailed": "加载项目失败：{detail}",
   "projects.aliasPrompt": "工作区显示名称",

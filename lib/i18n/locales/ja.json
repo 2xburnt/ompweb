@@ -839,6 +839,7 @@
   "projects.emptyProject": "このプロジェクトにはセッションがありません",
   "projects.expandProject": "{name} を展開",
   "projects.expandProjectTitle": "プロジェクト {path} を展開",
+  "projects.newSessionHere": "{name} で新しいセッション",
   "projects.heading": "ワークスペース",
   "projects.loadFailed": "プロジェクトの読み込みに失敗しました: {detail}",
   "projects.aliasPrompt": "ワークスペースの表示名",

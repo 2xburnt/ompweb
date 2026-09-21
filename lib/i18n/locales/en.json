@@ -839,6 +839,7 @@
   "projects.emptyProject": "No sessions in this project",
   "projects.expandProject": "Expand {name}",
   "projects.expandProjectTitle": "Expand project {path}",
+  "projects.newSessionHere": "New session in {name}",
   "projects.heading": "Workspaces",
   "projects.loadFailed": "Failed to load projects: {detail}",
   "projects.aliasPrompt": "Workspace display name",
