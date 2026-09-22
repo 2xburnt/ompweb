@@ -27,7 +27,7 @@ import { comparableProjectPath } from "@/lib/comparable-path";
 import { Archive, Check, ChevronDown, ChevronRight, FileUp, Folder, GitBranch, GripVertical, MoreHorizontal, Plus, RefreshCw, Search, Server, Settings2, SlidersHorizontal, Trash2 } from "lucide-react";
 import { publishSessionsChanged } from "@/lib/session-change-bus";
 import { hostFetch, useHosts, worthAsking } from "@/lib/hosts/client";
-import { groupSessionsByMachine, projectActivityByKey, projectExpansionKey, sessionHostId, sessionProjectPath, type MachineGroup } from "./machine-groups";
+import { collapsedActivity, groupSessionsByMachine, machineActivityByHost, projectActivityByKey, projectExpansionKey, sessionHostId, sessionProjectPath, type MachineGroup } from "./machine-groups";
 
 const SESSIONS_FETCH_TIMEOUT_MS = 15_000;
 
@@ -1164,6 +1164,10 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     () => projectActivityByKey(machineGroups, runningSessionIds, unreadSessionIds),
     [machineGroups, runningSessionIds, unreadSessionIds],
   );
+  const machineActivity = useMemo(
+    () => machineActivityByHost(machineGroups, projectActivity),
+    [machineGroups, projectActivity],
+  );
 
   // Client-side filtering (Workspaces header: search + "running only").
   // While a filter is active, workspaces with no matching sessions are hidden
@@ -1942,6 +1946,8 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             // collapsed, and `toggledHosts` records any flip from that default.
             const defaultExpanded = isCurrentMachine;
             const isExpanded = hostFilterActive || (toggledHosts.has(group.hostId) ? !defaultExpanded : defaultExpanded);
+            const activity = collapsedActivity(isExpanded, machineActivity.get(group.hostId));
+            const hasHiddenActivity = Boolean(activity);
             return (
               <div key={group.hostId} className="sidebar-machine" data-current={isCurrentMachine ? "true" : "false"}>
                 {multiHost && (
@@ -1971,7 +1977,21 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                   <Server size={14} />
                   <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {machineName}
-                  </span></button>
+                  </span>
+                  {hasHiddenActivity && (
+                    <span
+                      aria-label={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0 })}
+                      title={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0 })}
+                      className="sidebar-project-activity"
+                      data-running={(activity?.running ?? 0) > 0 ? "true" : "false"}
+                      role="status"
+                      aria-live="polite"
+                      style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 11, height: 11, marginLeft: "auto", flexShrink: 0, lineHeight: 0 }}
+                    >
+                      <span aria-hidden="true" className="sidebar-project-activity-dot" style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--accent)" }} />
+                    </span>
+                  )}
+                  </button>
                 )}
                 {isExpanded && (
                   <div style={multiHost ? { paddingLeft: 16 } : undefined}>
@@ -2223,7 +2243,6 @@ function ProjectRow({
   }, [aliasValue, project.alias, project.path, onUpdatePresentation]);
   const label = project.alias ?? projectLabel(project.path);
   const displayLabel = machineLabel ? `${machineLabel}:${label}` : label;
-  const hasActivity = Boolean(activity && (activity.running > 0 || activity.unread > 0));
   const visibleRoots = hiddenCount > 0 && !showAllSessions
     ? tree.slice(0, MAX_PROJECT_SESSIONS)
     : tree;
@@ -2431,7 +2450,7 @@ function ProjectRow({
         >
           <Plus size={14} strokeWidth={2} aria-hidden="true" />
         </button>
-        {hasActivity && (
+        {collapsedActivity(isExpanded, activity) && (
           <span
             aria-label={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0 })}
             title={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0 })}

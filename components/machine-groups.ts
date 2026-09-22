@@ -164,3 +164,34 @@ export function projectActivityByKey(
   }
   return result;
 }
+export interface SidebarActivity {
+  running: number;
+  unread: number;
+}
+
+/** Aggregate project activity to each machine. Machines without activity are omitted. */
+export function machineActivityByHost(
+  groups: readonly MachineGroup[],
+  projectActivity: ReadonlyMap<string, SidebarActivity>,
+): Map<string, SidebarActivity> {
+  const result = new Map<string, SidebarActivity>();
+  for (const group of groups) {
+    let running = 0;
+    let unread = 0;
+    for (const bucket of group.projects) {
+      const activity = projectActivity.get(bucket.key);
+      running += activity?.running ?? 0;
+      unread += activity?.unread ?? 0;
+    }
+    if (running > 0 || unread > 0) result.set(group.hostId, { running, unread });
+  }
+  return result;
+}
+
+/** Parent rows represent activity only while their child rows are hidden. */
+export function collapsedActivity(
+  isExpanded: boolean,
+  activity: SidebarActivity | undefined,
+): SidebarActivity | undefined {
+  return isExpanded ? undefined : activity;
+}
