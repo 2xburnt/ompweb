@@ -361,44 +361,53 @@ handled or safely ignored.
 - `POST /api/omp-update` (`action: "restart"`) restarts active OMP sessions after a manual CLI update.
 - Notifications in `AppShell` and settings cards in `SettingsConfig` present the update notification alongside copyable terminal update commands.
 
-### In-app self-update (`lib/self-update.ts`, `bin/omp-web-update-worker.js`)
-- `POST /api/app-update` drives one attempt: `prepare` (lease + status + a copy
-  of the worker in a 0700 temp root), `commit` (arms the launcher and spawns the
-  worker; `applyMode: "auto"` skips the confirmation), `apply`, `cancel`,
-  `status`, `acknowledge`. The worker reports progress through `status.json`;
-  the browser polls `GET /api/app-update`.
-- Stages are `preparing → building → ready → stopping → installing → restarting
-  → finalizing`. **Only `stopping` onwards is downtime.** `building` and `ready`
-  exist for git checkouts, where the new build is produced with the current
-  server still serving, and the restart waits for the browser to confirm it
-  (30 minutes, then the staged build is discarded). A package install (`npm` /
-  `bun`) replaces the directory the server runs from and cannot be staged, so it
-  keeps the old stop-then-install order and skips both stages —
-  `getAppUpdateSteps()` hides them.
-- The git build happens in a **detached worktree** (`~/.cache/ompweb/build-<checkout>`,
-  or a sibling of the checkout when the cache dir is on another filesystem —
-  `rename()` must not cross devices). `node_modules` is symlinked to the live
-  checkout unless the update changes `package.json`/`package-lock.json`, in
-  which case the staging tree runs its own `npm ci` and the two directories are
-  swapped during the restart. Nothing skips `npm ci` that needs it, and nothing
-  runs it when it is not needed — that is where the old flow lost minutes.
-- Applying is a fast-forward plus renames: `git merge --ff-only <target>`, then
-  `.next` and (if installed) `node_modules` are renamed into place; the previous
-  ones are deleted only after the server answers again. The fast-forward is
-  verified with `merge-base --is-ancestor` **before** the build, so it can never
-  be the step that fails with the service already down.
-- The staging tree is removed after every update, so no build tree of ours
-  stays registered in the repository. `OMP_WEB_UPDATE_KEEP_BUILD_TREE=1` keeps
-  it instead: `.next/cache` then survives (moved aside before the swap) and the
-  next build is incremental, at the cost of a lingering worktree.
-- A failure or a cancel before `stopping` leaves the checkout, `node_modules`
-  and the running build untouched — cancellation reports `state: "cancelled"`,
-  not `"failed"`, so saying "not yet" never looks like a broken update.
+### Deployment and in-app self-update
+- **The service never runs from a git checkout.** It runs an exported release
+  under the release root (`OMP_WEB_RELEASE_ROOT`, else
+  `$XDG_DATA_HOME/ompweb`): `releases/<sha>/` holds a tree exported from one
+  commit plus its `node_modules` and `.next`, `current` is the symlink
+  `ExecStart` resolves, and `previous` is the one flip back.
+- `bin/omp-web-release.js` is the release store and the **only** implementation
+  of a deploy: export, install/link dependencies, build, activate, prune,
+  roll back. `bin/omp-web-deploy.js` (`ompweb-deploy`) and the in-app update
+  worker both call into it, so the command line and the update button cannot
+  drift apart.
+- **Nothing writes to the repository.** A commit is read with `git archive`
+  into its own release directory — no worktree is registered, no ref moves, no
+  checkout is touched. That is what keeps the deployment out of the rules that
+  govern checkouts; do not reintroduce `git worktree add` or a fast-forward
+  into a served tree.
+- `POST /api/app-update` drives one attempt: `prepare` (lease, status, a copy
+  of the worker **and the release store** in a 0700 temp root), `commit`
+  (arms the launcher and spawns the worker; `applyMode: "auto"` skips the
+  confirmation), `apply`, `cancel`, `status`, `acknowledge`.
+- Stages are `preparing → building → ready → stopping → installing →
+  restarting → finalizing`. **Only `stopping` onwards is downtime**, and for a
+  release that window is two symlink renames plus the service restart. A staged
+  release waits for the browser to confirm (30 minutes, then it is discarded)
+  unless the update asked to apply automatically. A package install
+  (`npm`/`bun`) replaces the directory the server runs from and cannot be
+  staged, so it keeps the old stop-then-install order and
+  `getAppUpdateSteps()` hides both stages.
+- `npm ci` runs only when `package.json`/`package-lock.json` differ between the
+  deployed commit and the target; otherwise the previous release's
+  `node_modules` is hard-linked (`cp -al`, byte copy as a fallback). It is
+  never written to after a release is built, which is what makes that safe.
+- A cancelled or failed update deletes the release it was building and leaves
+  `current` alone — cancellation reports `state: "cancelled"`, not `"failed"`.
+  There is no "the checkout moved" failure mode any more: nothing outside the
+  release root participates.
+- Rollback is `ompweb-deploy --rollback`: a symlink flip and a restart, with no
+  build and no git operation. `pruneReleases()` always retains whatever
+  `current` and `previous` point at, on top of the newest `keep`.
+- Running from a git checkout is a **development** shape: `getSelfUpdateSupport()`
+  reports self-update unsupported there and points at `ompweb-deploy`.
 - Under systemd the worker runs in its own transient unit (it stops the service
   that spawned it) and needs the unit name: `OMP_WEB_SERVICE` when the unit file
   sets it, otherwise derived from the process's own cgroup
-  (`parseServiceUnitFromCgroup`). Without either, self-update reports itself
-  unsupported rather than guessing.
+  (`parseServiceUnitFromCgroup`). `ompweb-systemd` writes `ExecStart` to
+  `<release root>/current/bin/omp-web.js` when a release exists, so reinstalling
+  from the wrong directory can no longer repoint the service.
 - The worker renews the lease while it builds; `LEASE_MS` is 30 minutes and a
   build plus a confirmation wait can outlast it, which would otherwise let a
   second attempt start.

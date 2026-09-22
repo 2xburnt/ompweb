@@ -20,6 +20,9 @@ import { checkNpmUpdate, detectInstallMethod, getPackageDir, type InstallMethod 
 import { checkOmpUpdate } from "./omp/updates";
 
 const LEASE_MS = 30 * 60 * 1000;
+/** The worker runs from a copy outside the package dir; the release store it
+ * shares with `ompweb-deploy` travels with it. */
+const WORKER_SUPPORT_FILE = "omp-web-release.js";
 const TERMINAL_STATUS_TTL_MS = 24 * 60 * 60 * 1000;
 
 export type SelfUpdateState = "prepared" | "running" | "succeeded" | "failed" | "cancelled";
@@ -49,6 +52,11 @@ export interface SelfUpdateStatus {
 interface StoredStatus extends SelfUpdateStatus {
   workerPid?: number;
   managerPid?: number;
+  /** Release installs resolve the commit to deploy at prepare time. */
+  targetCommit?: string;
+  sourceRepo?: string;
+  remote?: string;
+  branch?: string;
 }
 export interface PrepareResult {
   attemptId: string;
@@ -224,11 +232,14 @@ function removeAttemptDirectory(attemptId: string, kind: Kind): boolean {
     if (isMissing(error)) return true;
     throw error;
   }
+  const allowed = ["worker.js", WORKER_SUPPORT_FILE];
   const entries = readdirSync(dir);
-  if (entries.some((e) => e !== "worker.js")) {
+  if (entries.some((e) => !allowed.includes(e))) {
     throw new SelfUpdateError("unsafe_update_state", "The temporary update attempt contains unexpected files", 500);
   }
-  if (entries.includes("worker.js") && !removeSecureFile(join(dir, "worker.js"))) return false;
+  for (const name of allowed) {
+    if (entries.includes(name) && !removeSecureFile(join(dir, name))) return false;
+  }
   return removeSecureEmptyDirectory(dir);
 }
 function removeAttemptArtifacts(attemptId: string, kind: Kind, includeCompletionAck = true): boolean {
@@ -363,6 +374,30 @@ export function getSelfUpdateSupport(): { supported: boolean; reason?: string; p
   const supervision = detectSupervisor();
   try {
     if (!existsSync(packageDir)) return { supported: false, reason: "package dir not found", packageDir, installMethod, supervisor: supervision.supervisor };
+    // A checkout is a development tree: it serves what is in it, so there is
+    // nothing to swap in. Deployments run an exported release instead.
+    if (installMethod === "git") {
+      return {
+        supported: false,
+        reason: "ompweb is running from a git checkout; deploy a release with ompweb-deploy instead",
+        packageDir,
+        installMethod,
+        supervisor: supervision.supervisor,
+      };
+    }
+    // Activating a release repoints the `current` symlink, so whatever starts
+    // the server again has to resolve it. systemd does, because ExecStart is
+    // that path; a launcher or tray that re-executes its own directory would
+    // come back on the release it was already running.
+    if (installMethod === "release" && supervision.supervisor !== "systemd") {
+      return {
+        supported: false,
+        reason: "releases are updated by a supervisor that restarts from the current symlink; run ompweb-deploy instead",
+        packageDir,
+        installMethod,
+        supervisor: supervision.supervisor,
+      };
+    }
     if (supervision.supervisor === "systemd") {
       if (!supervision.serviceUnit) return { supported: false, reason: supervision.reason, packageDir, installMethod, supervisor: "systemd" };
       if (!findOnPath("systemd-run") || !findOnPath("systemctl")) {
@@ -406,6 +441,7 @@ export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResu
   }
   let currentVersion: string;
   let targetVersion: string;
+  let release: { targetCommit: string; sourceRepo: string; remote: string; branch: string } | undefined;
   if (kind === "omp") {
     const ompStatus = await checkOmpUpdate(true);
     if (!ompStatus.updateAvailable || !ompStatus.availableVersion) {
@@ -420,6 +456,17 @@ export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResu
     }
     currentVersion = npmStatus.currentVersion;
     targetVersion = npmStatus.availableVersion;
+    if (npmStatus.installMethod === "release") {
+      if (!npmStatus.availableCommit || !npmStatus.sourceRepo) {
+        throw new SelfUpdateError("no_update_available", "The release has no source commit to deploy", 409);
+      }
+      release = {
+        targetCommit: npmStatus.availableCommit,
+        sourceRepo: npmStatus.sourceRepo,
+        remote: npmStatus.remote ?? "origin",
+        branch: npmStatus.branch ?? "main",
+      };
+    }
   }
   const attemptId = randomUUID();
   const preparedAt = new Date().toISOString();
@@ -433,6 +480,7 @@ export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResu
     targetVersion,
     preparedAt,
     installMethod: kind === "omp" ? undefined : detectInstallMethod(getPackageDir()),
+    ...release,
   };
   atomicWrite(statusFile, JSON.stringify(stored));
   // copy worker
@@ -451,6 +499,17 @@ export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResu
     copyFileSync(workerSrc, destWorker);
     try {
       chmodSync(destWorker, 0o600);
+    } catch {}
+  }
+  const supportSrc = [
+    resolve(join(dirname(workerSrc), WORKER_SUPPORT_FILE)),
+    resolve(join(process.cwd(), "bin", WORKER_SUPPORT_FILE)),
+  ].find((candidate) => existsSync(candidate));
+  if (supportSrc) {
+    const destSupport = join(attemptDir, WORKER_SUPPORT_FILE);
+    copyFileSync(supportSrc, destSupport);
+    try {
+      chmodSync(destSupport, 0o600);
     } catch {}
   }
   // write ready marker
@@ -506,7 +565,9 @@ export function commitSelfUpdate(attemptId: string, kind: Kind = "app", applyMod
   if (kind !== "omp" && supervision.supervisor === "systemd" && !supervision.serviceUnit) {
     throw new SelfUpdateError("unsupported_supervisor", supervision.reason ?? "unsupported supervisor", 409);
   }
-  const upstream = manager === "git" ? gitUpstreamSync(packageDir) : { remote: "origin", branch: "main" };
+  const upstream = manager === "git"
+    ? gitUpstreamSync(packageDir)
+    : { remote: status.remote ?? "origin", branch: status.branch ?? "main" };
   const fromVersion = status.fromVersion;
   const targetVersion = status.targetVersion;
   const descriptor = {
@@ -550,6 +611,8 @@ export function commitSelfUpdate(attemptId: string, kind: Kind = "app", applyMod
     upstream.branch,
     "--apply-mode",
     applyMode,
+    ...(status.targetCommit ? ["--target-commit", status.targetCommit] : []),
+    ...(status.sourceRepo ? ["--source-repo", status.sourceRepo] : []),
   ];
   try {
     const workerArgs = workerPath ? [workerPath, ...args] : args;

@@ -16,6 +16,7 @@
   },
   "bin": {
     "ompweb": "bin/omp-web.js",
+    "ompweb-deploy": "bin/omp-web-deploy.js",
     "ompweb-tray": "bin/omp-web-tray.js",
     "ompweb-tray-linux": "bin/linux-tray.js",
     "ompweb-launchd": "bin/omp-web-launchd.js",

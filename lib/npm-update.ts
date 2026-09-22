@@ -1,6 +1,6 @@
 import packageJson from "../package.json";
 import { execFile } from "child_process";
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join, normalize, resolve, sep } from "path";
 import { promisify } from "util";
@@ -8,11 +8,16 @@ import { promisify } from "util";
 /**
  * Update availability for ompweb itself.
  *
- * Three install methods exist:
- * - "git":  ompweb runs from a git checkout (this fork's deployment). Updates
- *           are commits on the tracked remote branch; applying one is
- *           `git pull --ff-only && npm ci && npm run build`. The npm registry
- *           and upstream releases are never consulted.
+ * Four install methods exist:
+ * - "release": the service runs an exported release under the release root
+ *           (see bin/omp-web-release.js). The deployed commit is recorded in
+ *           the release's own metadata and compared with the tracked remote
+ *           branch of the source repository; applying one is `ompweb-deploy`.
+ *           This is the deployment shape — no checkout is involved.
+ * - "git":  ompweb runs directly from a git checkout (development, or a
+ *           machine that has not migrated). Updates are commits on the tracked
+ *           remote branch; applying one is
+ *           `git pull --ff-only && npm ci && npm run build`.
  * - "npm" / "bun": a global package install; the registry's latest version
  *           is compared with package.json.
  */
@@ -24,7 +29,7 @@ const CHECK_TTL_MS = 60 * 60 * 1000;
 const GIT_TIMEOUT_MS = 30_000;
 const DEFAULT_UPSTREAM = "origin/main";
 
-export type InstallMethod = "git" | "npm" | "bun";
+export type InstallMethod = "release" | "git" | "npm" | "bun";
 
 export interface NpmUpdateStatus {
   currentVersion: string;
@@ -32,6 +37,10 @@ export interface NpmUpdateStatus {
   updateAvailable: boolean;
   updateCommand: string;
   installMethod: InstallMethod;
+  /** Release directory currently serving, for "release" installs. */
+  releaseDir?: string;
+  /** Source repository a release was exported from. */
+  sourceRepo?: string;
   /** Web URL of the repository (git installs), e.g. https://github.com/2xburnt/ompweb */
   repoUrl?: string | null;
   remote?: string;
@@ -83,12 +92,36 @@ export function isGitCheckout(packageDir: string): boolean {
   }
 }
 
+/** Metadata a release directory carries about the commit it was built from. */
+export interface ReleaseMetadata {
+  commit: string;
+  repo: string;
+  remote?: string;
+  branch?: string;
+  version?: string | null;
+  createdAt?: string;
+}
+
+export const RELEASE_METADATA_FILE = ".ompweb-release.json";
+
+/** A deployed release identifies itself; nothing has to remember for it. */
+export function readReleaseMetadata(packageDir: string): ReleaseMetadata | null {
+  try {
+    const data = JSON.parse(readFileSync(join(packageDir, RELEASE_METADATA_FILE), "utf8")) as Partial<ReleaseMetadata>;
+    if (typeof data?.commit !== "string" || typeof data.repo !== "string") return null;
+    return data as ReleaseMetadata;
+  } catch {
+    return null;
+  }
+}
+
 /** Which package manager owns a given install dir, so updates always run
  * through the manager that manages it (git checkout → git, bun global root →
  * bun, anything else → npm as the fallback). Separators are normalized so the
  * classification is deterministic even when a Windows-style path is passed
  * on a POSIX host (e.g. in CI tests). */
 export function detectInstallMethod(packageDir: string): InstallMethod {
+  if (readReleaseMetadata(packageDir)) return "release";
   if (isGitCheckout(packageDir)) return "git";
   const toPlatformPath = (value: string): string => normalize(value).replaceAll("\\", sep);
   const normalized = toPlatformPath(packageDir);
@@ -130,6 +163,9 @@ export function parseGitRemoteUrl(remote: string): string | null {
 export function gitUpdateCommand(packageDir: string, remote = "origin", branch = "main"): string {
   return `cd ${packageDir} && git pull --ff-only ${remote} ${branch} && npm ci && npm run build`;
 }
+
+/** A release deploy is one command; the web interface runs the same code. */
+export const RELEASE_UPDATE_COMMAND = "ompweb-deploy";
 
 async function git(packageDir: string, args: string[], timeoutMs = GIT_TIMEOUT_MS): Promise<string> {
   const { stdout } = await execFileAsync("git", ["-C", packageDir, ...args], {
@@ -220,12 +256,90 @@ export async function checkGitUpdate(packageDir: string, options: { fetch?: bool
   };
 }
 
+/** Compare the deployed release's commit with the tracked remote branch. The
+ * source repository is only ever read; the release root is the only thing a
+ * deploy writes to. */
+export async function checkReleaseUpdate(packageDir: string, options: { fetch?: boolean } = {}): Promise<NpmUpdateStatus> {
+  const metadata = readReleaseMetadata(packageDir);
+  if (!metadata) throw new Error("the running directory is not a release");
+  const remote = metadata.remote ?? "origin";
+  const branch = metadata.branch ?? "main";
+  const remoteRef = `${remote}/${branch}`;
+  const deployedVersion = metadata.version ?? packageJson.version;
+  const base: NpmUpdateStatus = {
+    currentVersion: `${deployedVersion}+${metadata.commit.slice(0, 7)}`,
+    availableVersion: null,
+    updateAvailable: false,
+    updateCommand: RELEASE_UPDATE_COMMAND,
+    installMethod: "release",
+    releaseDir: packageDir,
+    sourceRepo: metadata.repo,
+    remote,
+    branch,
+    currentCommit: metadata.commit,
+    behindBy: 0,
+    aheadBy: 0,
+  };
+  let checkError: string | undefined;
+  if (options.fetch !== false) {
+    try {
+      await git(metadata.repo, ["fetch", "--quiet", remote, branch], GIT_TIMEOUT_MS);
+    } catch (error) {
+      checkError = error instanceof Error ? error.message.split("\n")[0].slice(0, 200) : String(error);
+    }
+  }
+  let remoteHead: string;
+  try {
+    remoteHead = await git(metadata.repo, ["rev-parse", `${remoteRef}^{commit}`]);
+  } catch {
+    return { ...base, checkError: checkError ?? `${remoteRef} has not been fetched yet` };
+  }
+  const [behindRaw, remoteUrl] = await Promise.all([
+    git(metadata.repo, ["rev-list", "--count", `${metadata.commit}..${remoteHead}`]).catch(() => "0"),
+    git(metadata.repo, ["remote", "get-url", remote]).catch(() => ""),
+  ]);
+  let remoteVersion = deployedVersion;
+  try {
+    const remotePackage = JSON.parse(await git(metadata.repo, ["show", `${remoteHead}:package.json`])) as { version?: unknown };
+    if (typeof remotePackage.version === "string") remoteVersion = remotePackage.version;
+  } catch {
+    // Keep the deployed version label.
+  }
+  const behindBy = Number.parseInt(behindRaw, 10) || 0;
+  return {
+    ...base,
+    availableVersion: behindBy > 0 ? `${remoteVersion}+${remoteHead.slice(0, 7)}` : null,
+    updateAvailable: behindBy > 0,
+    repoUrl: parseGitRemoteUrl(remoteUrl),
+    availableCommit: remoteHead,
+    behindBy,
+    ...(checkError ? { checkError } : {}),
+  };
+}
+
 export async function checkNpmUpdate(force = false): Promise<NpmUpdateStatus> {
   if (!force && cached && Date.now() - cached.checkedAt < CHECK_TTL_MS) return cached.status;
 
   const currentVersion = packageJson.version;
   const packageDir = getPackageDir();
   const method = detectInstallMethod(packageDir);
+
+  if (method === "release") {
+    try {
+      const status = await checkReleaseUpdate(packageDir);
+      cached = { checkedAt: Date.now(), status };
+      return status;
+    } catch (error) {
+      return {
+        currentVersion,
+        availableVersion: null,
+        updateAvailable: false,
+        updateCommand: RELEASE_UPDATE_COMMAND,
+        installMethod: "release",
+        checkError: error instanceof Error ? error.message.slice(0, 200) : String(error),
+      };
+    }
+  }
 
   if (method === "git") {
     try {

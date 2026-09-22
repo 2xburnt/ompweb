@@ -54,11 +54,6 @@ const APPLY_WAIT_MS = Number(process.env.OMP_WEB_UPDATE_APPLY_WAIT_MS) > 0
   ? Number(process.env.OMP_WEB_UPDATE_APPLY_WAIT_MS)
   : 30 * 60 * 1000;
 const LEASE_MS = 30 * 60 * 1000;
-// The staging worktree is removed after every update, so nothing of ours is
-// left registered in the repository. Set to "1" to keep it instead: its
-// .next/cache survives and makes the next build incremental, at the cost of a
-// build tree (and a `git worktree list` entry) that outlives the update.
-const KEEP_BUILD_TREE = process.env.OMP_WEB_UPDATE_KEEP_BUILD_TREE === "1";
 
 function leaseFile() { return path.join(root, "lease.json"); }
 function statusFile() { return path.join(root, "status.json"); }
@@ -238,121 +233,36 @@ async function stopOriginalProcesses() {
   return { launchd, tray };
 }
 
-// --- git checkouts: build first, restart second -----------------------------
+// --- releases: build first, restart second ---------------------------------
 //
-// The checkout the server runs from is never modified until the new build is
-// finished and released. The build happens in a sibling worktree detached at
-// the target commit, so a failed or cancelled update leaves both the checkout
-// and the running build exactly as they were.
+// The service runs an exported release, never a checkout, so an update builds
+// a whole new release directory while the current one keeps serving and then
+// flips a symlink. Nothing in the source repository is written: the commit is
+// read with `git archive`. The same code backs `ompweb-deploy`, so the button
+// in the web interface and the command line cannot drift apart.
 
-function gitEnv() {
-  return { ...process.env, LC_ALL: "C", GIT_TERMINAL_PROMPT: "0", FORCE_COLOR: "0", NO_COLOR: "1", NEXT_TELEMETRY_DISABLED: "1" };
-}
-function git(args, cwd) {
-  return run("git", args, { cwd: cwd || packageDir, timeout: 5 * 60 * 1000, env: gitEnv() }).stdout.trim();
-}
-function gitOk(args, cwd) {
-  const result = cp.spawnSync("git", args, { cwd: cwd || packageDir, timeout: 60_000, encoding: "utf8", windowsHide: true, env: gitEnv() });
-  return result.status === 0;
-}
-function npmBin() {
-  const sibling = path.join(path.dirname(process.execPath), "npm");
-  return fs.existsSync(sibling) ? sibling : "npm";
-}
-function sameDevice(a, b) {
-  try { return fs.statSync(a).dev === fs.statSync(b).dev; } catch { return false; }
-}
-/** Where the new build is produced. The cache directory keeps it out of the
- * checkout's parent (a git repository home holds task checkouts, not build
- * trees), but only while it is on the same filesystem — the swap relies on
- * rename() being atomic, which never crosses devices. */
-function buildTreePath() {
-  const resolved = path.resolve(packageDir);
-  const name = `build-${path.basename(resolved)}`;
-  const cacheHome = process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
-  const cacheRoot = path.join(cacheHome, "ompweb");
-  try {
-    fs.mkdirSync(cacheRoot, { recursive: true, mode: 0o700 });
-    if (sameDevice(cacheRoot, resolved)) return path.join(cacheRoot, name);
-    appendLog(`${cacheRoot} is on another filesystem; building next to the checkout instead`);
-  } catch (error) {
-    appendLog(`${cacheRoot} is unusable (${error.message}); building next to the checkout instead`);
-  }
-  return path.join(path.dirname(resolved), `.ompweb-${name}`);
-}
-function removeBuildTree(stagingDir) {
-  if (!stagingDir) return;
-  try { gitOk(["worktree", "remove", "--force", stagingDir]); } catch {}
-  try { fs.rmSync(stagingDir, { recursive: true, force: true }); } catch {}
-  try { gitOk(["worktree", "prune"]); } catch {}
-}
-/** Point the staging worktree at `commit`, reusing an existing one so its
- * .next/cache (and node_modules) keep the next build incremental. */
-function prepareBuildTree(commit) {
-  const stagingDir = buildTreePath();
-  const reusable = fs.existsSync(path.join(stagingDir, ".git"))
-    && gitOk(["-C", stagingDir, "rev-parse", "--is-inside-work-tree"]);
-  if (reusable) {
-    // A leftover tree from an interrupted update may be dirty; it is ours.
-    gitOk(["-C", stagingDir, "reset", "--hard", "--quiet"]);
-    try {
-      git(["checkout", "--detach", "--quiet", commit], stagingDir);
-      return stagingDir;
-    } catch (error) {
-      appendLog(`reusing the staging worktree failed (${error.message}); recreating it`);
-    }
-  }
-  removeBuildTree(stagingDir);
-  git(["worktree", "add", "--detach", "--quiet", stagingDir, commit]);
-  return stagingDir;
-}
-/** node_modules is shared with the live checkout unless the update changes a
- * dependency, in which case the staging tree installs its own copy and the two
- * are swapped during the restart. */
-async function prepareBuildDependencies(stagingDir, headCommit, targetCommit) {
-  const changed = git(["diff", "--name-only", headCommit, targetCommit, "--", "package.json", "package-lock.json"]);
-  const modules = path.join(stagingDir, "node_modules");
-  const live = path.join(packageDir, "node_modules");
-  let linked = false;
-  try { linked = fs.lstatSync(modules).isSymbolicLink(); } catch {}
-  if (!changed) {
-    if (!linked) {
-      try { fs.rmSync(modules, { recursive: true, force: true }); } catch {}
-      fs.symlinkSync(live, modules, "junction");
-    }
-    return false;
-  }
-  if (linked) fs.rmSync(modules);
-  await runLong(npmBin(), ["ci", "--no-audit", "--no-fund"], { cwd: stagingDir, timeout: 20 * 60 * 1000, env: gitEnv() });
-  return true;
-}
-async function stageGitBuild() {
-  updateStatus({ stage: "building", installMethod: "git" });
-  const remoteRef = `${gitRemote}/${gitBranch}`;
-  await runLong("git", ["fetch", "--quiet", gitRemote, gitBranch], { cwd: packageDir, timeout: 5 * 60 * 1000, env: gitEnv() });
+// Copied next to this worker by prepareSelfUpdate().
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const releaseStore = require("./omp-web-release");
+
+async function stageReleaseBuild() {
+  updateStatus({ stage: "building", installMethod: "release" });
+  if (!sourceRepo || !targetCommit) throw new Error("the update did not resolve a commit to deploy");
+  const releaseRoot = releaseStore.resolveReleaseRoot();
+  const releaseDir = await releaseStore.buildRelease({
+    repo: sourceRepo,
+    commit: targetCommit,
+    root: releaseRoot,
+    remote: gitRemote,
+    branch: gitBranch,
+    runLong,
+    log: appendLog,
+  });
   throwIfCancelled();
-  if (git(["status", "--porcelain", "--untracked-files=no"])) {
-    throw new Error("the checkout has uncommitted changes; commit or stash them before updating");
-  }
-  const headCommit = git(["rev-parse", "HEAD"]);
-  const targetCommit = git(["rev-parse", remoteRef]);
-  if (headCommit === targetCommit) throw new Error(`the checkout is already at ${remoteRef}`);
-  // Verified before anything is built so the fast-forward cannot be the step
-  // that fails once the server is already down.
-  if (!gitOk(["-C", packageDir, "merge-base", "--is-ancestor", headCommit, targetCommit])) {
-    throw new Error(`${remoteRef} is not a fast-forward of the checked-out commit`);
-  }
-  const stagingDir = prepareBuildTree(targetCommit);
-  const staged = { stagingDir, headCommit, targetCommit, ownDependencies: false };
-  staged.ownDependencies = await prepareBuildDependencies(stagingDir, headCommit, targetCommit);
-  throwIfCancelled();
-  await runLong(npmBin(), ["run", "build"], { cwd: stagingDir, timeout: 20 * 60 * 1000, env: gitEnv() });
-  if (!fs.existsSync(path.join(stagingDir, ".next", "BUILD_ID"))) {
-    throw new Error("the build finished without producing .next/BUILD_ID");
-  }
   updateStatus({ stagedCommit: targetCommit });
-  return staged;
+  return { releaseRoot, releaseDir };
 }
+
 /** Wait for the browser to release the staged build. Returns false when the
  * attempt was cancelled or nobody confirmed in time — the server is untouched
  * either way. */
@@ -368,86 +278,34 @@ async function waitForApplyConfirmation() {
   appendLog("no confirmation arrived before the staged build expired");
   return false;
 }
-/** Re-checked immediately before the server is stopped: the build may have
- * taken minutes, and a commit or a stray edit in the checkout since then would
- * otherwise turn the fast-forward into the step that fails with the service
- * already down. */
+
+/** Nothing outside the release root changed while this was building, so the
+ * only thing that can have gone missing is the build itself. */
 function verifyStagedBuildStillApplies(staged) {
-  if (git(["status", "--porcelain", "--untracked-files=no"])) {
-    throw new Error("the checkout was modified while the update was building; nothing was changed");
-  }
-  const head = git(["rev-parse", "HEAD"]);
-  if (head === staged.targetCommit) throw new Error("the checkout already moved to the target commit");
-  if (!gitOk(["-C", packageDir, "merge-base", "--is-ancestor", head, staged.targetCommit])) {
-    throw new Error("the checkout moved while the update was building and can no longer fast-forward");
-  }
-  if (!fs.existsSync(path.join(staged.stagingDir, ".next", "BUILD_ID"))) {
-    throw new Error("the staged build disappeared before it could be applied");
+  if (!fs.existsSync(path.join(staged.releaseDir, ".next", "BUILD_ID"))) {
+    throw new Error("the staged release disappeared before it could be applied");
   }
 }
-function swapDirectory(stagingPath, livePath, backupPath) {
-  let movedLive = false;
-  if (fs.existsSync(livePath)) {
-    fs.renameSync(livePath, backupPath);
-    movedLive = true;
-  }
-  try {
-    fs.renameSync(stagingPath, livePath);
-  } catch (error) {
-    if (movedLive) {
-      try { fs.renameSync(backupPath, livePath); } catch {}
-    }
-    throw error;
-  }
-  return movedLive ? backupPath : null;
-}
-/** The downtime window: a fast-forward plus two renames. */
-function applyStagedBuild(staged) {
+
+/** The downtime window: two symlink renames. */
+function applyStagedRelease(staged) {
   updateStatus({ stage: "installing" });
-  const { stagingDir, targetCommit, ownDependencies } = staged;
-  git(["merge", "--ff-only", targetCommit]);
-  const suffix = attemptId.slice(0, 8);
-  const discard = [];
-  // The build cache is the reason the next update is fast; it stays behind in
-  // the staging tree instead of moving into the live directory.
-  const stagedNext = path.join(stagingDir, ".next");
-  const keptCache = path.join(stagingDir, ".ompweb-build-cache");
-  let cacheKept = false;
-  if (KEEP_BUILD_TREE && fs.existsSync(path.join(stagedNext, "cache"))) {
-    try {
-      fs.rmSync(keptCache, { recursive: true, force: true });
-      fs.renameSync(path.join(stagedNext, "cache"), keptCache);
-      cacheKept = true;
-    } catch (error) {
-      appendLog(`keeping the build cache failed: ${error.message}`);
-    }
+  const result = releaseStore.activateRelease({ root: staged.releaseRoot, releaseDir: staged.releaseDir });
+  appendLog(`activated ${result.activated}${result.previous ? `, previous ${result.previous}` : ""}`);
+  return result;
+}
+
+/** A release that was never activated is inert; delete it so a cancelled or
+ * failed update leaves nothing behind. */
+function discardStagedRelease(staged) {
+  if (!staged) return;
+  try {
+    if (releaseStore.currentReleaseDir(staged.releaseRoot) === staged.releaseDir) return;
+    fs.rmSync(staged.releaseDir, { recursive: true, force: true });
+    appendLog(`discarded ${staged.releaseDir}`);
+  } catch (error) {
+    appendLog(`could not discard ${staged.releaseDir}: ${error.message}`);
   }
-  const replaced = swapDirectory(stagedNext, path.join(packageDir, ".next"), path.join(packageDir, `.next.old-${suffix}`));
-  if (replaced) discard.push(replaced);
-  if (ownDependencies) {
-    const liveModules = path.join(packageDir, "node_modules");
-    const backup = path.join(packageDir, `node_modules.old-${suffix}`);
-    try {
-      const previous = swapDirectory(path.join(stagingDir, "node_modules"), liveModules, backup);
-      if (previous) discard.push(previous);
-      fs.symlinkSync(liveModules, path.join(stagingDir, "node_modules"), "junction");
-    } catch (error) {
-      // .next is already the new build; a stale node_modules would only differ
-      // by the dependencies this update added, so surface it rather than
-      // rolling back a half-applied swap.
-      appendLog(`swapping node_modules failed: ${error.message}`);
-      throw new Error(`the new dependencies could not be moved into place: ${error.message}`);
-    }
-  }
-  if (cacheKept) {
-    try {
-      fs.mkdirSync(stagedNext, { recursive: true });
-      fs.renameSync(keptCache, path.join(stagedNext, "cache"));
-    } catch (error) {
-      appendLog(`restoring the build cache failed: ${error.message}`);
-    }
-  }
-  return discard;
 }
 
 async function runManagerGate() {
@@ -465,7 +323,7 @@ async function runManagerGate() {
     return;
   }
   // App update via npm/bun. A global install replaces the directory the server
-  // runs from, so unlike the git path it cannot be staged in advance.
+  // runs from, so unlike a release it cannot be built alongside in advance.
   const cmd = manager === "bun" ? (managerPath || "bun") : (managerPath || "npm");
   const args = manager === "bun" ? ["add", "-g", `@kahme247/ompweb@${target}`] : ["install", "-g", `@kahme247/ompweb@${target}`];
   if (Array.isArray(managerPrefix) && managerPrefix.length) args.unshift(...managerPrefix);
@@ -532,13 +390,6 @@ async function restartServices(info) {
   } catch {}
 }
 
-/** Directories replaced by the swap, deleted after the server is back up. */
-function discardReplaced(paths) {
-  for (const target of paths) {
-    try { fs.rmSync(target, { recursive: true, force: true }); } catch (error) { appendLog(`could not remove ${target}: ${error.message}`); }
-  }
-}
-
 async function main() {
   if (!/^[0-9a-f-]{36}$/i.test(attemptId || "") || !root || !packageDir || !target) {
     process.exit(1);
@@ -564,31 +415,24 @@ async function main() {
   let svcInfo = { launchd: false, tray: false, systemd: false };
   let staged = null;
   try {
-    if (kind !== "omp" && manager === "git") {
-      staged = await stageGitBuild();
+    if (kind !== "omp" && manager === "release") {
+      staged = await stageReleaseBuild();
       if (applyMode !== "auto" && !await waitForApplyConfirmation()) throw new CancelledError();
       throwIfCancelled();
       verifyStagedBuildStillApplies(staged);
     }
     if (kind !== "omp") svcInfo = await stopOriginalProcesses();
-    let replaced = [];
     if (staged) {
-      replaced = applyStagedBuild(staged);
+      applyStagedRelease(staged);
     } else {
       await runManagerGate();
     }
-    try {
-      const pkgPath = path.join(packageDir, "package.json");
-      if (fs.existsSync(pkgPath)) {
-        const pkg = readJson(pkgPath);
-        if (pkg && pkg.version !== target) {
-          // version mismatch not fatal but record
-        }
-      }
-    } catch {}
     if (kind !== "omp") await restartServices(svcInfo);
-    discardReplaced(replaced);
-    if (staged && !KEEP_BUILD_TREE) removeBuildTree(staged.stagingDir);
+    if (staged) {
+      releaseStore
+        .pruneReleases({ root: staged.releaseRoot, log: appendLog })
+        .forEach((dir) => appendLog(`pruned ${dir}`));
+    }
     await sleep(500);
     updateStatus({ state: "succeeded", stage: "finalizing", finishedAt: new Date().toISOString(), cleanupReady: true });
     // write complete marker
@@ -596,7 +440,7 @@ async function main() {
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     appendLog(`${e && e.cancelled ? "CANCELLED" : "FAILED"}: ${msg}`);
-    if (staged && !KEEP_BUILD_TREE) removeBuildTree(staged.stagingDir);
+    discardStagedRelease(staged);
     updateStatus({
       state: e && e.cancelled ? "cancelled" : "failed",
       error: msg.slice(0, 240),

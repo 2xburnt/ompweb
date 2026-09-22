@@ -24,20 +24,25 @@ const {
   getAppUpdateStageTimeoutMs,
 } = await jiti.import("./AppShell-app-update.ts");
 
-test("only git checkouts build before the restart", () => {
-  assert.equal(isStagedAppUpdate("git"), true);
+test("only releases build before the restart", () => {
+  assert.equal(isStagedAppUpdate("release"), true);
+  // A checkout serves what is in it and a global install overwrites itself;
+  // neither can have a replacement built alongside.
+  assert.equal(isStagedAppUpdate("git"), false);
   assert.equal(isStagedAppUpdate("npm"), false);
   assert.equal(isStagedAppUpdate("bun"), false);
   assert.equal(isStagedAppUpdate(undefined), false);
 });
 
-test("the step list hides the staged steps for package installs", () => {
-  assert.deepEqual(getAppUpdateSteps("git").map((step) => step.stage), [
+test("the step list hides the staged steps for anything but a release", () => {
+  assert.deepEqual(getAppUpdateSteps("release").map((step) => step.stage), [
     "preparing", "building", "ready", "stopping", "installing", "restarting", "finalizing",
   ]);
-  assert.deepEqual(getAppUpdateSteps("npm").map((step) => step.stage), [
-    "preparing", "stopping", "installing", "restarting", "finalizing",
-  ]);
+  for (const method of ["npm", "bun", "git", undefined]) {
+    assert.deepEqual(getAppUpdateSteps(method).map((step) => step.stage), [
+      "preparing", "stopping", "installing", "restarting", "finalizing",
+    ], `steps for ${method}`);
+  }
 });
 
 test("stage indexes stay absolute so a filtered list still marks progress", () => {

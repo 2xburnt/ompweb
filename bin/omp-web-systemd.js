@@ -125,6 +125,12 @@ function resolveOmpwebBin(env = process.env) {
     return override;
   }
 
+  // The release symlink first: it is stable across deploys and independent of
+  // wherever the installer happened to be run from, which is what stopped a
+  // stray `ompweb-systemd install` from repointing the service at a checkout.
+  const released = releaseLauncher(env);
+  if (released) return released;
+
   const sibling = path.join(path.dirname(process.execPath), "ompweb");
   if (isExecutableFile(sibling)) return sibling;
 
@@ -132,6 +138,21 @@ function resolveOmpwebBin(env = process.env) {
   if (onPath) return onPath;
   throw new Error("ompweb binary not found (next to node or on PATH); set OMP_WEB_SYSTEMD_BIN");
 }
+/** `<releaseRoot>/current/bin/omp-web.js` when a release is deployed. The path
+ * is returned unresolved on purpose: it must keep pointing at whatever
+ * `current` means after the next deploy. */
+function releaseLauncher(env = process.env) {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { releasePaths, resolveReleaseRoot } = require("./omp-web-release");
+    const { current } = releasePaths(resolveReleaseRoot(env));
+    const launcher = path.join(current, "bin", "omp-web.js");
+    return isExecutableFile(launcher) ? launcher : null;
+  } catch {
+    return null;
+  }
+}
+
 function validatePort(value) {
   const port = Number(value);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {

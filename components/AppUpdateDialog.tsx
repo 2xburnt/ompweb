@@ -34,10 +34,11 @@ const APP_UPDATE_STEP_BY_STAGE: Record<AppUpdateStage, number> = {
   finalizing: 6,
 };
 
-/** Only git checkouts build ahead of the restart; a global package install
- * replaces the directory the server runs from and cannot be staged. */
+/** Only releases build ahead of the restart: a new release directory is built
+ * while the current one keeps serving. A global package install replaces the
+ * directory the server runs from and cannot be staged. */
 export function isStagedAppUpdate(installMethod: AppUpdateInfo["installMethod"]): boolean {
-  return installMethod === "git";
+  return installMethod === "release";
 }
 
 export function getAppUpdateSteps(installMethod: AppUpdateInfo["installMethod"]): typeof APP_UPDATE_STEPS {
@@ -143,8 +144,9 @@ export interface AppUpdateInfo {
   availableVersion: string | null;
   updateAvailable: boolean;
   updateCommand?: string;
-  /** "git" when ompweb runs from a checkout (updates pull and rebuild this repository). */
-  installMethod?: "git" | "npm" | "bun";
+  /** "release" when ompweb serves an exported release (updates build a new
+   * release and flip a symlink); "git" when it runs from a checkout. */
+  installMethod?: "release" | "git" | "npm" | "bun";
   repoUrl?: string | null;
   branch?: string;
   behindBy?: number;
@@ -163,7 +165,7 @@ export interface AppUpdateInfo {
     recovered?: boolean;
     cleanupReady?: boolean;
     error?: string;
-    installMethod?: "git" | "npm" | "bun";
+    installMethod?: "release" | "git" | "npm" | "bun";
     stagedCommit?: string;
     applyDeadline?: number;
   } | null;
@@ -254,8 +256,13 @@ export function AppUpdateDialog({
   const busy = phase === "preparing" || phase === "restarting" || phase === "completed";
   const staged = isStagedAppUpdate(update?.installMethod);
   const steps = getAppUpdateSteps(update?.installMethod);
-  const command = update?.updateCommand || (update?.installMethod === "git" ? "git pull --ff-only && npm ci && npm run build" : "npm install -g @kahme247/ompweb");
-  const gitDescription = update?.installMethod === "git"
+  const command = update?.updateCommand
+    || (update?.installMethod === "release"
+      ? "ompweb-deploy"
+      : update?.installMethod === "git"
+        ? "git pull --ff-only && npm ci && npm run build"
+        : "npm install -g @kahme247/ompweb");
+  const gitDescription = update?.installMethod === "release" || update?.installMethod === "git"
     ? t("appUpdateDialog.gitDescription", { count: String(update.behindBy ?? 0), branch: update.branch ?? "main" })
     : null;
   const completedVersion = update?.selfUpdateStatus?.targetVersion ?? update?.availableVersion ?? update?.currentVersion ?? "?";
