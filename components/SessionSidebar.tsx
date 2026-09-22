@@ -3245,11 +3245,6 @@ const SessionItem = memo(function SessionItem({
           <div style={{ display: "flex", alignItems: "center", gap: 2, flexShrink: 0 }}>
             <div style={{ position: "relative", display: "flex", alignItems: "center", justifyContent: "flex-end", width: 64, height: 24, flexShrink: 0 }}>
               <div aria-hidden={showActions && !isRunning} style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 2, width: "100%", whiteSpace: "nowrap", opacity: showActions && !isRunning ? 0 : 1, pointerEvents: showActions && !isRunning ? "none" : "auto", transition: "opacity var(--dur-fast) var(--ease-out-warm)" }}>
-                {machineLabel && (
-                  <span role="img" aria-label={t("hosts.sidebar.badge", { name: machineLabel })} title={t("hosts.sidebar.badge", { name: machineLabel })} style={{ display: "inline-flex", alignItems: "center", flexShrink: 0, color: "var(--text-dim)", opacity: 0.8 }}>
-                    <Server size={10} strokeWidth={2} aria-hidden="true" />
-                  </span>
-                )}
                 {isRunning && <RunningSessionIndicator size={12} />}
                 {!isRunning && isUnread && <UnreadSessionIndicator size={11} />}
                 {relativeTime && <span title={new Date(session.modified).toLocaleString(locale)} style={{ minWidth: 42, whiteSpace: "nowrap", textAlign: "right", color: isSelected ? "var(--accent)" : "var(--text-dim)", fontSize: 10, fontVariantNumeric: "tabular-nums" }}>{relativeTime}</span>}
