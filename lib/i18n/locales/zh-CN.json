@@ -1552,5 +1552,6 @@
   "settingsConfig.defaultVoice": "系统默认声音",
   "messageView.readAloud": "朗读",
   "messageView.stopSpeech": "停止朗读",
-  "settingsConfig.ttsNotSupported": "当前浏览器不支持"
+  "settingsConfig.ttsNotSupported": "当前浏览器不支持",
+  "projects.reorder": "调整 {name} 的顺序。拖动或使用方向键。"
 }

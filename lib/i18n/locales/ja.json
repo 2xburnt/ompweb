@@ -1552,5 +1552,6 @@
   "settingsConfig.defaultVoice": "システムの既定の音声",
   "messageView.readAloud": "読み上げ",
   "messageView.stopSpeech": "読み上げを停止",
-  "settingsConfig.ttsNotSupported": "このブラウザではサポートされていません"
+  "settingsConfig.ttsNotSupported": "このブラウザではサポートされていません",
+  "projects.reorder": "{name} の順序を変更。ドラッグするか矢印キーを使用します。"
 }

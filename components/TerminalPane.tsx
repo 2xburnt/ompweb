@@ -55,6 +55,7 @@ export function TerminalPane({
   hostId,
   cwd,
   sessionId,
+  active = true,
   onSessionChange,
   onClose,
   onExit,
@@ -70,6 +71,8 @@ export function TerminalPane({
    * must be two shells, which is not something the pane can work out for itself.
    */
   sessionId?: string | null;
+  /** Whether this pane is visible and may resize or take focus. */
+  active?: boolean;
   /** Reports the shell this pane settled on, so the tab can reattach to it later. */
   onSessionChange?: (sessionId: string | null) => void;
   onClose: () => void;
@@ -98,6 +101,7 @@ export function TerminalPane({
   const requestedSessionRef = useRef(sessionId ?? null);
   const onSessionChangeRef = useRef(onSessionChange);
   const onExitRef = useRef(onExit);
+  const activeRef = useRef(active);
   const [status, setStatus] = useState<Status>("starting");
   const [error, setError] = useState<string | null>(null);
   const [exitCode, setExitCode] = useState<number | null>(null);
@@ -109,7 +113,8 @@ export function TerminalPane({
     cwdRef.current = cwd;
     onSessionChangeRef.current = onSessionChange;
     onExitRef.current = onExit;
-  }, [cwd, onSessionChange, onExit]);
+    activeRef.current = active;
+  }, [cwd, onSessionChange, onExit, active]);
 
   const sendInput = useCallback((data: string) => {
     const id = sessionIdRef.current;
@@ -245,6 +250,7 @@ export function TerminalPane({
       term.onResize(({ cols, rows }) => sendResize(cols, rows));
 
       resizeObserver = new ResizeObserver(() => {
+        if (!activeRef.current) return;
         const size = fit();
         if (size) sendResize(size.cols, size.rows);
       });
@@ -269,9 +275,11 @@ export function TerminalPane({
           attachedRef.current = true;
           if (!firstAttach) term.reset();
           if (frame.backlog) term.write(atob(frame.backlog));
-          const size = fit();
-          if (size) sendResize(size.cols, size.rows);
-          if (firstAttach) term.focus();
+          if (activeRef.current) {
+            const size = fit();
+            if (size) sendResize(size.cols, size.rows);
+            if (firstAttach) term.focus();
+          }
           return;
         }
         if (frame.type === "output" && typeof frame.data === "string") {
@@ -305,6 +313,19 @@ export function TerminalPane({
       void id;
     };
   }, [hostId, restartKey, isDark, sendInput, sendResize]);
+
+  // Inactive panes remain mounted and consume their streams. Fit only after a
+  // pane becomes visible again, avoiding both scrollback replay and dimensions
+  // measured from a hidden container.
+  useEffect(() => {
+    if (!active) return;
+    const frame = window.requestAnimationFrame(() => {
+      const size = termRef.current?.fit();
+      if (size) sendResize(size.cols, size.rows);
+      termRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [active, sendResize]);
 
   // Hides the pane; the shell keeps running. Closing a tab is what ends a
   // shell, so putting the terminal away does not throw away what is in it.

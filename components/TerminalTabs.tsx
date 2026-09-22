@@ -15,10 +15,10 @@ import { TerminalPane } from "./TerminalPane";
  * tabs on the same machine have to be two different shells — something the pane
  * cannot work out from the machine alone.
  *
- * Only the active tab is mounted. The server keeps every PTY and its
- * scrollback, so switching back reattaches to the same shell with its screen
- * intact; keeping hidden panes mounted would mean measuring xterm in a
- * zero-sized box and sending nonsense dimensions to the PTY.
+ * Every tab stays mounted so its xterm instance and SSE connection keep their
+ * state current in the background. Inactive panes are moved offscreen rather
+ * than collapsed to zero size, which preserves their last valid dimensions
+ * without making xterm remeasure an invisible box.
  */
 
 const TABS_STORAGE_KEY = "omp-web.terminal.tabs";
@@ -468,16 +468,29 @@ export function TerminalTabs({
   }
 
   return (
-    <TerminalPane
-      // Remounting per tab is deliberate: it is what tears down the previous
-      // tab's stream and attaches to this one's.
-      key={active.key}
-      hostId={active.hostId}
-      cwd={active.cwd}
-      sessionId={active.sessionId}
-      onSessionChange={(sessionId) => setTabSession(active.key, sessionId)}
-      onClose={onClose}
-      tabs={tabStrip}
-    />
+    <div style={{ position: "relative", height: "100%", minHeight: 0, overflow: "hidden" }}>
+      {tabs.map((tab) => {
+        const isActive = tab.key === active.key;
+        return (
+          <div
+            key={tab.key}
+            aria-hidden={!isActive}
+            style={isActive
+              ? { position: "absolute", inset: 0 }
+              : { position: "absolute", inset: 0, transform: "translateX(-200vw)", visibility: "hidden", pointerEvents: "none" }}
+          >
+            <TerminalPane
+              hostId={tab.hostId}
+              cwd={tab.cwd}
+              sessionId={tab.sessionId}
+              active={isActive}
+              onSessionChange={(sessionId) => setTabSession(tab.key, sessionId)}
+              onClose={onClose}
+              tabs={isActive ? tabStrip : undefined}
+            />
+          </div>
+        );
+      })}
+    </div>
   );
 }

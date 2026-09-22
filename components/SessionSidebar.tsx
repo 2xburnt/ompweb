@@ -24,10 +24,9 @@ import {
 import { clearLastOpenSession, setLastOpenSession, workspaceKeyOf } from "@/lib/workspace-memory";
 import { sortManagedProjects } from "@/lib/project-ordering";
 import { comparableProjectPath } from "@/lib/comparable-path";
-import { Archive, Check, ChevronDown, ChevronRight, FileUp, Folder, GitBranch, MoreHorizontal, Plus, RefreshCw, Search, Server, Settings2, SlidersHorizontal, Trash2 } from "lucide-react";
+import { Archive, Check, ChevronDown, ChevronRight, FileUp, Folder, GitBranch, GripVertical, MoreHorizontal, Plus, RefreshCw, Search, Server, Settings2, SlidersHorizontal, Trash2 } from "lucide-react";
 import { publishSessionsChanged } from "@/lib/session-change-bus";
 import { hostFetch, useHosts, worthAsking } from "@/lib/hosts/client";
-import { MachineSwitcher } from "./MachineSwitcher";
 import { groupSessionsByMachine, projectActivityByKey, projectExpansionKey, sessionHostId, sessionProjectPath, type MachineGroup } from "./machine-groups";
 
 const SESSIONS_FETCH_TIMEOUT_MS = 15_000;
@@ -65,10 +64,10 @@ interface Props {
   updateAvailable?: boolean;
   /** Opens the archived sessions browser. */
   onOpenArchive?: () => void;
-  /** Opens Settings → Machines (from the machine switcher). */
-  onManageMachines?: () => void;
   /** True when settings full-page view is currently open. */
   settingsOpen?: boolean;
+  /** Whether the containing sidebar is currently visible. */
+  sidebarOpen?: boolean;
 }
 
 
@@ -377,7 +376,7 @@ function OmpWebTitle() {
     </button>
   );
 }
-export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, optimisticSession, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onWorkspaceOptionsChange, addProjectOpen, setAddProjectOpen, usageVisible = true, onOpenSettings, onOpenArchive, updateAvailable, settingsOpen = false, onManageMachines }: Props) {
+export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, optimisticSession, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onWorkspaceOptionsChange, addProjectOpen, setAddProjectOpen, usageVisible = true, onOpenSettings, onOpenArchive, updateAvailable, settingsOpen = false, sidebarOpen = true }: Props) {
   const { t } = useI18n();
   // Machines: the selected machine scopes projects, worktrees, the explorer
   // and New Session; sessions from every machine are listed together.
@@ -414,7 +413,12 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         ? t("projects.loadFailed", { detail: selectedHostSummary.lastError ?? t("hosts.status.error") })
         : null)
     : null;
-  // Collapsed machine groups, persisted like project expansion.
+  // Remote machines start collapsed. Expansion is intentionally ephemeral:
+  // reopening the sidebar returns focus to this machine's workspaces.
+  const [expandedRemoteHosts, setExpandedRemoteHosts] = useState<Set<string>>(() => new Set());
+  useEffect(() => {
+    if (!sidebarOpen) setExpandedRemoteHosts(new Set());
+  }, [sidebarOpen]);
   // Machine the selected cwd belongs to. A machine switch from the header
   // resets the selection; selecting a session/project on another machine
   // updates this first so the switch effect leaves the selection alone.
@@ -1162,6 +1166,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   // debounce already in place — keystrokes never block the main thread on large session lists.
   const deferredSearchQuery = useDeferredValue(searchQuery);
   const filtersActive = searchOpen || runningOnly || deferredSearchQuery.trim().length > 0;
+    const hostFilterActive = runningOnly || deferredSearchQuery.trim().length > 0;
   type ProjectEntry = { project: ManagedProject; sessions: SessionInfo[]; key: string };
   type MachineEntry = MachineGroup & { entries: ProjectEntry[] };
   const visibleMachineEntries = useMemo<MachineEntry[]>(() => {
@@ -1767,7 +1772,6 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             void handleImportSession(file);
           }}
         />
-        <MachineSwitcher onManageMachines={onManageMachines} />
         <button
           onClick={handleNewSession}
           disabled={!selectedCwd}
@@ -1922,16 +1926,42 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
           )}
 
           {visibleMachineEntries.map((group) => {
-            // Workspaces are one flat list across machines. Each row carries a
-            // machine label instead of sitting under a machine heading: the
-            // heading repeated itself on every row below it, and the machine
-            // switcher above already says which machine is active.
             const isCurrentMachine = group.hostId === hostId;
             const machineName = group.host?.name ?? group.hostId;
             const groupHome = homeByHost[group.hostId] ?? "";
+            const isExpanded = hostFilterActive || isCurrentMachine || expandedRemoteHosts.has(group.hostId);
             return (
               <div key={group.hostId} className="sidebar-machine" data-current={isCurrentMachine ? "true" : "false"}>
-                {group.entries.map(({ project, sessions, key }) => {
+                {!isCurrentMachine && (
+                  <button type="button" disabled={hostFilterActive} onClick={hostFilterActive ? undefined : () => setExpandedRemoteHosts((current) => {
+                    const next = new Set(current);
+                    if (next.has(group.hostId)) next.delete(group.hostId);
+                    else next.add(group.hostId);
+                    return next;
+                  })} aria-expanded={isExpanded} aria-label={hostFilterActive ? machineName : isExpanded
+                    ? t("hosts.sidebar.collapse", { name: machineName })
+                    : t("hosts.sidebar.expand", { name: machineName })} title={hostFilterActive ? undefined : isExpanded
+                    ? t("hosts.sidebar.collapse", { name: machineName })
+                    : t("hosts.sidebar.expand", { name: machineName })} style={{ ...{
+                    width: "100%",
+                    minHeight: 34,
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 7,
+                    padding: "6px 8px",
+                    border: 0,
+                    borderRadius: 7,
+                    background: "transparent",
+                    color: "var(--text-muted)",
+                    cursor: "pointer",
+                    textAlign: "left",
+                  }, cursor: hostFilterActive ? "default" : "pointer" }}>{isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                  <Server size={14} />
+                  <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {machineName}
+                  </span></button>
+                )}
+                {isExpanded && group.entries.map(({ project, sessions, key }) => {
                   const tree = treesByProject.get(key) ?? buildSessionTree(sessions);
                   // Sessions group under a project through the case-folded
                   // comparable form (see groupSessionsByMachine), so the active
@@ -1979,7 +2009,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                       worktreeOpen={isActive ? wtDropdownOpen : false}
                       onToggleWorktrees={isActive ? toggleWorktrees : undefined}
                       homeDir={groupHome}
-                      machineLabel={multiHost ? machineName : null}
+                      machineLabel={multiHost && isCurrentMachine ? machineName : null}
                     />
                   );
                 })}
@@ -2151,8 +2181,6 @@ function ProjectRow({
     <section className="sidebar-project" data-active={isActive ? "true" : "false"} style={{ marginBottom: 12 }}>
       <div
         className="sidebar-project-header"
-        draggable={!aliasEditing}
-        onDragStart={(event) => { event.dataTransfer.setData("text/plain", project.path); event.dataTransfer.effectAllowed = "move"; onDragPathChange(project.path); }}
         onDragOver={(event) => { if (isDragTarget) { event.preventDefault(); event.dataTransfer.dropEffect = "move"; } }}
         onDrop={(event) => { event.preventDefault(); onDropProject(project.path); }}
         onDragEnd={() => onDragPathChange(null)}
@@ -2181,6 +2209,29 @@ function ProjectRow({
           ...(isDragTarget ? { outline: "1px solid var(--accent)", outlineOffset: -1 } : {}),
         }}
       >
+        <button
+          type="button"
+          className="sidebar-project-drag-handle"
+          draggable={!aliasEditing}
+          onDragStart={(event) => {
+            event.stopPropagation();
+            event.dataTransfer.setData("text/plain", project.path);
+            event.dataTransfer.effectAllowed = "move";
+            onDragPathChange(project.path);
+          }}
+          onDragEnd={() => onDragPathChange(null)}
+          onKeyDown={(event) => {
+            if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+            event.preventDefault();
+            event.stopPropagation();
+            void onMoveProject(project.path, event.key === "ArrowUp" ? -1 : 1);
+          }}
+          aria-label={t("projects.reorder", { name: label })}
+          title={t("projects.reorder", { name: label })}
+          style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 20, height: 24, padding: 0, flexShrink: 0, border: "none", borderRadius: "var(--radius-control)", background: "transparent", color: hovered || focusWithin ? "var(--text-dim)" : "var(--border-strong)", cursor: aliasEditing ? "default" : "grab", lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
+        >
+          <GripVertical size={14} strokeWidth={1.8} aria-hidden="true" />
+        </button>
         {aliasEditing ? (
           <div
             className="sidebar-project-identity"
@@ -2192,7 +2243,7 @@ function ProjectRow({
               display: "flex",
               alignItems: "center",
               gap: 7,
-              padding: "0 4px 0 10px",
+              padding: "0 4px 0 0",
             }}
           >
             <Folder
@@ -2247,7 +2298,7 @@ function ProjectRow({
               display: "flex",
               alignItems: "center",
               gap: 7,
-              padding: "0 4px 0 10px",
+              padding: "0 4px 0 0",
               background: "none", border: "none",
               color: hovered ? "var(--text)" : "var(--text-muted)",
               cursor: "pointer",
@@ -2375,12 +2426,6 @@ function ProjectRow({
             </button>
             <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { onEditLaunchConfig(project); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
               {project.launchConfig ? t("sessionSidebar.editLaunchConfig") : t("sessionSidebar.configureLaunchConfig")}
-            </button>
-            <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { setActionMenuOpen(false); void onMoveProject(project.path, -1); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
-              {t("projects.moveUp")}
-            </button>
-            <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { setActionMenuOpen(false); void onMoveProject(project.path, 1); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
-              {t("projects.moveDown")}
             </button>
             <button type="button" role="menuitem" className="sidebar-menu-item" disabled={removeBusy} onClick={() => { setActionMenuOpen(false); void onRemoveProject(project.path); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--status-error)", cursor: removeBusy ? "default" : "pointer", textAlign: "left", fontSize: 11 }}>
               {t("projects.remove", { name: label })}

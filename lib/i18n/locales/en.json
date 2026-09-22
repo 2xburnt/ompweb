@@ -1581,5 +1581,6 @@
   "settingsConfig.defaultVoice": "Default system voice",
   "messageView.readAloud": "Read aloud",
   "messageView.stopSpeech": "Stop speaking",
-  "settingsConfig.ttsNotSupported": "Not supported in this browser"
+  "settingsConfig.ttsNotSupported": "Not supported in this browser",
+  "projects.reorder": "Reorder {name}. Drag, or use the arrow keys."
 }

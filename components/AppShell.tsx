@@ -224,18 +224,24 @@ export function AppShell() {
   // Terminal pane: spans the chat and file area along the bottom, never the
   // sidebar, so the workspace list stays full height beside it.
   const [terminalOpen, setTerminalOpen] = useState(false);
+  const [terminalEverOpened, setTerminalEverOpened] = useState(false);
   const [terminalHeight, setTerminalHeight] = useState<number>(TERMINAL_DEFAULT_HEIGHT);
   const [terminalResizing, setTerminalResizing] = useState(false);
 
   useEffect(() => {
     try {
-      setTerminalOpen(window.localStorage.getItem(TERMINAL_OPEN_STORAGE_KEY) === "1");
+      const storedOpen = window.localStorage.getItem(TERMINAL_OPEN_STORAGE_KEY) === "1";
+      setTerminalOpen(storedOpen);
+      setTerminalEverOpened(storedOpen);
       const stored = Number.parseInt(window.localStorage.getItem(TERMINAL_HEIGHT_STORAGE_KEY) ?? "", 10);
       if (Number.isFinite(stored)) setTerminalHeight(Math.max(TERMINAL_MIN_HEIGHT, stored));
     } catch {
       // storage unavailable — defaults are fine
     }
   }, []);
+  useEffect(() => {
+    if (terminalOpen) setTerminalEverOpened(true);
+  }, [terminalOpen]);
   useEffect(() => {
     try {
       window.localStorage.setItem(TERMINAL_OPEN_STORAGE_KEY, terminalOpen ? "1" : "0");
@@ -1712,6 +1718,7 @@ export function AppShell() {
       addProjectOpen={addProjectOpen}
       setAddProjectOpen={setAddProjectOpen}
       usageVisible={providerUsageVisible}
+      sidebarOpen={sidebarOpen}
       settingsOpen={Boolean(settingsTab)}
       onOpenSettings={() => setSettingsTab((prev) => prev ? null : "general")}
       onOpenArchive={() => setArchiveBrowserOpen(true)}
@@ -2482,8 +2489,13 @@ export function AppShell() {
       </div>
       </div>
 
-      {terminalOpen && (
-        <>
+      <div
+        aria-hidden={!terminalOpen}
+        style={terminalOpen
+          ? { display: "contents" }
+          : { position: "fixed", width: 1024, height: TERMINAL_DEFAULT_HEIGHT, left: "-200vw", top: 0, visibility: "hidden", pointerEvents: "none" }}
+      >
+        {terminalOpen && (
           <div
             role="separator"
             aria-orientation="horizontal"
@@ -2501,15 +2513,17 @@ export function AppShell() {
             onMouseEnter={(e) => { e.currentTarget.style.background = "color-mix(in srgb, var(--accent) 35%, transparent)"; }}
             onMouseLeave={(e) => { if (!terminalResizing) e.currentTarget.style.background = "var(--border)"; }}
           />
-          <div style={{ height: terminalHeight, flexShrink: 0, minHeight: TERMINAL_MIN_HEIGHT, overflow: "hidden" }}>
+        )}
+        {terminalEverOpened && (
+          <div style={{ height: terminalOpen ? terminalHeight : TERMINAL_DEFAULT_HEIGHT, flexShrink: 0, minHeight: TERMINAL_MIN_HEIGHT, overflow: "hidden" }}>
             <TerminalTabs
               hostId={hostId}
               cwd={terminalCwd}
               onClose={() => setTerminalOpen(false)}
             />
           </div>
-        </>
-      )}
+        )}
+      </div>
       </div>
     </div>
     {!settingsTab && (
