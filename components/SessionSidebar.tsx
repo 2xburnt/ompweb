@@ -2311,16 +2311,6 @@ function ProjectRow({
           </button>
         )}
         <div style={{ flex: 1 }} />
-        <button
-          type="button"
-          className="sidebar-project-action"
-          onClick={(event) => { event.stopPropagation(); onNewSession(project.path); }}
-          aria-label={t("projects.newSessionHere", { name: label })}
-          title={t("projects.newSessionHere", { name: label })}
-          style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 24, height: 24, padding: 0, flexShrink: 0, border: "none", borderRadius: "var(--radius-control)", background: "transparent", color: hovered ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
-        >
-          <Plus size={14} strokeWidth={2} aria-hidden="true" />
-        </button>
         {hasActivity && (
           <span
             aria-label={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0 })}
@@ -2344,11 +2334,22 @@ function ProjectRow({
           </span>
         )}
         <div
+          className="sidebar-project-actions"
           style={{
             flexShrink: 0,
             visibility: showActions ? "visible" : "hidden",
           }}
         >
+          <button
+            type="button"
+            className="sidebar-project-action"
+            onClick={(event) => { event.stopPropagation(); onNewSession(project.path); }}
+            aria-label={t("projects.newSessionHere", { name: label })}
+            title={t("projects.newSessionHere", { name: label })}
+            style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 24, height: 24, padding: 0, flexShrink: 0, border: "none", borderRadius: "var(--radius-control)", background: "transparent", color: hovered ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
+          >
+            <Plus size={14} strokeWidth={2} aria-hidden="true" />
+          </button>
           <button
             type="button"
             ref={actionButtonRef}
