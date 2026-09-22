@@ -152,3 +152,46 @@ test("dependencies are only reinstalled when the lockfile moved", () => {
   assert.equal(store.dependenciesChanged({ repo: "/r", from: "a", to: "b", run }), false);
   assert.equal(store.dependenciesChanged({ repo: "/r", from: "dirty", to: "b", run }), true);
 });
+
+test("resolveTracking inherits the current release's branch, then defaults", () => {
+  // Explicit choice wins.
+  assert.deepEqual(
+    store.resolveTracking({ branch: "feature", metadata: { remote: "origin", branch: "main" } }),
+    { remote: "origin", branch: "feature" },
+  );
+  // No choice inherits from the live release — a plain deploy keeps following it.
+  assert.deepEqual(
+    store.resolveTracking({ metadata: { remote: "upstream", branch: "multi-machine" } }),
+    { remote: "upstream", branch: "multi-machine" },
+  );
+  // First-ever deploy (no release yet) falls back to origin/main.
+  assert.deepEqual(store.resolveTracking({}), { remote: "origin", branch: "main" });
+  assert.deepEqual(store.resolveTracking({ metadata: null }), { remote: "origin", branch: "main" });
+});
+
+test("setReleaseTracking retargets the live release without a rebuild", () => {
+  const root = scratch("ompweb-release-retarget-");
+  const dir = fakeRelease(root, "abc123", { remote: "origin", branch: "main" });
+  store.activateRelease({ root, releaseDir: dir });
+
+  const result = store.setReleaseTracking({ root, branch: "multi-machine" });
+  assert.deepEqual(result, { releaseDir: dir, remote: "origin", branch: "multi-machine" });
+  // Persisted, and the rest of the metadata (commit, build) is untouched.
+  const metadata = store.readReleaseMetadata(dir);
+  assert.equal(metadata.branch, "multi-machine");
+  assert.equal(metadata.remote, "origin");
+  assert.equal(metadata.commit, "abc123");
+
+  // remote alone, and both together.
+  assert.equal(store.setReleaseTracking({ root, remote: "upstream" }).remote, "upstream");
+  const both = store.setReleaseTracking({ root, remote: "origin", branch: "deploy" });
+  assert.deepEqual([both.remote, both.branch], ["origin", "deploy"]);
+});
+
+test("setReleaseTracking refuses when there is no release or no change", () => {
+  const root = scratch("ompweb-release-retarget-empty-");
+  assert.throws(() => store.setReleaseTracking({ root, branch: "x" }), /no release is active/);
+  const dir = fakeRelease(root, "abc123");
+  store.activateRelease({ root, releaseDir: dir });
+  assert.throws(() => store.setReleaseTracking({ root }), /nothing to change/);
+});

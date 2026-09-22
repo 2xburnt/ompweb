@@ -293,6 +293,37 @@ function npmCommand() {
   return fs.existsSync(sibling) ? sibling : "npm";
 }
 
+/**
+ * The remote and branch a deploy should record and track. An explicit choice
+ * wins; otherwise the current release's own tracking is inherited so a plain
+ * `ompweb-deploy` keeps following whatever the last deploy followed; only a
+ * first-ever deploy falls back to origin/main.
+ */
+function resolveTracking({ remote, branch, metadata } = {}) {
+  return {
+    remote: remote || (metadata && metadata.remote) || "origin",
+    branch: branch || (metadata && metadata.branch) || "main",
+  };
+}
+
+/**
+ * Retarget which ref a release follows, without a rebuild. Writes the current
+ * release's own metadata (the sanctioned alternative to hand-editing it), so
+ * the next update check and the next inheriting deploy both see the change.
+ */
+function setReleaseTracking({ root = resolveReleaseRoot(), releaseDir, remote, branch } = {}) {
+  const dir = releaseDir || currentReleaseDir(root);
+  if (!dir) throw new Error("no release is active");
+  const metadata = readReleaseMetadata(dir);
+  if (!metadata) throw new Error(`${dir} is not a release`);
+  if (remote === undefined && branch === undefined) throw new Error("nothing to change");
+  const next = { ...metadata };
+  if (remote !== undefined) next.remote = remote;
+  if (branch !== undefined) next.branch = branch;
+  writeReleaseMetadata(dir, next);
+  return { releaseDir: dir, remote: next.remote, branch: next.branch };
+}
+
 /** Resolve what should be deployed: the tip of the tracked ref after a fetch. */
 function resolveTarget({ repo, remote = "origin", branch = "main", ref = null, fetch = true, run = defaultRun }) {
   if (fetch) run("git", ["-C", repo, "fetch", "--quiet", remote, branch], { env: gitEnvironment(), timeout: 5 * 60 * 1000 });
@@ -317,6 +348,8 @@ module.exports = {
   releasePaths,
   resolveReleaseRoot,
   resolveTarget,
+  resolveTracking,
   rollbackRelease,
+  setReleaseTracking,
   writeReleaseMetadata,
 };

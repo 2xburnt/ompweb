@@ -26,6 +26,8 @@ const USAGE = `Usage: ompweb-deploy [options]
   --repo <path>       source repository (required for the first deploy)
   --remote <name>     remote to fetch (default: origin, or the live release's)
   --branch <name>     branch to track (default: the live release's, else main)
+  --set-branch <name> retarget the live release to this branch; no rebuild
+  --set-remote <name> retarget the live release to this remote; no rebuild
   --rollback          activate the previous release; no build, no git
   --list              list releases, newest first
   --status            show what is deployed
@@ -51,6 +53,8 @@ function parseArgs(argv) {
       case "--repo": options.repo = path.resolve(value()); break;
       case "--remote": options.remote = value(); break;
       case "--branch": options.branch = value(); break;
+      case "--set-branch": options.setBranch = value(); break;
+      case "--set-remote": options.setRemote = value(); break;
       case "--unit": options.unit = value(); break;
       case "--keep": options.keep = Number(value()); break;
       case "--rollback": options.rollback = true; break;
@@ -90,12 +94,8 @@ function resolveSource(root, options) {
   const repo = options.repo || (metadata && metadata.repo) || process.env.OMP_WEB_SOURCE_REPO;
   if (!repo) fail("no source repository known yet; pass --repo <path> for the first deploy");
   if (!fs.existsSync(repo)) fail(`source repository not found: ${repo}`);
-  return {
-    repo,
-    remote: options.remote || (metadata && metadata.remote) || "origin",
-    branch: options.branch || (metadata && metadata.branch) || "main",
-    metadata,
-  };
+  const { remote, branch } = store.resolveTracking({ remote: options.remote, branch: options.branch, metadata });
+  return { repo, remote, branch, metadata };
 }
 
 function describe(release) {
@@ -151,6 +151,17 @@ async function main() {
     const result = store.rollbackRelease({ root });
     log(`rolled back to ${result.activated}`);
     restart(options);
+    return;
+  }
+
+  if (options.setBranch !== undefined || options.setRemote !== undefined) {
+    let result;
+    try {
+      result = store.setReleaseTracking({ root, remote: options.setRemote, branch: options.setBranch });
+    } catch (error) {
+      fail(error instanceof Error ? error.message : String(error));
+    }
+    log(`tracking ${result.remote}/${result.branch}`);
     return;
   }
 
