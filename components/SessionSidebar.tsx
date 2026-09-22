@@ -24,7 +24,7 @@ import {
 import { clearLastOpenSession, setLastOpenSession, workspaceKeyOf } from "@/lib/workspace-memory";
 import { sortManagedProjects } from "@/lib/project-ordering";
 import { comparableProjectPath } from "@/lib/comparable-path";
-import { Archive, Check, ChevronDown, ChevronRight, FileUp, Folder, GitBranch, MoreHorizontal, Plus, RefreshCw, Search, Server, Settings2, SlidersHorizontal, Trash2 } from "lucide-react";
+import { Archive, Check, ChevronDown, ChevronRight, FileUp, Folder, GitBranch, GripVertical, MoreHorizontal, Plus, RefreshCw, Search, Server, Settings2, SlidersHorizontal, Trash2 } from "lucide-react";
 import { publishSessionsChanged } from "@/lib/session-change-bus";
 import { hostFetch, useHosts, worthAsking } from "@/lib/hosts/client";
 import { MachineSwitcher } from "./MachineSwitcher";
@@ -2151,8 +2151,6 @@ function ProjectRow({
     <section className="sidebar-project" data-active={isActive ? "true" : "false"} style={{ marginBottom: 12 }}>
       <div
         className="sidebar-project-header"
-        draggable={!aliasEditing}
-        onDragStart={(event) => { event.dataTransfer.setData("text/plain", project.path); event.dataTransfer.effectAllowed = "move"; onDragPathChange(project.path); }}
         onDragOver={(event) => { if (isDragTarget) { event.preventDefault(); event.dataTransfer.dropEffect = "move"; } }}
         onDrop={(event) => { event.preventDefault(); onDropProject(project.path); }}
         onDragEnd={() => onDragPathChange(null)}
@@ -2181,6 +2179,29 @@ function ProjectRow({
           ...(isDragTarget ? { outline: "1px solid var(--accent)", outlineOffset: -1 } : {}),
         }}
       >
+        <button
+          type="button"
+          className="sidebar-project-drag-handle"
+          draggable={!aliasEditing}
+          onDragStart={(event) => {
+            event.stopPropagation();
+            event.dataTransfer.setData("text/plain", project.path);
+            event.dataTransfer.effectAllowed = "move";
+            onDragPathChange(project.path);
+          }}
+          onDragEnd={() => onDragPathChange(null)}
+          onKeyDown={(event) => {
+            if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+            event.preventDefault();
+            event.stopPropagation();
+            void onMoveProject(project.path, event.key === "ArrowUp" ? -1 : 1);
+          }}
+          aria-label={t("projects.reorder", { name: label })}
+          title={t("projects.reorder", { name: label })}
+          style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 20, height: 24, padding: 0, flexShrink: 0, border: "none", borderRadius: "var(--radius-control)", background: "transparent", color: hovered || focusWithin ? "var(--text-dim)" : "var(--border-strong)", cursor: aliasEditing ? "default" : "grab", lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
+        >
+          <GripVertical size={14} strokeWidth={1.8} aria-hidden="true" />
+        </button>
         {aliasEditing ? (
           <div
             className="sidebar-project-identity"
@@ -2192,7 +2213,7 @@ function ProjectRow({
               display: "flex",
               alignItems: "center",
               gap: 7,
-              padding: "0 4px 0 10px",
+              padding: "0 4px 0 0",
             }}
           >
             <Folder
@@ -2247,7 +2268,7 @@ function ProjectRow({
               display: "flex",
               alignItems: "center",
               gap: 7,
-              padding: "0 4px 0 10px",
+              padding: "0 4px 0 0",
               background: "none", border: "none",
               color: hovered ? "var(--text)" : "var(--text-muted)",
               cursor: "pointer",
@@ -2375,12 +2396,6 @@ function ProjectRow({
             </button>
             <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { onEditLaunchConfig(project); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
               {project.launchConfig ? t("sessionSidebar.editLaunchConfig") : t("sessionSidebar.configureLaunchConfig")}
-            </button>
-            <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { setActionMenuOpen(false); void onMoveProject(project.path, -1); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
-              {t("projects.moveUp")}
-            </button>
-            <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { setActionMenuOpen(false); void onMoveProject(project.path, 1); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
-              {t("projects.moveDown")}
             </button>
             <button type="button" role="menuitem" className="sidebar-menu-item" disabled={removeBusy} onClick={() => { setActionMenuOpen(false); void onRemoveProject(project.path); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--status-error)", cursor: removeBusy ? "default" : "pointer", textAlign: "left", fontSize: 11 }}>
               {t("projects.remove", { name: label })}
