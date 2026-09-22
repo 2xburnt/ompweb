@@ -909,6 +909,7 @@
   "projects.moveDown": "下移",
   "projects.moveUp": "上移",
   "projects.nameAlias": "命名工作区",
+  "projects.reorder": "调整 {name} 的顺序。拖动或使用方向键。",
   "projects.reorderFailed": "更新工作区顺序失败",
   "projects.updateFailed": "更新工作区失败",
   "projectLaunchConfig.dialogLabel": "编辑工作区 OMP 启动配置",

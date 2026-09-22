@@ -2290,6 +2290,7 @@ function ProjectRow({
           ...(isDragTarget ? { outline: "1px solid var(--accent)", outlineOffset: -1 } : {}),
         }}
       >
+<<<<<<< HEAD
         {/* A drag handle must be a plain element, not a <button>: Firefox and
             WebKit refuse to start a native HTML5 drag from a form control even
             with draggable="true", so a <button> handle silently never drags
@@ -2299,6 +2300,10 @@ function ProjectRow({
         <span
           role="button"
           tabIndex={aliasEditing ? -1 : 0}
+=======
+        <button
+          type="button"
+>>>>>>> b5f8a59 (feat(sidebar): add workspace drag handles)
           className="sidebar-project-drag-handle"
           draggable={!aliasEditing}
           onDragStart={(event) => {
@@ -2319,7 +2324,11 @@ function ProjectRow({
           style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 20, height: 24, padding: 0, flexShrink: 0, border: "none", borderRadius: "var(--radius-control)", background: "transparent", color: hovered || focusWithin ? "var(--text-dim)" : "var(--border-strong)", cursor: aliasEditing ? "default" : "grab", lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
         >
           <GripVertical size={14} strokeWidth={1.8} aria-hidden="true" />
+<<<<<<< HEAD
         </span>
+=======
+        </button>
+>>>>>>> b5f8a59 (feat(sidebar): add workspace drag handles)
         {aliasEditing ? (
           <div
             className="sidebar-project-identity"
@@ -2515,9 +2524,12 @@ function ProjectRow({
             <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { onEditLaunchConfig(project); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
               {project.launchConfig ? t("sessionSidebar.editLaunchConfig") : t("sessionSidebar.configureLaunchConfig")}
             </button>
+<<<<<<< HEAD
             <button type="button" role="menuitem" className="sidebar-menu-item" disabled={sessionCount === 0 || archivingAll} onClick={() => { setActionMenuOpen(false); setConfirmArchiveAll(true); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: sessionCount === 0 ? "var(--text-dim)" : "var(--text)", cursor: sessionCount === 0 || archivingAll ? "default" : "pointer", textAlign: "left", fontSize: 11, opacity: sessionCount === 0 ? 0.55 : 1 }}>
               {t("projects.archiveAll")}
             </button>
+=======
+>>>>>>> b5f8a59 (feat(sidebar): add workspace drag handles)
             <button type="button" role="menuitem" className="sidebar-menu-item" disabled={removeBusy} onClick={() => { setActionMenuOpen(false); void onRemoveProject(project.path); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--status-error)", cursor: removeBusy ? "default" : "pointer", textAlign: "left", fontSize: 11 }}>
               {t("projects.remove", { name: label })}
             </button>

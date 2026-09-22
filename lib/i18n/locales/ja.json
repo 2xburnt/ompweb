@@ -909,6 +909,7 @@
   "projects.moveDown": "下へ移動",
   "projects.moveUp": "上へ移動",
   "projects.nameAlias": "ワークスペースに名前を付ける",
+  "projects.reorder": "{name} の順序を変更。ドラッグするか矢印キーを使用します。",
   "projects.reorderFailed": "ワークスペースの並び順を更新できませんでした",
   "projects.updateFailed": "ワークスペースを更新できませんでした",
   "projectLaunchConfig.dialogLabel": "ワークスペースのOMP起動設定を編集",

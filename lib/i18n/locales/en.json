@@ -935,6 +935,7 @@
   "projects.moveDown": "Move down",
   "projects.moveUp": "Move up",
   "projects.nameAlias": "Name workspace",
+  "projects.reorder": "Reorder {name}. Drag, or use the arrow keys.",
   "projects.reorderFailed": "Failed to update workspace order",
   "projects.updateFailed": "Failed to update workspace",
   "projectLaunchConfig.dialogLabel": "Edit workspace OMP launch configuration",
