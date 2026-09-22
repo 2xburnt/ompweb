@@ -156,7 +156,8 @@ test("dirty second Back cancels without losing content and Leave exits without a
   const world = browserHistory();
   const shell = await mount();
   try {
-    await act(() => setDraft(draftKey, { value: "keep my draft", images: [], files: [] }));
+    // An attachment keeps the unload guard armed; text alone is restored.
+    await act(() => setDraft(draftKey, { value: "keep my draft", images: [{ data: "AA==", mimeType: "image/png" }], files: [] }));
     world.window.history.back();
     await world.flush();
     assert.equal(shell.api.sidebarOpen, true);
@@ -290,7 +291,9 @@ test("wide layouts keep a collapsed sidebar unchanged while protecting drafts on
     assert.equal(shell.api.sidebarOpen, false);
     await act(() => shell.api.cancelExit());
     assert.equal(getDraft(draftKey)?.value, "desktop draft");
-    assert.equal(world.fire("beforeunload").defaultPrevented, true);
+    // Text comes back from sessionStorage, so the browser's own prompt would
+    // only tax every reload; the in-app dialog above is the guard that matters.
+    assert.equal(world.fire("beforeunload").defaultPrevented, false);
     await act(() => clearDraft(draftKey));
     await world.flush();
     world.window.history.back();

@@ -56,6 +56,15 @@ export function hasUnsentDrafts(): boolean {
   return drafts.size > 0;
 }
 
+// Draft text is restored from sessionStorage after a reload, so only
+// attachments are actually lost when the document goes away.
+export function hasUnrestorableDrafts(): boolean {
+  for (const draft of drafts.values()) {
+    if (draft.images.length > 0 || draft.files.length > 0) return true;
+  }
+  return false;
+}
+
 export function subscribeDrafts(listener: () => void): () => void {
   listeners.add(listener);
   return () => { listeners.delete(listener); };

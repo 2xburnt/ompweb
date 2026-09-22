@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
-import { hasUnsentDrafts, subscribeDrafts } from "@/lib/draft-store";
+import { hasUnrestorableDrafts, hasUnsentDrafts, subscribeDrafts } from "@/lib/draft-store";
 
 const HISTORY_KEY = "__ompSidebarHistory";
 type SidebarEntry = {
@@ -162,9 +162,11 @@ export function useSidebarHistory({ active, ready, sidebarOpen, setSidebarOpen, 
   useEffect(() => {
     if (!dirty) return;
     const onBeforeUnload = (event: BeforeUnloadEvent) => {
-      if (leaveAllowed.current || !hasUnsentDrafts()) return;
+      // Reload is the common unload here and a text draft survives it, so a
+      // prompt for one is pure noise. Only attachments cannot be restored.
+      if (leaveAllowed.current || !hasUnrestorableDrafts()) return;
       event.preventDefault();
-      event.returnValue = "You have unsent drafts.";
+      event.returnValue = "You have unsent attachments.";
     };
     window.addEventListener("beforeunload", onBeforeUnload);
     return () => window.removeEventListener("beforeunload", onBeforeUnload);
