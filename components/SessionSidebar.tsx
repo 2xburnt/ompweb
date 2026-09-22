@@ -132,6 +132,32 @@ function projectLabel(projectPath: string): string {
   return index >= 0 ? trimmed.slice(index + 1) : trimmed;
 }
 
+/** Shortest trailing path that distinguishes every unaliased project label. */
+function distinguishingProjectLabels(projects: readonly ManagedProject[]): Map<string, string> {
+  const result = new Map<string, string>();
+  const byBasename = new Map<string, ManagedProject[]>();
+  for (const project of projects) {
+    if (project.alias) continue;
+    const label = projectLabel(project.path);
+    const siblings = byBasename.get(label) ?? [];
+    siblings.push(project);
+    byBasename.set(label, siblings);
+  }
+  for (const [label, siblings] of byBasename) {
+    if (siblings.length === 1) {
+      result.set(siblings[0].path, label);
+      continue;
+    }
+    const segments = siblings.map(({ path }) => path.replace(/[\\/]+$/, "").split(/[\\/]+/).filter(Boolean));
+    for (let index = 0; index < siblings.length; index += 1) {
+      let depth = 2;
+      while (depth < segments[index].length && siblings.some((_, other) => other !== index && segments[other].slice(-depth).join("/") === segments[index].slice(-depth).join("/"))) depth += 1;
+      result.set(siblings[index].path, segments[index].slice(-depth).join("/"));
+    }
+  }
+  return result;
+}
+
 /**
  * Path label that ellipsizes on the LEFT, keeping the (most relevant) trailing
  * segments visible: "…orkspace/pi-web". Shows as much of the path as fits
@@ -1188,6 +1214,13 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     return result;
   }, [machineGroups, runningOnly, deferredSearchQuery, runningSessionIds, filtersActive]);
   const hasVisibleProject = visibleMachineEntries.some((group) => group.entries.length > 0);
+  const projectLabelsByHost = useMemo(() => {
+    const result = new Map<string, Map<string, string>>();
+    for (const group of visibleMachineEntries) {
+      result.set(group.hostId, distinguishingProjectLabels(group.entries.map(({ project }) => project)));
+    }
+    return result;
+  }, [visibleMachineEntries]);
 
   const treesByProject = useMemo(() => {
     const m = new Map<string, ReturnType<typeof buildSessionTree>>();
@@ -1950,6 +1983,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                     <ProjectRow
                       key={key}
                       project={project}
+                      displayName={projectLabelsByHost.get(group.hostId)?.get(project.path)}
                       isActive={isActive}
                       activity={projectActivity.get(key)}
                       tree={tree}
@@ -2065,6 +2099,7 @@ interface ProjectRowProps {
   onRenamed?: () => void;
   onSessionDeleted?: (id: string) => void;
   activeWorktreeSwitcher?: ReactNode;
+  displayName?: string;
   /** Active worktree/branch label shown inline beside the workspace name. */
   worktreeBranch?: string | null;
   worktreeToggleRef?: RefObject<HTMLButtonElement | null>;
@@ -2081,6 +2116,7 @@ interface ProjectRowProps {
  *  show-more toggle) nested under it when expanded. */
 function ProjectRow({
   project,
+  displayName,
   isActive,
   isExpanded,
   activity,
@@ -2139,7 +2175,7 @@ function ProjectRow({
     if (alias === (project.alias ?? "")) return;
     void onUpdatePresentation(project.path, { alias });
   }, [aliasValue, project.alias, project.path, onUpdatePresentation]);
-  const label = project.alias ?? projectLabel(project.path);
+  const label = project.alias ?? displayName ?? projectLabel(project.path);
   const displayLabel = machineLabel ? `${machineLabel}:${label}` : label;
   const hasActivity = Boolean(activity && (activity.running > 0 || activity.unread > 0));
   const visibleRoots = hiddenCount > 0 && !showAllSessions
