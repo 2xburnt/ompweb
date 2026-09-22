@@ -129,6 +129,35 @@ export type {
 } from "./useAgentSession-stream";
 export type { QueuedMessages } from "./useAgentSession-queue";
 export type { NoticeItem, NoticeType } from "./useAgentSession-notices";
+type CachedSessionView = {
+  data: SessionData;
+  messages: AgentMessage[];
+  entryIds: string[];
+  activeLeafId: string | null;
+  showPreCompactionHistory: boolean;
+};
+
+const SESSION_VIEW_CACHE_LIMIT = 8;
+const sessionViewCache = new Map<string, CachedSessionView>();
+
+function readCachedSessionView(sessionId: string | undefined): CachedSessionView | null {
+  if (!sessionId) return null;
+  const cached = sessionViewCache.get(sessionId);
+  if (!cached) return null;
+  sessionViewCache.delete(sessionId);
+  sessionViewCache.set(sessionId, cached);
+  return cached;
+}
+
+function writeCachedSessionView(sessionId: string, view: CachedSessionView): void {
+  sessionViewCache.delete(sessionId);
+  sessionViewCache.set(sessionId, view);
+  while (sessionViewCache.size > SESSION_VIEW_CACHE_LIMIT) {
+    const oldest = sessionViewCache.keys().next().value;
+    if (oldest === undefined) break;
+    sessionViewCache.delete(oldest);
+  }
+}
 
 /** Read the error carried by OMP's assistant/error frames without rendering
  * arbitrary payloads as [object Object]. OMP normally puts provider failures
@@ -189,16 +218,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   } = opts;
   const reducedMotion = usePrefersReducedMotion();
   const isNew = session === null && newSessionCwd !== null;
+  const [cachedView] = useState(() => readCachedSessionView(session?.id));
 
-  const [data, setData] = useState<SessionData | null>(null);
-  const [loading, setLoading] = useState(!isNew);
+  const [data, setData] = useState<SessionData | null>(cachedView?.data ?? null);
+  const [loading, setLoading] = useState(!isNew && cachedView === null);
   const [error, setError] = useState<string | null>(null);
-  const [activeLeafId, setActiveLeafId] = useState<string | null>(null);
-  const [confirmedMessages, setMessages] = useState<AgentMessage[]>([]);
+  const [activeLeafId, setActiveLeafId] = useState<string | null>(cachedView?.activeLeafId ?? null);
+  const [confirmedMessages, setMessages] = useState<AgentMessage[]>(cachedView?.messages ?? []);
   const [optimisticUserMessage, setOptimisticUserMessage] = useState<AgentMessage | null>(null);
   const messages = useMemo(() => optimisticUserMessage ? [...confirmedMessages, optimisticUserMessage] : confirmedMessages, [confirmedMessages, optimisticUserMessage]);
-  const [entryIds, setEntryIds] = useState<string[]>([]);
-  const [showPreCompactionHistory, setShowPreCompactionHistory] = useState(false);
+  const [entryIds, setEntryIds] = useState<string[]>(cachedView?.entryIds ?? []);
+  const [showPreCompactionHistory, setShowPreCompactionHistory] = useState(cachedView?.showPreCompactionHistory ?? false);
   const [streamState, dispatch] = useReducer(streamReducer, { isStreaming: false, streamingMessage: null });
   // Latest streaming snapshot for event handlers that must not close over a
   // stale streamState (quota error stamping onto the live assistant bubble).
@@ -716,13 +746,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [applyAuthoritativeModel, beginAuthoritativeModelSync]);
 
-  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, fenceRunId?: number) => {
+  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, fenceRunId?: number, initialHydration = false) => {
     const requestSeq = ++contextRequestSeqRef.current;
     catchUp.invalidate();
     const requestRun = promptRunIdRef.current;
     const position = catchUp.position();
     const metadataVersion = authoritativeModelSeqRef.current;
     let messagesLoaded = false;
+    if (initialHydration) initialHydrationPendingRef.current = true;
     try {
       if (showLoading) setLoading(true);
       const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
@@ -774,9 +805,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         return { context: d.context, agentState: null };
       }
 
-      // Track initial hydration so prompt submission waits for the live state.
-      const isInitialHydration = showLoading && includeState;
-      if (isInitialHydration) initialHydrationPendingRef.current = true;
+      // Cached transcripts stay interactive-looking while state refreshes, but
+      // prompt submission must still wait for the authoritative running/model state.
 
       try {
         // State was folded into the transcript response (?includeState=1). If
@@ -827,8 +857,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         console.error("Failed to load agent state:", e);
         if (showLoading) setLoading(false);
         return { context: d.context, agentState: null };
-      } finally {
-        if (isInitialHydration) initialHydrationPendingRef.current = false;
       }
     } catch (e) {
       // loadSession runs fire-and-forget as a background reconciler (file
@@ -837,12 +865,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       // screen — only surface it when the user is actively waiting.
       if (showLoading) setError(String(e));
       else console.warn("Background loadSession failed:", e);
-      if (showLoading && includeState) initialHydrationPendingRef.current = false;
       return null;
     } finally {
       if (showLoading && !messagesLoaded) setLoading(false);
-      // Ensure the flag is cleared even if the pre-state early-return path was taken
-      if (showLoading && includeState && !messagesLoaded) initialHydrationPendingRef.current = false;
+      if (initialHydration) initialHydrationPendingRef.current = false;
     }
   }, [catchUp, refreshSubagentHistory, applyAuthoritativeModel, beginAuthoritativeModelSync]);
 
@@ -3255,6 +3281,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     // a run (queued follow-up, steering reply) would never auto-scroll.
     completionScrollAllowedRef.current = end.getBoundingClientRect().bottom - container.getBoundingClientRect().bottom <= 24;
   }, []);
+  useEffect(() => {
+    if (!session || !data) return;
+    writeCachedSessionView(session.id, {
+      data,
+      messages: confirmedMessages,
+      entryIds,
+      activeLeafId,
+      showPreCompactionHistory,
+    });
+  }, [session, data, confirmedMessages, entryIds, activeLeafId, showPreCompactionHistory]);
 
   // Load session on mount
   // React StrictMode re-invokes this effect for the freshly mounted keyed
@@ -3275,7 +3311,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       lastQuotaErrorRef.current = null;
       lastRunErrorRef.current = null;
       catchUp.select({ leafId: null, includePreCompaction: false });
-      loadSession(session.id, true, true).then((loaded) => {
+      loadSession(session.id, cachedView === null, true, undefined, true).then((loaded) => {
         if (!hookAliveRef.current || sessionIdRef.current !== session.id) return;
         const agentState = loaded?.agentState;
         if (agentState?.running && !eventSourceRef.current) {
