@@ -704,7 +704,6 @@ export function SettingsConfig({ activeTab, toolCallsDefaultCollapsed, onToolCal
     minHeight: 0,
     display: "flex" as const,
     flexDirection: "column" as const,
-    overflowY: "auto" as const,
     background: "var(--bg)" as const,
     opacity: isPending ? 0.92 : 1,
     transition: isPending ? "opacity 80ms ease-out" : "opacity 120ms ease-out",

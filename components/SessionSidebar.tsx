@@ -27,7 +27,7 @@ import { comparableProjectPath } from "@/lib/comparable-path";
 import { Archive, Check, ChevronDown, ChevronRight, FileUp, Folder, GitBranch, GripVertical, MoreHorizontal, Plus, RefreshCw, Search, Server, Settings2, SlidersHorizontal, Trash2 } from "lucide-react";
 import { publishSessionsChanged } from "@/lib/session-change-bus";
 import { hostFetch, useHosts, worthAsking } from "@/lib/hosts/client";
-import { groupSessionsByMachine, projectActivityByKey, projectExpansionKey, sessionHostId, sessionProjectPath, type MachineGroup } from "./machine-groups";
+import { collapsedActivity, groupSessionsByMachine, machineActivityByHost, projectActivityByKey, projectExpansionKey, sessionHostId, sessionProjectPath, type MachineGroup } from "./machine-groups";
 
 const SESSIONS_FETCH_TIMEOUT_MS = 15_000;
 
@@ -148,6 +148,32 @@ function projectLabel(projectPath: string): string {
   const trimmed = projectPath.replace(/[\\/]+$/, "");
   const index = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
   return index >= 0 ? trimmed.slice(index + 1) : trimmed;
+}
+
+/** Shortest trailing path that distinguishes every unaliased project label. */
+function distinguishingProjectLabels(projects: readonly ManagedProject[]): Map<string, string> {
+  const result = new Map<string, string>();
+  const byBasename = new Map<string, ManagedProject[]>();
+  for (const project of projects) {
+    if (project.alias) continue;
+    const label = projectLabel(project.path);
+    const siblings = byBasename.get(label) ?? [];
+    siblings.push(project);
+    byBasename.set(label, siblings);
+  }
+  for (const [label, siblings] of byBasename) {
+    if (siblings.length === 1) {
+      result.set(siblings[0].path, label);
+      continue;
+    }
+    const segments = siblings.map(({ path }) => path.replace(/[\\/]+$/, "").split(/[\\/]+/).filter(Boolean));
+    for (let index = 0; index < siblings.length; index += 1) {
+      let depth = 2;
+      while (depth < segments[index].length && siblings.some((_, other) => other !== index && segments[other].slice(-depth).join("/") === segments[index].slice(-depth).join("/"))) depth += 1;
+      result.set(siblings[index].path, segments[index].slice(-depth).join("/"));
+    }
+  }
+  return result;
 }
 
 /**
@@ -1194,6 +1220,10 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     () => projectActivityByKey(machineGroups, runningSessionIds, unreadSessionIds),
     [machineGroups, runningSessionIds, unreadSessionIds],
   );
+  const machineActivity = useMemo(
+    () => machineActivityByHost(machineGroups, projectActivity),
+    [machineGroups, projectActivity],
+  );
 
   // Client-side filtering (Workspaces header: search + "running only").
   // While a filter is active, workspaces with no matching sessions are hidden
@@ -1230,6 +1260,13 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     return result;
   }, [machineGroups, runningOnly, deferredSearchQuery, runningSessionIds, filtersActive]);
   const hasVisibleProject = visibleMachineEntries.some((group) => group.entries.length > 0);
+  const projectLabelsByHost = useMemo(() => {
+    const result = new Map<string, Map<string, string>>();
+    for (const group of visibleMachineEntries) {
+      result.set(group.hostId, distinguishingProjectLabels(group.entries.map(({ project }) => project)));
+    }
+    return result;
+  }, [visibleMachineEntries]);
 
   const treesByProject = useMemo(() => {
     const m = new Map<string, ReturnType<typeof buildSessionTree>>();
@@ -1972,6 +2009,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             // collapsed until the user has made an explicit choice.
             const defaultExpanded = isCurrentMachine;
             const isExpanded = hostFilterActive || (expandedHosts[group.hostId] ?? defaultExpanded);
+            const activity = collapsedActivity(isExpanded, machineActivity.get(group.hostId));
             return (
               <div key={group.hostId} className="sidebar-machine" data-current={isCurrentMachine ? "true" : "false"}>
                 {multiHost && (
@@ -2000,7 +2038,21 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                   <Server size={14} />
                   <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     {machineName}
-                  </span></button>
+                  </span>
+                  {activity && (
+                    <span
+                      aria-label={t("projects.activity", { running: activity.running, unread: activity.unread })}
+                      title={t("projects.activity", { running: activity.running, unread: activity.unread })}
+                      className="sidebar-project-activity"
+                      data-running={activity.running > 0 ? "true" : "false"}
+                      role="status"
+                      aria-live="polite"
+                      style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 11, height: 11, marginLeft: "auto", flexShrink: 0, lineHeight: 0 }}
+                    >
+                      <span aria-hidden="true" className="sidebar-project-activity-dot" style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--accent)" }} />
+                    </span>
+                  )}
+                </button>
                 )}
                 {isExpanded && (
                   <div style={multiHost ? { paddingLeft: 16 } : undefined}>
@@ -2023,6 +2075,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                     <ProjectRow
                       key={key}
                       project={project}
+                      displayName={projectLabelsByHost.get(group.hostId)?.get(project.path)}
                       isActive={isActive}
                       activity={projectActivity.get(key)}
                       tree={tree}
@@ -2140,6 +2193,7 @@ interface ProjectRowProps {
   onRenamed?: () => void;
   onSessionDeleted?: (id: string) => void;
   activeWorktreeSwitcher?: ReactNode;
+  displayName?: string;
   /** Active worktree/branch label shown inline beside the workspace name. */
   worktreeBranch?: string | null;
   worktreeToggleRef?: RefObject<HTMLButtonElement | null>;
@@ -2156,6 +2210,7 @@ interface ProjectRowProps {
  *  show-more toggle) nested under it when expanded. */
 function ProjectRow({
   project,
+  displayName,
   isActive,
   isExpanded,
   activity,
@@ -2250,9 +2305,9 @@ function ProjectRow({
     if (alias === (project.alias ?? "")) return;
     void onUpdatePresentation(project.path, { alias });
   }, [aliasValue, project.alias, project.path, onUpdatePresentation]);
-  const label = project.alias ?? projectLabel(project.path);
+  const label = project.alias ?? displayName ?? projectLabel(project.path);
   const displayLabel = machineLabel ? `${machineLabel}:${label}` : label;
-  const hasActivity = Boolean(activity && (activity.running > 0 || activity.unread > 0));
+  const hasActivity = Boolean(collapsedActivity(isExpanded, activity));
   const visibleRoots = hiddenCount > 0 && !showAllSessions
     ? tree.slice(0, MAX_PROJECT_SESSIONS)
     : tree;
@@ -2290,7 +2345,6 @@ function ProjectRow({
           ...(isDragTarget ? { outline: "1px solid var(--accent)", outlineOffset: -1 } : {}),
         }}
       >
-<<<<<<< HEAD
         {/* A drag handle must be a plain element, not a <button>: Firefox and
             WebKit refuse to start a native HTML5 drag from a form control even
             with draggable="true", so a <button> handle silently never drags
@@ -2300,10 +2354,6 @@ function ProjectRow({
         <span
           role="button"
           tabIndex={aliasEditing ? -1 : 0}
-=======
-        <button
-          type="button"
->>>>>>> b5f8a59 (feat(sidebar): add workspace drag handles)
           className="sidebar-project-drag-handle"
           draggable={!aliasEditing}
           onDragStart={(event) => {
@@ -2324,11 +2374,7 @@ function ProjectRow({
           style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 20, height: 24, padding: 0, flexShrink: 0, border: "none", borderRadius: "var(--radius-control)", background: "transparent", color: hovered || focusWithin ? "var(--text-dim)" : "var(--border-strong)", cursor: aliasEditing ? "default" : "grab", lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
         >
           <GripVertical size={14} strokeWidth={1.8} aria-hidden="true" />
-<<<<<<< HEAD
         </span>
-=======
-        </button>
->>>>>>> b5f8a59 (feat(sidebar): add workspace drag handles)
         {aliasEditing ? (
           <div
             className="sidebar-project-identity"
@@ -2459,16 +2505,6 @@ function ProjectRow({
           </button>
         )}
         <div style={{ flex: 1 }} />
-        <button
-          type="button"
-          className="sidebar-project-action"
-          onClick={(event) => { event.stopPropagation(); onNewSession(project.path); }}
-          aria-label={t("projects.newSessionHere", { name: label })}
-          title={t("projects.newSessionHere", { name: label })}
-          style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 24, height: 24, padding: 0, flexShrink: 0, border: "none", borderRadius: "var(--radius-control)", background: "transparent", color: hovered ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
-        >
-          <Plus size={14} strokeWidth={2} aria-hidden="true" />
-        </button>
         {hasActivity && (
           <span
             aria-label={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0 })}
@@ -2491,12 +2527,18 @@ function ProjectRow({
             />
           </span>
         )}
-        <div
-          style={{
-            flexShrink: 0,
-            visibility: showActions ? "visible" : "hidden",
-          }}
-        >
+        <div className="sidebar-project-actions" style={{ flexShrink: 0 }}>
+          <button
+            type="button"
+            className="sidebar-project-action"
+            onClick={(event) => { event.stopPropagation(); onNewSession(project.path); }}
+            aria-label={t("projects.newSessionHere", { name: label })}
+            title={t("projects.newSessionHere", { name: label })}
+            style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 24, height: 24, padding: 0, flexShrink: 0, border: "none", borderRadius: "var(--radius-control)", background: "transparent", color: hovered ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
+          >
+            <Plus size={14} strokeWidth={2} aria-hidden="true" />
+          </button>
+          <div style={{ visibility: showActions ? "visible" : "hidden" }}>
           <button
             type="button"
             ref={actionButtonRef}
@@ -2524,16 +2566,14 @@ function ProjectRow({
             <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { onEditLaunchConfig(project); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
               {project.launchConfig ? t("sessionSidebar.editLaunchConfig") : t("sessionSidebar.configureLaunchConfig")}
             </button>
-<<<<<<< HEAD
             <button type="button" role="menuitem" className="sidebar-menu-item" disabled={sessionCount === 0 || archivingAll} onClick={() => { setActionMenuOpen(false); setConfirmArchiveAll(true); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: sessionCount === 0 ? "var(--text-dim)" : "var(--text)", cursor: sessionCount === 0 || archivingAll ? "default" : "pointer", textAlign: "left", fontSize: 11, opacity: sessionCount === 0 ? 0.55 : 1 }}>
               {t("projects.archiveAll")}
             </button>
-=======
->>>>>>> b5f8a59 (feat(sidebar): add workspace drag handles)
             <button type="button" role="menuitem" className="sidebar-menu-item" disabled={removeBusy} onClick={() => { setActionMenuOpen(false); void onRemoveProject(project.path); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--status-error)", cursor: removeBusy ? "default" : "pointer", textAlign: "left", fontSize: 11 }}>
               {t("projects.remove", { name: label })}
             </button>
           </SidebarPortalMenu>
+          </div>
         </div>
         <button
           className="sidebar-project-toggle"
@@ -3081,7 +3121,6 @@ const SessionItem = memo(function SessionItem({
   collapsed = false,
   relativeTimeNow,
   onToggleCollapse,
-  machineLabel,
 }: {
   session: SessionInfo;
   isSelected: boolean;

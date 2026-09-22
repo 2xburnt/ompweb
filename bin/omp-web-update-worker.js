@@ -37,6 +37,8 @@ const supervisor = arg("--supervisor") === "systemd" ? "systemd" : "none";
 const serviceUnit = arg("--service-unit") || "";
 const gitRemote = arg("--remote") || "origin";
 const gitBranch = arg("--branch") || "main";
+const targetCommit = arg("--target-commit");
+const sourceRepo = arg("--source-repo");
 const applyMode = arg("--apply-mode") === "auto" ? "auto" : "ask";
 let descriptor;
 let managerPrefix;

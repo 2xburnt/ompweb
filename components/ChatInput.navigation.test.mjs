@@ -36,7 +36,7 @@ function Guard() {
   return null;
 }
 
-test("no-key composer text survives minimization and warns on document exit until sent", async () => {
+test("no-key composer text survives minimization and reload without warning until sent", async () => {
   const user = userEvent.setup();
   const sent = [];
   function Shell({ minimized = false }) {
@@ -49,9 +49,9 @@ test("no-key composer text survives minimization and warns on document exit unti
   const { rerender } = render(React.createElement(Shell));
   assert.equal(warnsOnExit(), false);
   await user.type(screen.getByRole("textbox"), "unsent in a new composer");
-  assert.equal(warnsOnExit(), true);
+  assert.equal(warnsOnExit(), false);
   rerender(React.createElement(Shell, { minimized: true }));
-  assert.equal(warnsOnExit(), true);
+  assert.equal(warnsOnExit(), false);
   assert.equal(screen.getByRole("textbox", { hidden: true }).value, "unsent in a new composer");
   rerender(React.createElement(Shell));
   await user.click(screen.getByRole("textbox"));

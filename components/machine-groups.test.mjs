@@ -4,8 +4,10 @@ import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url, { tsconfigPaths: true });
 const {
+  collapsedActivity,
   groupSessionsByMachine,
   hostStatusColor,
+  machineActivityByHost,
   projectActivityByKey,
   projectExpansionKey,
   sessionProjectPath,
@@ -114,6 +116,35 @@ test("projectActivityByKey counts running and unread sessions per bucket", () =>
   const activity = projectActivityByKey(groups, new Set(["a"]), new Set(["b", "c"]));
   assert.deepEqual(activity.get(projectExpansionKey("local", "/p")), { running: 1, unread: 1 });
   assert.deepEqual(activity.get(projectExpansionKey("local", "/q")), { running: 0, unread: 1 });
+});
+test("machineActivityByHost sums projects and omits inactive machines", () => {
+  const groups = groupSessionsByMachine({
+    hosts: [host("local"), host("box"), host("idle")],
+    projectsByHost: {
+      local: [{ path: "/a" }, { path: "/b" }],
+      box: [{ path: "/c" }],
+      idle: [{ path: "/d" }],
+    },
+    sessions: [
+      session("a", "local", "/a"),
+      session("b", "local", "/b"),
+      session("c", "box", "/c"),
+    ],
+    fallbackHostId: "local",
+  });
+  const projects = projectActivityByKey(groups, new Set(["a", "c"]), new Set(["b", "c"]));
+  const machines = machineActivityByHost(groups, projects);
+
+  assert.deepEqual(machines.get("local"), { running: 1, unread: 1 });
+  assert.deepEqual(machines.get("box"), { running: 1, unread: 1 });
+  assert.equal(machines.has("idle"), false);
+});
+
+test("collapsedActivity exposes parent state only while children are hidden", () => {
+  const activity = { running: 1, unread: 2 };
+  assert.equal(collapsedActivity(true, activity), undefined);
+  assert.equal(collapsedActivity(false, undefined), undefined);
+  assert.equal(collapsedActivity(false, activity), activity);
 });
 
 test("hostStatusColor maps states to design tokens", () => {
