@@ -1580,6 +1580,7 @@ pre, code {
 }
 
 .sidebar-project-header > button:focus-visible,
+.sidebar-project-drag-handle:focus-visible,
 .sidebar-project-identity:focus-visible,
 .sidebar-project-action:focus-visible,
 .sidebar-new-session:focus-visible,

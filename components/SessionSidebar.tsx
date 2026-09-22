@@ -2261,8 +2261,15 @@ function ProjectRow({
           ...(isDragTarget ? { outline: "1px solid var(--accent)", outlineOffset: -1 } : {}),
         }}
       >
-        <button
-          type="button"
+        {/* A drag handle must be a plain element, not a <button>: Firefox and
+            WebKit refuse to start a native HTML5 drag from a form control even
+            with draggable="true", so a <button> handle silently never drags
+            (Chromium is the exception, which is why it looked fine there). A
+            span with role="button" keeps the keyboard/AT affordance while
+            actually being draggable everywhere. */}
+        <span
+          role="button"
+          tabIndex={aliasEditing ? -1 : 0}
           className="sidebar-project-drag-handle"
           draggable={!aliasEditing}
           onDragStart={(event) => {
@@ -2283,7 +2290,7 @@ function ProjectRow({
           style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 20, height: 24, padding: 0, flexShrink: 0, border: "none", borderRadius: "var(--radius-control)", background: "transparent", color: hovered || focusWithin ? "var(--text-dim)" : "var(--border-strong)", cursor: aliasEditing ? "default" : "grab", lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
         >
           <GripVertical size={14} strokeWidth={1.8} aria-hidden="true" />
-        </button>
+        </span>
         {aliasEditing ? (
           <div
             className="sidebar-project-identity"
