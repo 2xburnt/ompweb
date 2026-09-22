@@ -73,7 +73,12 @@ export const GET = withHostRoute(async () => {
     // have no sessions (the in-memory list does not survive restarts, and an
     // empty managed project derives no root from sessions).
     for (const project of projects) allowFileRoot(project.path, host);
-    return NextResponse.json({ projects: projects.map((project) => withProjectKey(host, project)), host: host.id });
+    // Hidden project paths travel to the client too: a hidden project is
+    // dropped from `projects`, but its leftover sessions still appear in the
+    // session list, and without knowing the path is hidden the sidebar would
+    // resurrect it as a phantom "same-name" bucket.
+    const hidden = registry.projects.filter((project) => project.hidden).map((project) => project.path);
+    return NextResponse.json({ projects: projects.map((project) => withProjectKey(host, project)), host: host.id, hidden });
   } catch (error) {
     return apiErrorResponse(error);
   }

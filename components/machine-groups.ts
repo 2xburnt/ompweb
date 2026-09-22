@@ -65,6 +65,9 @@ export interface GroupSessionsByMachineInput {
   hosts: readonly HostSummary[];
   /** Managed projects per machine, already in display order. */
   projectsByHost: Readonly<Record<string, readonly ManagedProject[]>>;
+  /** Hidden project paths per machine. A session whose project is hidden is
+   *  dropped rather than resurrected as a synthetic bucket. */
+  hiddenPathsByHost?: Readonly<Record<string, readonly string[]>>;
   sessions: readonly SessionInfo[];
   /** Host assumed for sessions without a `host` tag. */
   fallbackHostId: string | null;
@@ -76,10 +79,17 @@ export interface GroupSessionsByMachineInput {
  *  machine's list get a synthetic project row (path = projectRoot) instead of
  *  disappearing — the project list for a remote may still be loading. */
 export function groupSessionsByMachine(input: GroupSessionsByMachineInput): MachineGroup[] {
-  const { hosts, projectsByHost, sessions, fallbackHostId } = input;
+  const { hosts, projectsByHost, hiddenPathsByHost, sessions, fallbackHostId } = input;
   const groups = new Map<string, MachineGroup>();
   const bucketByKey = new Map<string, MachineProjectGroup>();
   const hostById = new Map(hosts.map((host) => [host.id, host] as const));
+  // Hidden project paths folded to their expansion keys, keyed by host, so a
+  // session under a removed project is skipped instead of spawning a phantom
+  // bucket that shares a display name with a still-visible project.
+  const hiddenKeysByHost = new Map<string, Set<string>>();
+  for (const [host, paths] of Object.entries(hiddenPathsByHost ?? {})) {
+    hiddenKeysByHost.set(host, new Set(paths.map((path) => projectExpansionKey(host, path))));
+  }
 
   const ensureGroup = (hostId: string): MachineGroup => {
     let group = groups.get(hostId);
@@ -108,6 +118,11 @@ export function groupSessionsByMachine(input: GroupSessionsByMachineInput): Mach
     const path = sessionProjectPath(session);
     if (!path) continue;
     const key = projectExpansionKey(hostId, path);
+    // A hidden project keeps no bucket, so its leftover sessions would fall
+    // through to the synthetic branch below and reappear. Drop them: the
+    // project was explicitly removed from the sidebar. A session that matches
+    // an existing (visible) bucket is unaffected.
+    if (!bucketByKey.has(key) && hiddenKeysByHost.get(hostId)?.has(key)) continue;
     let bucket = bucketByKey.get(key);
     if (!bucket) {
       bucket = { project: { path: session.projectRoot ?? session.cwd ?? path }, sessions: [], key };

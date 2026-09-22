@@ -401,6 +401,9 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   // Managed + session-discovered projects per machine (server-merged, hidden
   // excluded). `projects` is the selected machine's list.
   const [projectsByHost, setProjectsByHost] = useState<Record<string, ManagedProject[]>>({});
+  // Hidden project paths per host (see /api/projects) — sessions under a hidden
+  // project are dropped from the sidebar rather than shown as a phantom bucket.
+  const [hiddenPathsByHost, setHiddenPathsByHost] = useState<Record<string, string[]>>({});
   const projects = hostId ? projectsByHost[hostId] ?? EMPTY_PROJECTS : EMPTY_PROJECTS;
   const [draggedProject, setDraggedProject] = useState<{ host: string; path: string } | null>(null);
   const [projectsErrorByHost, setProjectsErrorByHost] = useState<Record<string, string>>({});
@@ -413,11 +416,14 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         ? t("projects.loadFailed", { detail: selectedHostSummary.lastError ?? t("hosts.status.error") })
         : null)
     : null;
-  // Remote machines start collapsed. Expansion is intentionally ephemeral:
-  // reopening the sidebar returns focus to this machine's workspaces.
-  const [expandedRemoteHosts, setExpandedRemoteHosts] = useState<Set<string>>(() => new Set());
+  // Machine sections. The current machine starts expanded; remote machines
+  // start collapsed. This set holds the hosts whose state is flipped from that
+  // default, so toggling either kind is one uniform action. Expansion is
+  // intentionally ephemeral: reopening the sidebar returns focus to this
+  // machine's workspaces.
+  const [toggledHosts, setToggledHosts] = useState<Set<string>>(() => new Set());
   useEffect(() => {
-    if (!sidebarOpen) setExpandedRemoteHosts(new Set());
+    if (!sidebarOpen) setToggledHosts(new Set());
   }, [sidebarOpen]);
   // Machine the selected cwd belongs to. A machine switch from the header
   // resets the selection; selecting a session/project on another machine
@@ -558,10 +564,11 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       try {
         const res = await hostFetch("/api/projects", undefined, id);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json() as { projects?: ManagedProject[] };
+        const data = await res.json() as { projects?: ManagedProject[]; hidden?: string[] };
         // A newer request superseded this one — drop the stale response.
         if (seq !== projectsLoadSeqRef.current) return;
         setProjectsByHost((prev) => ({ ...prev, [id]: data.projects ?? [] }));
+        setHiddenPathsByHost((prev) => ({ ...prev, [id]: data.hidden ?? [] }));
         setProjectsErrorByHost((prev) => {
           if (!(id in prev)) return prev;
           const next = { ...prev };
@@ -1149,8 +1156,8 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     return result;
   }, [enabledHosts, hostId, sortedProjects, projectsByHost]);
   const machineGroups = useMemo(
-    () => groupSessionsByMachine({ hosts, projectsByHost: sortedProjectsByHost, sessions: visibleSessions, fallbackHostId }),
-    [hosts, sortedProjectsByHost, visibleSessions, fallbackHostId],
+    () => groupSessionsByMachine({ hosts, projectsByHost: sortedProjectsByHost, hiddenPathsByHost, sessions: visibleSessions, fallbackHostId }),
+    [hosts, sortedProjectsByHost, hiddenPathsByHost, visibleSessions, fallbackHostId],
   );
   const hasAnyProject = machineGroups.some((group) => group.projects.length > 0);
   const projectActivity = useMemo(
@@ -1929,11 +1936,16 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             const isCurrentMachine = group.hostId === hostId;
             const machineName = group.host?.name ?? group.hostId;
             const groupHome = homeByHost[group.hostId] ?? "";
-            const isExpanded = hostFilterActive || isCurrentMachine || expandedRemoteHosts.has(group.hostId);
+            // Every machine gets a collapsible header (a dropdown of its
+            // projects) once more than one is enabled; a single machine stays
+            // flat. The current machine defaults to expanded, remotes to
+            // collapsed, and `toggledHosts` records any flip from that default.
+            const defaultExpanded = isCurrentMachine;
+            const isExpanded = hostFilterActive || (toggledHosts.has(group.hostId) ? !defaultExpanded : defaultExpanded);
             return (
               <div key={group.hostId} className="sidebar-machine" data-current={isCurrentMachine ? "true" : "false"}>
-                {!isCurrentMachine && (
-                  <button type="button" disabled={hostFilterActive} onClick={hostFilterActive ? undefined : () => setExpandedRemoteHosts((current) => {
+                {multiHost && (
+                  <button type="button" disabled={hostFilterActive} onClick={hostFilterActive ? undefined : () => setToggledHosts((current) => {
                     const next = new Set(current);
                     if (next.has(group.hostId)) next.delete(group.hostId);
                     else next.add(group.hostId);
@@ -1961,7 +1973,9 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                     {machineName}
                   </span></button>
                 )}
-                {isExpanded && group.entries.map(({ project, sessions, key }) => {
+                {isExpanded && (
+                  <div style={multiHost ? { paddingLeft: 16 } : undefined}>
+                {group.entries.map(({ project, sessions, key }) => {
                   const tree = treesByProject.get(key) ?? buildSessionTree(sessions);
                   // Sessions group under a project through the case-folded
                   // comparable form (see groupSessionsByMachine), so the active
@@ -2009,10 +2023,12 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                       worktreeOpen={isActive ? wtDropdownOpen : false}
                       onToggleWorktrees={isActive ? toggleWorktrees : undefined}
                       homeDir={groupHome}
-                      machineLabel={multiHost && isCurrentMachine ? machineName : null}
+                      machineLabel={null}
                     />
                   );
                 })}
+                  </div>
+                )}
               </div>
             );
           })}
@@ -2151,6 +2167,42 @@ function ProjectRow({
   const [aliasValue, setAliasValue] = useState("");
   const aliasInputRef = useRef<HTMLInputElement>(null);
   const aliasCancelRef = useRef(false);
+  const [confirmArchiveAll, setConfirmArchiveAll] = useState(false);
+  const [archivingAll, setArchivingAll] = useState(false);
+
+  // Total sessions under this project (roots + every fork), for the archive-all
+  // affordance and its confirmation copy.
+  const sessionCount = useMemo(() => {
+    let count = 0;
+    const walk = (nodes: SessionTreeNode[]) => nodes.forEach((node) => { count += 1; walk(node.children); });
+    walk(tree);
+    return count;
+  }, [tree]);
+
+  // Archive every session in the project. The archive endpoint refuses a
+  // session that still has children (fork parents), so walk the tree
+  // depth-first post-order — children before their parent — and archive
+  // sequentially so each parent is a leaf by the time its turn comes.
+  const handleArchiveAll = useCallback(async () => {
+    if (archivingAll) return;
+    setArchivingAll(true);
+    const ordered: SessionInfo[] = [];
+    const walk = (nodes: SessionTreeNode[]) => nodes.forEach((node) => { walk(node.children); ordered.push(node.session); });
+    walk(tree);
+    let failed = 0;
+    for (const session of ordered) {
+      try {
+        const response = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/archive`, { method: "POST" });
+        if (!response.ok) { failed += 1; continue; }
+        onSessionDeleted?.(session.id);
+      } catch {
+        failed += 1;
+      }
+    }
+    setArchivingAll(false);
+    setConfirmArchiveAll(false);
+    if (failed > 0) toast.error(t("projects.archiveAllFailed", { count: failed }));
+  }, [archivingAll, tree, onSessionDeleted, t]);
 
   const startAliasEdit = useCallback(() => {
     setAliasValue(project.alias ?? "");
@@ -2427,6 +2479,9 @@ function ProjectRow({
             <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { onEditLaunchConfig(project); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
               {project.launchConfig ? t("sessionSidebar.editLaunchConfig") : t("sessionSidebar.configureLaunchConfig")}
             </button>
+            <button type="button" role="menuitem" className="sidebar-menu-item" disabled={sessionCount === 0 || archivingAll} onClick={() => { setActionMenuOpen(false); setConfirmArchiveAll(true); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: sessionCount === 0 ? "var(--text-dim)" : "var(--text)", cursor: sessionCount === 0 || archivingAll ? "default" : "pointer", textAlign: "left", fontSize: 11, opacity: sessionCount === 0 ? 0.55 : 1 }}>
+              {t("projects.archiveAll")}
+            </button>
             <button type="button" role="menuitem" className="sidebar-menu-item" disabled={removeBusy} onClick={() => { setActionMenuOpen(false); void onRemoveProject(project.path); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--status-error)", cursor: removeBusy ? "default" : "pointer", textAlign: "left", fontSize: 11 }}>
               {t("projects.remove", { name: label })}
             </button>
@@ -2455,6 +2510,20 @@ function ProjectRow({
           />
         </button>
       </div>
+
+      {confirmArchiveAll && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, margin: "2px 0 0", padding: "6px 8px", borderRadius: "var(--radius-control)", background: "var(--bg-hover)" }}>
+          <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11.5, color: "var(--text)" }}>
+            {t("projects.archiveAllConfirm", { count: sessionCount, name: label })}
+          </span>
+          <button type="button" disabled={archivingAll} onClick={(event) => { event.stopPropagation(); void handleArchiveAll(); }} style={{ height: 26, padding: "0 10px", border: "none", borderRadius: "var(--radius-control)", background: "var(--accent-strong)", color: "var(--on-accent)", cursor: archivingAll ? "default" : "pointer", fontSize: 11, fontWeight: 600, opacity: archivingAll ? 0.7 : 1 }}>
+            {archivingAll ? t("projects.archiveAllBusy") : t("projects.archiveAll")}
+          </button>
+          <button type="button" disabled={archivingAll} onClick={(event) => { event.stopPropagation(); setConfirmArchiveAll(false); }} style={{ height: 26, padding: "0 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg)", color: "var(--text-muted)", cursor: archivingAll ? "default" : "pointer", fontSize: 11 }}>
+            {t("sessionSidebar.cancel")}
+          </button>
+        </div>
+      )}
 
       {isActive && activeWorktreeSwitcher}
 
