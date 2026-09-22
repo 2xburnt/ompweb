@@ -22,8 +22,11 @@ import { checkOmpUpdate } from "./omp/updates";
 const LEASE_MS = 30 * 60 * 1000;
 const TERMINAL_STATUS_TTL_MS = 24 * 60 * 60 * 1000;
 
-export type SelfUpdateState = "prepared" | "running" | "succeeded" | "failed";
-export type SelfUpdateStage = "preparing" | "stopping" | "installing" | "restarting" | "finalizing";
+export type SelfUpdateState = "prepared" | "running" | "succeeded" | "failed" | "cancelled";
+/** "building" and "ready" only occur for git checkouts, where the new build is
+ * produced while the current server keeps serving; everything from "stopping"
+ * onwards is the downtime window. */
+export type SelfUpdateStage = "preparing" | "building" | "ready" | "stopping" | "installing" | "restarting" | "finalizing";
 export interface SelfUpdateStatus {
   attemptId: string;
   state: SelfUpdateState;
@@ -36,6 +39,12 @@ export interface SelfUpdateStatus {
   recovered?: boolean;
   error?: string;
   cleanupReady?: boolean;
+  /** How the update is applied; "git" is the only method that stages a build. */
+  installMethod?: InstallMethod;
+  /** Commit the staged build was produced from (git checkouts). */
+  stagedCommit?: string;
+  /** Epoch ms after which an unconfirmed staged build is discarded. */
+  applyDeadline?: number;
 }
 interface StoredStatus extends SelfUpdateStatus {
   workerPid?: number;
@@ -168,7 +177,7 @@ function isActiveLease(lease: { expiresAt?: unknown } | null, now = Date.now()):
   return lease.expiresAt > now;
 }
 function isTerminalStatus(status: SelfUpdateStatus | null | undefined): boolean {
-  return status?.state === "succeeded" || status?.state === "failed";
+  return status?.state === "succeeded" || status?.state === "failed" || status?.state === "cancelled";
 }
 function isProcessAlive(pid: unknown): boolean {
   if (!Number.isInteger(pid) || (pid as number) <= 0) return false;
@@ -225,7 +234,7 @@ function removeAttemptDirectory(attemptId: string, kind: Kind): boolean {
 function removeAttemptArtifacts(attemptId: string, kind: Kind, includeCompletionAck = true): boolean {
   if (!/^[0-9a-f-]{36}$/i.test(attemptId)) return false;
   if (!removeAttemptDirectory(attemptId, kind)) return false;
-  const suffixes = ["ready", "go", "abort.json", "armed.json", "restart-request.json", "restart-ack.json", "complete.json"];
+  const suffixes = ["ready", "go", "apply.json", "abort.json", "armed.json", "restart-request.json", "restart-ack.json", "complete.json"];
   if (includeCompletionAck) suffixes.push("complete-ack.json");
   for (const s of suffixes) {
     if (!removeSecureFile(markerPath(attemptId, s, kind))) return false;
@@ -300,15 +309,43 @@ export type UpdateSupervisor = "systemd" | "none";
 
 /** How the server is supervised. Under systemd the update worker must run in
  * its own transient unit (stopping the service would otherwise kill it) and
- * restart the service through systemctl; that needs the unit name, which the
- * unit file provides as OMP_WEB_SERVICE. */
-export function detectSupervisor(env: NodeJS.ProcessEnv = process.env): { supervisor: UpdateSupervisor; serviceUnit: string | null; reason?: string } {
+ * restart the service through systemctl; that needs the unit name, taken from
+ * OMP_WEB_SERVICE when the unit file sets it and derived from the process's
+ * own cgroup otherwise. */
+export function detectSupervisor(env: NodeJS.ProcessEnv = process.env, cgroup = readSelfCgroup): { supervisor: UpdateSupervisor; serviceUnit: string | null; reason?: string } {
   const serviceUnit = env.OMP_WEB_SERVICE?.trim() || null;
   if (serviceUnit) return { supervisor: "systemd", serviceUnit };
-  if (env.INVOCATION_ID) {
-    return { supervisor: "systemd", serviceUnit: null, reason: "running under systemd without OMP_WEB_SERVICE; add Environment=OMP_WEB_SERVICE=<unit>.service to the unit file" };
+  if (!env.INVOCATION_ID) return { supervisor: "none", serviceUnit: null };
+  // The generated unit does not have to name itself: under systemd the unit
+  // this process belongs to is the last *.service segment of its cgroup path.
+  const derived = parseServiceUnitFromCgroup(cgroup());
+  if (derived) return { supervisor: "systemd", serviceUnit: derived };
+  return { supervisor: "systemd", serviceUnit: null, reason: "running under systemd but the unit name could not be determined; add Environment=OMP_WEB_SERVICE=<unit>.service to the unit file" };
+}
+
+function readSelfCgroup(): string {
+  try {
+    return readFileSync("/proc/self/cgroup", "utf8");
+  } catch {
+    return "";
   }
-  return { supervisor: "none", serviceUnit: null };
+}
+
+const SERVICE_UNIT_SEGMENT = /^[A-Za-z0-9:_.@-]+\.service$/;
+
+/** cgroup v2 lines look like
+ * `0::/user.slice/user-1000.slice/user@1000.service/app.slice/ompweb.service`.
+ * The user manager's own `user@<uid>.service` is a parent, never the unit. */
+export function parseServiceUnitFromCgroup(contents: string): string | null {
+  for (const line of contents.split("\n")) {
+    const hierarchy = line.split(":").at(-1)?.trim();
+    if (!hierarchy) continue;
+    for (const segment of hierarchy.split("/").reverse()) {
+      if (!SERVICE_UNIT_SEGMENT.test(segment) || /^user@\d+\.service$/.test(segment)) continue;
+      return segment;
+    }
+  }
+  return null;
 }
 
 function findOnPath(binary: string): string | null {
@@ -395,6 +432,7 @@ export async function prepareSelfUpdate(kind: Kind = "app"): Promise<PrepareResu
     fromVersion: currentVersion,
     targetVersion,
     preparedAt,
+    installMethod: kind === "omp" ? undefined : detectInstallMethod(getPackageDir()),
   };
   atomicWrite(statusFile, JSON.stringify(stored));
   // copy worker
@@ -444,7 +482,11 @@ export async function armSelfUpdateLauncher(attemptId: string, kind: Kind = "app
   await new Promise<void>((r) => setTimeout(r, 500));
 }
 
-export function commitSelfUpdate(attemptId: string, kind: Kind = "app"): { accepted: true; attemptId: string } {
+/** "ask" holds the staged build until the browser confirms; "auto" applies it
+ * as soon as the build succeeds. Only meaningful for git checkouts. */
+export type ApplyMode = "ask" | "auto";
+
+export function commitSelfUpdate(attemptId: string, kind: Kind = "app", applyMode: ApplyMode = "ask"): { accepted: true; attemptId: string } {
   const status = readStateJson<StoredStatus>(statusPath(kind));
   if (!status || status.attemptId !== attemptId) throw new SelfUpdateError("attempt_not_found", "Update attempt not found", 404);
   // write go marker
@@ -506,6 +548,8 @@ export function commitSelfUpdate(attemptId: string, kind: Kind = "app"): { accep
     upstream.remote,
     "--branch",
     upstream.branch,
+    "--apply-mode",
+    applyMode,
   ];
   try {
     const workerArgs = workerPath ? [workerPath, ...args] : args;
@@ -550,6 +594,46 @@ export function commitSelfUpdate(attemptId: string, kind: Kind = "app"): { accep
   return { accepted: true, attemptId };
 }
 
+/** Release the staged build: the worker is waiting on this marker before it
+ * stops the server. Only valid while the attempt reports stage "ready". */
+export function applySelfUpdate(attemptId: string, kind: Kind = "app"): { applied: true; attemptId: string } {
+  const status = readStateJson<StoredStatus>(statusPath(kind));
+  if (!status || status.attemptId !== attemptId) throw new SelfUpdateError("attempt_not_found", "Update attempt not found", 404);
+  if (status.state !== "running" || status.stage !== "ready") {
+    throw new SelfUpdateError("not_ready", "The update has no staged build waiting to be applied", 409);
+  }
+  const marker = markerPath(attemptId, "apply.json", kind);
+  if (!existsSync(marker)) {
+    atomicWrite(marker, JSON.stringify({ attemptId, appliedAt: new Date().toISOString(), protocol: 1 }));
+  }
+  return { applied: true, attemptId };
+}
+
+/** Ask the worker to stop before it touches the running server. The worker
+ * discards the staged build; nothing that is serving traffic is modified. */
+export function cancelSelfUpdate(attemptId: string, kind: Kind = "app"): { cancelled: true; attemptId: string } {
+  const status = readStateJson<StoredStatus>(statusPath(kind));
+  if (!status || status.attemptId !== attemptId) throw new SelfUpdateError("attempt_not_found", "Update attempt not found", 404);
+  if (isTerminalStatus(status)) return { cancelled: true, attemptId };
+  const stage = status.stage;
+  if (status.state === "running" && stage !== undefined && stage !== "preparing" && stage !== "building" && stage !== "ready") {
+    throw new SelfUpdateError("invalid_state", "The update has already started restarting the server", 409);
+  }
+  const marker = markerPath(attemptId, "abort.json", kind);
+  if (!existsSync(marker)) {
+    atomicWrite(marker, JSON.stringify({ attemptId, reason: "cancelled from the web interface", protocol: 1 }));
+  }
+  if (status.state === "prepared") {
+    const next: StoredStatus = { ...status, state: "cancelled", finishedAt: new Date().toISOString(), cleanupReady: true };
+    try {
+      atomicWrite(statusPath(kind), JSON.stringify(next));
+    } catch {
+      // The worker records the cancellation itself when it sees the marker.
+    }
+  }
+  return { cancelled: true, attemptId };
+}
+
 export async function abortPreparedSelfUpdate(attemptId: string, reason: string, kind: Kind = "app"): Promise<void> {
   try {
     atomicWrite(markerPath(attemptId, "abort.json", kind), JSON.stringify({ attemptId, reason, protocol: 1 }));
@@ -566,7 +650,7 @@ export async function abortPreparedSelfUpdate(attemptId: string, reason: string,
 export function acknowledgeSelfUpdate(attemptId: string, kind: Kind = "app"): { acknowledged: true; attemptId: string } {
   if (!ensureSecureRoot(kind, false)) throw new SelfUpdateError("attempt_not_terminal", "The update attempt is not ready for cleanup", 409);
   const status = readStateJson<StoredStatus>(statusPath(kind));
-  if (status?.attemptId !== attemptId || (status.state !== "succeeded" && status.state !== "failed")) {
+  if (status?.attemptId !== attemptId || !isTerminalStatus(status)) {
     throw new SelfUpdateError("attempt_not_terminal", "The update attempt is not ready for cleanup", 409);
   }
   const lease = readStateJson<{ attemptId?: unknown; expiresAt?: unknown }>(leasePath(kind));

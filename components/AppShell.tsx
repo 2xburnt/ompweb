@@ -33,16 +33,16 @@ import { clearDraft } from "@/lib/draft-store";
 import { showCompletionNotification } from "@/lib/browser-notifications";
 import {
   APP_UPDATE_COMPLETED_RELOAD_MS,
-  APP_UPDATE_POLL_MS,
   APP_UPDATE_PREPARING_MIN_MS,
-  APP_UPDATE_STOPPING_POLL_MS,
-  APP_UPDATE_TIMEOUT_MS,
   APP_UPDATE_VISIBLE_STAGE_MIN_MS,
   AppUpdateTransportError,
   COMPLETED_APP_UPDATE_KEY,
   DISMISSED_APP_UPDATE_KEY,
   DISMISSED_OMP_UPDATE_KEY,
   fetchAppUpdateJson,
+  getAppUpdatePhaseForStage,
+  getAppUpdatePollMs,
+  getAppUpdateStageTimeoutMs,
   isExactLegacyTargetCompletion,
   readDismissedVersion,
   rememberDismissedVersion,
@@ -71,6 +71,7 @@ import {
   getAppUpdateStageIndex,
   getNextAppUpdateStage,
   getMonotonicAppUpdateStage,
+  isStagedAppUpdate,
   type AppUpdateInfo,
   type AppUpdatePhase,
   type AppUpdateStage,
@@ -298,6 +299,10 @@ export function AppShell() {
   const appUpdateCommittedAttemptRef = useRef<string | null>(null);
   const appUpdateRecoveryCommitAttemptRef = useRef<string | null>(null);
   const appUpdateStageFlowRef = useRef(0);
+  // Chosen before the update starts and sent with the commit, so the restart
+  // still happens on its own if this browser is closed while the build runs.
+  const [appUpdateApplyWhenReady, setAppUpdateApplyWhenReady] = useState(false);
+  const appUpdateApplyInFlightRef = useRef<string | null>(null);
   const appUpdateAcknowledgementsRef = useRef<Map<string, Promise<boolean>>>(new Map());
   const advanceAppUpdateVisibleStage = useCallback((next: AppUpdateStage) => {
     const visible = getMonotonicAppUpdateStage(appUpdateVisibleStageRef.current, next);
@@ -533,11 +538,11 @@ export function AppShell() {
     setAppUpdateDialogOpen(true);
   }, []);
 
-  const submitAppUpdateCommit = useCallback((attemptId: string) => {
+  const submitAppUpdateCommit = useCallback((attemptId: string, applyMode: "ask" | "auto" = "ask") => {
     void fetchAppUpdateJson<{ error?: string }>("/api/app-update", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "commit", attemptId }),
+      body: JSON.stringify({ action: "commit", attemptId, applyMode }),
       keepalive: true,
     }, 202).then(() => {
       if (appUpdateAttemptRef.current === attemptId) {
@@ -554,6 +559,43 @@ export function AppShell() {
       showAppUpdateFailure(error);
     });
   }, [showAppUpdateFailure]);
+
+  /** Release a staged build. Everything after this interrupts the browser. */
+  const applyAppUpdate = useCallback(() => {
+    const attemptId = appUpdateAttemptRef.current;
+    if (!attemptId || appUpdateApplyInFlightRef.current === attemptId) return;
+    appUpdateApplyInFlightRef.current = attemptId;
+    setAppUpdatePhase("restarting");
+    void fetchAppUpdateJson<{ error?: string }>("/api/app-update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "apply", attemptId }),
+      keepalive: true,
+    }, 202).catch((error) => {
+      appUpdateApplyInFlightRef.current = null;
+      if (error instanceof AppUpdateTransportError) return;
+      if (appUpdateAttemptRef.current !== attemptId) return;
+      showAppUpdateFailure(error);
+    });
+  }, [showAppUpdateFailure]);
+
+  /** Stop an update that has not touched the running server yet. */
+  const cancelAppUpdate = useCallback(() => {
+    const attemptId = appUpdateAttemptRef.current;
+    if (!attemptId) {
+      setAppUpdateDialogOpen(false);
+      setAppUpdatePhase("idle");
+      resetAppUpdateVisibleStage();
+      return;
+    }
+    void fetchAppUpdateJson<{ error?: string }>("/api/app-update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "cancel", attemptId }),
+    }).catch(() => {
+      // The worker also stops on its own once the staged build expires.
+    });
+  }, [resetAppUpdateVisibleStage]);
 
   const recoverPreparedAppUpdate = useCallback((data: AppUpdateInfo, attemptId: string) => {
     const status = data.selfUpdateStatus;
@@ -593,6 +635,19 @@ export function AppShell() {
   ): Promise<boolean> => {
     const status = data.selfUpdateStatus;
     if (status?.attemptId !== attemptId || status.cleanupReady !== true) return false;
+    if (status.state === "cancelled") {
+      if (!await acknowledgeAppUpdate(attemptId)) return false;
+      appUpdateAttemptRef.current = null;
+      appUpdateStartInFlightRef.current = false;
+      appUpdateCommittedAttemptRef.current = null;
+      appUpdateApplyInFlightRef.current = null;
+      appUpdateStageFlowRef.current += 1;
+      setAppUpdateError(null);
+      setAppUpdatePhase("cancelled");
+      setAppUpdateDialogOpen(true);
+      toast.info(t("appUpdateDialog.cancelled"));
+      return true;
+    }
     if (status.state === "failed") {
       if (!await acknowledgeAppUpdate(attemptId)) return false;
       showAppUpdateFailure(status.error);
@@ -604,16 +659,17 @@ export function AppShell() {
       return true;
     }
     return false;
-  }, [acknowledgeAppUpdate, completeAppUpdate, showAppUpdateFailure]);
+  }, [acknowledgeAppUpdate, completeAppUpdate, showAppUpdateFailure, t]);
 
   const monitorAppUpdate = useCallback(async (attemptId: string, targetVersion: string) => {
     if (appUpdateAttemptRef.current === attemptId) return;
     appUpdateAttemptRef.current = attemptId;
-    const deadline = Date.now() + APP_UPDATE_TIMEOUT_MS;
+    let timedStage: AppUpdateStage | undefined;
+    let deadline = Date.now() + getAppUpdateStageTimeoutMs(undefined);
     while (appUpdateAttemptRef.current === attemptId && Date.now() < deadline) {
       await new Promise<void>((resolve) => window.setTimeout(
         resolve,
-        appUpdateVisibleStageRef.current === "stopping" ? APP_UPDATE_STOPPING_POLL_MS : APP_UPDATE_POLL_MS,
+        getAppUpdatePollMs(appUpdateVisibleStageRef.current),
       ));
       try {
         const data = await refreshAppUpdate();
@@ -621,7 +677,17 @@ export function AppShell() {
         const status = data.selfUpdateStatus;
         if (status?.attemptId === attemptId && status.stage !== undefined) {
           if (status.stage !== "preparing") appUpdateCommittedAttemptRef.current = attemptId;
+          // Each stage gets its own budget: building and waiting for a
+          // confirmation are slow on purpose and keep the server up.
+          if (status.stage !== timedStage) {
+            timedStage = status.stage;
+            deadline = Date.now() + getAppUpdateStageTimeoutMs(status.stage);
+          }
           await showAppUpdateStagesThrough(status.stage);
+          if (appUpdateAttemptRef.current !== attemptId) return;
+          setAppUpdatePhase((current) => (current === "completed" || current === "failed" || current === "cancelled")
+            ? current
+            : getAppUpdatePhaseForStage(status.stage!));
         }
         recoverPreparedAppUpdate(data, attemptId);
         if (await handleTerminalAppUpdate(data, attemptId, targetVersion)) return;
@@ -665,10 +731,10 @@ export function AppShell() {
         const status = data?.selfUpdateStatus;
         if (!data || !status) return;
         const recoveredStage = status.stage ?? "stopping";
-        const initialStage = recoveredStage === "preparing" ? "preparing" : "stopping";
+        const initialStage = recoveredStage === "preparing" ? "preparing" : recoveredStage === "building" ? "building" : "stopping";
         if (initialStage === "stopping") appUpdateCommittedAttemptRef.current = status.attemptId;
         advanceAppUpdateVisibleStage(initialStage);
-        setAppUpdatePhase(initialStage === "preparing" ? "preparing" : "restarting");
+        setAppUpdatePhase(getAppUpdatePhaseForStage(recoveredStage));
         setAppUpdateDialogOpen(true);
         await showAppUpdateStagesThrough(recoveredStage);
         if (await handleTerminalAppUpdate(data, status.attemptId, status.targetVersion)) return;
@@ -695,15 +761,18 @@ export function AppShell() {
       if (!prepared.attemptId || !prepared.targetVersion) {
         throw new Error("Invalid update response");
       }
-      submitAppUpdateCommit(prepared.attemptId);
+      const staged = isStagedAppUpdate(appUpdate?.installMethod);
+      submitAppUpdateCommit(prepared.attemptId, staged && appUpdateApplyWhenReady ? "auto" : "ask");
       void monitorAppUpdate(prepared.attemptId, prepared.targetVersion);
-      await showAppUpdateStagesThrough("stopping");
+      // A staged update keeps serving while it builds; the monitor moves the
+      // dialog on when the worker reports it is actually stopping.
+      await showAppUpdateStagesThrough(staged ? "building" : "stopping");
       if (appUpdateAttemptRef.current !== prepared.attemptId) return;
-      setAppUpdatePhase("restarting");
+      if (!staged) setAppUpdatePhase("restarting");
     } catch (error) {
       showAppUpdateFailure(error);
     }
-  }, [advanceAppUpdateVisibleStage, monitorAppUpdate, resetAppUpdateVisibleStage, showAppUpdateFailure, showAppUpdateStagesThrough, submitAppUpdateCommit]);
+  }, [advanceAppUpdateVisibleStage, appUpdate?.installMethod, appUpdateApplyWhenReady, monitorAppUpdate, resetAppUpdateVisibleStage, showAppUpdateFailure, showAppUpdateStagesThrough, submitAppUpdateCommit]);
 
   const dismissAppUpdate = useCallback(() => {
     if (appUpdatePhase === "idle" && appUpdate?.availableVersion) {
@@ -714,6 +783,7 @@ export function AppShell() {
     setAppUpdatePhase("idle");
     setAppUpdateError(null);
     appUpdateAttemptRef.current = null;
+    appUpdateApplyInFlightRef.current = null;
     resetAppUpdateVisibleStage();
   }, [appUpdate?.availableVersion, appUpdatePhase, resetAppUpdateVisibleStage, t]);
 
@@ -2463,7 +2533,19 @@ export function AppShell() {
       </svg>
     </button>
     )}
-    <AppUpdateDialog open={appUpdateDialogOpen} update={appUpdate} phase={appUpdatePhase} visibleStage={appUpdateVisibleStage} error={appUpdateError} onProceed={() => void proceedWithAppUpdate()} onNotNow={dismissAppUpdate} />
+    <AppUpdateDialog
+      open={appUpdateDialogOpen}
+      update={appUpdate}
+      phase={appUpdatePhase}
+      visibleStage={appUpdateVisibleStage}
+      error={appUpdateError}
+      onProceed={() => void proceedWithAppUpdate()}
+      onNotNow={dismissAppUpdate}
+      onApply={applyAppUpdate}
+      onCancelUpdate={cancelAppUpdate}
+      applyWhenReady={appUpdateApplyWhenReady}
+      onApplyWhenReadyChange={setAppUpdateApplyWhenReady}
+    />
     {archiveBrowserOpen && (
       <ArchiveBrowser
         open={archiveBrowserOpen}

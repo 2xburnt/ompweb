@@ -9,11 +9,15 @@ import { Dialog, DialogContent, DialogTitle } from "@/components/ui/primitives";
 import { usePrefersReducedMotion } from "@/hooks/usePrefersReducedMotion";
 import { MarkdownBody } from "./MarkdownBody";
 
-export type AppUpdatePhase = "idle" | "preparing" | "restarting" | "completed" | "failed";
-export type AppUpdateStage = "preparing" | "stopping" | "installing" | "restarting" | "finalizing";
+export type AppUpdatePhase = "idle" | "preparing" | "ready" | "restarting" | "completed" | "failed" | "cancelled";
+export type AppUpdateStage = "preparing" | "building" | "ready" | "stopping" | "installing" | "restarting" | "finalizing";
 
+/** "building" and "ready" run with the server still up; the steps from
+ * "stopping" onwards are the only ones that interrupt the browser. */
 const APP_UPDATE_STEPS: ReadonlyArray<{ stage: AppUpdateStage; labelKey: string }> = [
   { stage: "preparing", labelKey: "appUpdateDialog.stepPrepare" },
+  { stage: "building", labelKey: "appUpdateDialog.stepBuild" },
+  { stage: "ready", labelKey: "appUpdateDialog.stepConfirm" },
   { stage: "stopping", labelKey: "appUpdateDialog.stepStopSessions" },
   { stage: "installing", labelKey: "appUpdateDialog.stepInstall" },
   { stage: "restarting", labelKey: "appUpdateDialog.stepRestart" },
@@ -22,11 +26,25 @@ const APP_UPDATE_STEPS: ReadonlyArray<{ stage: AppUpdateStage; labelKey: string 
 
 const APP_UPDATE_STEP_BY_STAGE: Record<AppUpdateStage, number> = {
   preparing: 0,
-  stopping: 1,
-  installing: 2,
-  restarting: 3,
-  finalizing: 4,
+  building: 1,
+  ready: 2,
+  stopping: 3,
+  installing: 4,
+  restarting: 5,
+  finalizing: 6,
 };
+
+/** Only git checkouts build ahead of the restart; a global package install
+ * replaces the directory the server runs from and cannot be staged. */
+export function isStagedAppUpdate(installMethod: AppUpdateInfo["installMethod"]): boolean {
+  return installMethod === "git";
+}
+
+export function getAppUpdateSteps(installMethod: AppUpdateInfo["installMethod"]): typeof APP_UPDATE_STEPS {
+  return isStagedAppUpdate(installMethod)
+    ? APP_UPDATE_STEPS
+    : APP_UPDATE_STEPS.filter((step) => step.stage !== "building" && step.stage !== "ready");
+}
 
 export function getAppUpdateStageIndex(stage: AppUpdateStage): number {
   return APP_UPDATE_STEP_BY_STAGE[stage];
@@ -50,7 +68,7 @@ export function getAppUpdateStepIndex(phase: AppUpdatePhase, stage?: AppUpdateSt
   if (phase === "completed") return APP_UPDATE_STEPS.length;
   if (stage !== undefined) return getAppUpdateStageIndex(stage);
   if (phase === "preparing") return 0;
-  return phase === "restarting" ? 1 : 0;
+  return phase === "restarting" ? getAppUpdateStageIndex("stopping") : 0;
 }
 const MAX_RELEASE_NOTES_BYTES = 64 * 1024;
 
@@ -145,6 +163,9 @@ export interface AppUpdateInfo {
     recovered?: boolean;
     cleanupReady?: boolean;
     error?: string;
+    installMethod?: "git" | "npm" | "bun";
+    stagedCommit?: string;
+    applyDeadline?: number;
   } | null;
   appUpdateDrain?: {
     state: "waiting" | "stopping" | "stopped" | "failed";
@@ -176,11 +197,30 @@ interface AppUpdateDialogProps {
   phase: AppUpdatePhase;
   visibleStage?: AppUpdateStage;
   error: string | null;
+  /** Start the update, or retry a failed one. */
   onProceed: () => void;
   onNotNow: () => void;
+  /** Release a staged build: everything from here on interrupts the browser. */
+  onApply?: () => void;
+  /** Stop before the server is touched (during the build, or once staged). */
+  onCancelUpdate?: () => void;
+  applyWhenReady?: boolean;
+  onApplyWhenReadyChange?: (value: boolean) => void;
 }
 
-export function AppUpdateDialog({ open, update, phase, visibleStage, error, onProceed, onNotNow }: AppUpdateDialogProps) {
+export function AppUpdateDialog({
+  open,
+  update,
+  phase,
+  visibleStage,
+  error,
+  onProceed,
+  onNotNow,
+  onApply,
+  onCancelUpdate,
+  applyWhenReady = false,
+  onApplyWhenReadyChange,
+}: AppUpdateDialogProps) {
   const { t } = useI18n();
   const prefersReducedMotion = usePrefersReducedMotion();
   const [releaseNotes, setReleaseNotes] = useState<AppUpdateReleaseNotes | null>(null);
@@ -212,6 +252,8 @@ export function AppUpdateDialog({ open, update, phase, visibleStage, error, onPr
     return () => controller.abort();
   }, [availableVersion, releaseNotes?.version, shouldLoadReleaseNotes]);
   const busy = phase === "preparing" || phase === "restarting" || phase === "completed";
+  const staged = isStagedAppUpdate(update?.installMethod);
+  const steps = getAppUpdateSteps(update?.installMethod);
   const command = update?.updateCommand || (update?.installMethod === "git" ? "git pull --ff-only && npm ci && npm run build" : "npm install -g @kahme247/ompweb");
   const gitDescription = update?.installMethod === "git"
     ? t("appUpdateDialog.gitDescription", { count: String(update.behindBy ?? 0), branch: update.branch ?? "main" })
@@ -220,6 +262,8 @@ export function AppUpdateDialog({ open, update, phase, visibleStage, error, onPr
   const versionTransition = getAppUpdateVersionTransition(update, phase);
   const effectiveStage = visibleStage ?? update?.selfUpdateStatus?.stage;
   const currentStepIndex = getAppUpdateStepIndex(phase, effectiveStage);
+  const canCancelBeforeRestart = onCancelUpdate !== undefined
+    && (phase === "ready" || (phase === "preparing" && (effectiveStage === undefined || effectiveStage === "preparing" || effectiveStage === "building")));
   const drain = update?.appUpdateDrain;
   const showDrain = effectiveStage === "stopping" && drain !== undefined && drain.processes.length > 0;
   const drainSummary = showDrain
@@ -234,19 +278,33 @@ export function AppUpdateDialog({ open, update, phase, visibleStage, error, onPr
     ? t("appUpdateDialog.failedTitle")
     : phase === "completed"
       ? t("appUpdateDialog.completedTitle")
-      : t("appUpdateDialog.title");
-  const dialogDescription = phase === "preparing"
-    ? t("appUpdateDialog.preparing")
-    : phase === "restarting"
-      ? t("appUpdateDialog.restarting")
-      : phase === "completed"
-        ? t("appUpdateDialog.completed", { version: completedVersion })
-        : phase === "failed"
-          ? t("appUpdateDialog.failedDescription")
-          : (gitDescription ?? t("appUpdateDialog.description"));
+      : phase === "cancelled"
+        ? t("appUpdateDialog.cancelledTitle")
+        : phase === "ready"
+          ? t("appUpdateDialog.readyTitle")
+          : t("appUpdateDialog.title");
+  const dialogDescription = phase === "ready"
+    ? t("appUpdateDialog.ready")
+    : phase === "preparing"
+      ? t(effectiveStage === "building" ? "appUpdateDialog.building" : "appUpdateDialog.preparing")
+      : phase === "restarting"
+        ? t("appUpdateDialog.restarting")
+        : phase === "completed"
+          ? t("appUpdateDialog.completed", { version: completedVersion })
+          : phase === "failed"
+            ? t("appUpdateDialog.failedDescription")
+            : phase === "cancelled"
+              ? t("appUpdateDialog.cancelledDescription")
+              : (gitDescription ?? t("appUpdateDialog.description"));
 
   return (
-    <Dialog open={open} onOpenChange={(next) => { if (!next && !busy) onNotNow(); }}>
+    <Dialog open={open} onOpenChange={(next) => {
+      if (next || busy) return;
+      // Dismissing a staged update is a decision, not a deferral: stop the
+      // worker rather than leaving a build waiting to restart the server.
+      if (canCancelBeforeRestart) onCancelUpdate?.();
+      else onNotNow();
+    }}>
       <DialogContent ariaLabel={dialogTitle} style={{ width: 500, maxWidth: "min(94vw, 500px)", padding: 24 }}>
         <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
           <div style={{ width: 36, height: 36, flexShrink: 0, borderRadius: "var(--radius-control)", display: "flex", alignItems: "center", justifyContent: "center", background: "var(--bg-subtle)", color: "var(--accent)" }}>
@@ -254,9 +312,11 @@ export function AppUpdateDialog({ open, update, phase, visibleStage, error, onPr
               ? <AlertTriangle size={19} aria-hidden="true" />
               : phase === "completed"
                 ? <CheckCircle2 size={19} aria-hidden="true" />
-                : phase === "restarting"
-                  ? <LoaderCircle size={19} aria-hidden="true" style={prefersReducedMotion ? undefined : { animation: "spin 1s linear infinite" }} />
-                  : <Download size={19} aria-hidden="true" />}
+                : phase === "cancelled"
+                  ? <Info size={19} aria-hidden="true" />
+                  : phase === "restarting"
+                    ? <LoaderCircle size={19} aria-hidden="true" style={prefersReducedMotion ? undefined : { animation: "spin 1s linear infinite" }} />
+                    : <Download size={19} aria-hidden="true" />}
           </div>
           <div style={{ flex: 1, minWidth: 0 }}>
             <DialogTitle style={{ margin: 0 }}>{dialogTitle}</DialogTitle>
@@ -295,7 +355,8 @@ export function AppUpdateDialog({ open, update, phase, visibleStage, error, onPr
 
         {phase !== "idle" && (
           <ol aria-label={t("appUpdateDialog.progressLabel")} aria-live="polite" style={{ margin: "16px 0 0", padding: 0, listStyle: "none", display: "grid", gap: 7 }}>
-            {APP_UPDATE_STEPS.map((step, index) => {
+            {steps.map((step) => {
+              const index = getAppUpdateStageIndex(step.stage);
               const isCurrent = index === currentStepIndex;
               const isFailed = phase === "failed" && isCurrent;
               const isCompleted = index < currentStepIndex;
@@ -362,6 +423,7 @@ export function AppUpdateDialog({ open, update, phase, visibleStage, error, onPr
         {phase === "idle" && (
           <div style={{ marginTop: 18, padding: "13px 14px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "var(--bg-subtle)", display: "grid", gap: 9, color: "var(--text-muted)", fontSize: 12, lineHeight: 1.55 }}>
             {[
+              ...(staged ? [t("appUpdateDialog.stagedBuildNote")] : []),
               t("appUpdateDialog.activeSessionsWarning"),
               t("appUpdateDialog.savedSessionsWarning"),
               t("appUpdateDialog.disconnectWarning"),
@@ -372,7 +434,24 @@ export function AppUpdateDialog({ open, update, phase, visibleStage, error, onPr
                 <span>{message}</span>
               </div>
             ))}
+            {staged && onApplyWhenReadyChange && (
+              <label style={{ display: "flex", alignItems: "flex-start", gap: 9, marginTop: 2, color: "var(--text)", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={applyWhenReady}
+                  onChange={(event) => onApplyWhenReadyChange(event.target.checked)}
+                  style={{ marginTop: 2, flexShrink: 0, accentColor: "var(--accent-strong)" }}
+                />
+                <span>{t("appUpdateDialog.applyWhenReady")}</span>
+              </label>
+            )}
           </div>
+        )}
+
+        {phase === "ready" && (
+          <p role="status" style={{ margin: "16px 0 0", paddingTop: 12, borderTop: "1px solid var(--border)", display: "flex", alignItems: "flex-start", gap: 8, color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}>
+            <Info size={14} aria-hidden="true" style={{ marginTop: 2, flexShrink: 0 }} /> <span>{t("appUpdateDialog.readyNote")}</span>
+          </p>
         )}
 
         {phase === "failed" && (
@@ -409,9 +488,19 @@ export function AppUpdateDialog({ open, update, phase, visibleStage, error, onPr
         )}
 
         <div style={{ marginTop: 22, display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 8 }}>
-          {!busy && (
+          {canCancelBeforeRestart && (
+            <button type="button" onClick={onCancelUpdate} style={{ padding: "7px 13px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "transparent", color: "var(--text-muted)", cursor: "pointer", fontSize: 12 }}>
+              {t("appUpdateDialog.cancelUpdate")}
+            </button>
+          )}
+          {!busy && !canCancelBeforeRestart && (
             <button type="button" onClick={onNotNow} style={{ padding: "7px 13px", border: "1px solid var(--border)", borderRadius: "var(--radius-control)", background: "transparent", color: "var(--text-muted)", cursor: "pointer", fontSize: 12 }}>
-              {phase === "failed" ? t("appUpdateDialog.close") : t("appUpdateDialog.notNow")}
+              {phase === "failed" || phase === "cancelled" ? t("appUpdateDialog.close") : t("appUpdateDialog.notNow")}
+            </button>
+          )}
+          {phase === "ready" && onApply && (
+            <button type="button" onClick={onApply} style={{ padding: "7px 13px", border: "1px solid var(--accent-strong)", borderRadius: "var(--radius-control)", background: "var(--accent-strong)", color: "var(--on-accent)", cursor: "pointer", fontSize: 12, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 6, whiteSpace: "nowrap", flexShrink: 0 }}>
+              <RotateCcw size={13} aria-hidden="true" /> {t("appUpdateDialog.restartNow")}
             </button>
           )}
           {phase === "idle" && (
@@ -419,7 +508,7 @@ export function AppUpdateDialog({ open, update, phase, visibleStage, error, onPr
               <Download size={13} aria-hidden="true" /> {t("appUpdateDialog.proceed")}
             </button>
           )}
-          {phase === "failed" && (
+          {(phase === "failed" || phase === "cancelled") && (
             <button type="button" onClick={onProceed} style={{ padding: "7px 13px", border: "1px solid var(--accent-strong)", borderRadius: "var(--radius-control)", background: "var(--accent-strong)", color: "var(--on-accent)", cursor: "pointer", fontSize: 12, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 6, whiteSpace: "nowrap", flexShrink: 0 }}>
               <RotateCcw size={13} aria-hidden="true" /> {t("appUpdateDialog.retry")}
             </button>

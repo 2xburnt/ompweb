@@ -5,29 +5,32 @@ import { checkNpmUpdate } from "@/lib/npm-update";
 import {
   abortPreparedSelfUpdate,
   acknowledgeSelfUpdate,
+  applySelfUpdate,
   armSelfUpdateLauncher,
+  cancelSelfUpdate,
   commitSelfUpdate,
   getSelfUpdateStatus,
   getSelfUpdateSupport,
-  markSelfUpdateStopping,
   prepareSelfUpdate,
   SelfUpdateError,
   validateCommitSelfUpdate,
+  type ApplyMode,
 } from "@/lib/self-update";
 
 export const dynamic = "force-dynamic";
 
 type CommitResult = { accepted: true; attemptId: string };
 
-async function commitAppUpdate(attemptId: string): Promise<CommitResult> {
+const INVALID_ACTION_MESSAGE = "action must be prepare, commit, apply, cancel, status, or acknowledge";
+
+async function commitAppUpdate(attemptId: string, applyMode: ApplyMode): Promise<CommitResult> {
   let launcherArmed = false;
   try {
     const commitState = validateCommitSelfUpdate(attemptId);
     if (commitState === "replay") return { accepted: true, attemptId };
-    if (commitState === "ready") markSelfUpdateStopping(attemptId);
     await armSelfUpdateLauncher(attemptId);
     launcherArmed = true;
-    return commitSelfUpdate(attemptId);
+    return commitSelfUpdate(attemptId, "app", applyMode);
   } catch (error) {
     if (!launcherArmed) {
       const reason = error instanceof SelfUpdateError
@@ -69,7 +72,7 @@ export async function POST(request: Request) {
   }
   try {
     const body = await parseJsonWithinLimit<Record<string, unknown> | null>(request, 4_096);
-    if (!body || typeof body !== "object" || Array.isArray(body)) throw new SelfUpdateError("invalid_action", "action must be prepare, commit, status, or acknowledge");
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new SelfUpdateError("invalid_action", INVALID_ACTION_MESSAGE);
     const keys = Object.keys(body);
     if (body.action === "prepare" && keys.length === 1) {
       const result = await prepareSelfUpdate();
@@ -78,15 +81,22 @@ export async function POST(request: Request) {
     if (body.action === "acknowledge" && keys.length === 2 && typeof body.attemptId === "string") {
       return NextResponse.json(acknowledgeSelfUpdate(body.attemptId));
     }
-    if (body.action === "commit" && keys.length === 2 && typeof body.attemptId === "string") {
-      const result = await commitAppUpdate(body.attemptId);
+    if (body.action === "commit" && typeof body.attemptId === "string"
+      && (keys.length === 2 || (keys.length === 3 && (body.applyMode === "ask" || body.applyMode === "auto")))) {
+      const result = await commitAppUpdate(body.attemptId, body.applyMode === "auto" ? "auto" : "ask");
       return NextResponse.json(result, { status: 202 });
+    }
+    if (body.action === "apply" && keys.length === 2 && typeof body.attemptId === "string") {
+      return NextResponse.json(applySelfUpdate(body.attemptId), { status: 202 });
+    }
+    if (body.action === "cancel" && keys.length === 2 && typeof body.attemptId === "string") {
+      return NextResponse.json(cancelSelfUpdate(body.attemptId));
     }
     if (body.action === "status" && keys.length === 1) {
       const selfUpdateStatus = getSelfUpdateStatus();
       return NextResponse.json(selfUpdateStatus ?? null, { headers: { "Cache-Control": "no-store" } });
     }
-    throw new SelfUpdateError("invalid_action", "action must be prepare, commit, status, or acknowledge");
+    throw new SelfUpdateError("invalid_action", INVALID_ACTION_MESSAGE);
   } catch (error) {
     if (error instanceof RequestBodyTooLargeError) return NextResponse.json({ error: error.message, code: "body_too_large" }, { status: 413 });
     if (error instanceof SyntaxError) return errorResponse(new SelfUpdateError("invalid_json", "Request body must be valid JSON"));

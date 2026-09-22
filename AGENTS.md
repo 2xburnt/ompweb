@@ -361,6 +361,48 @@ handled or safely ignored.
 - `POST /api/omp-update` (`action: "restart"`) restarts active OMP sessions after a manual CLI update.
 - Notifications in `AppShell` and settings cards in `SettingsConfig` present the update notification alongside copyable terminal update commands.
 
+### In-app self-update (`lib/self-update.ts`, `bin/omp-web-update-worker.js`)
+- `POST /api/app-update` drives one attempt: `prepare` (lease + status + a copy
+  of the worker in a 0700 temp root), `commit` (arms the launcher and spawns the
+  worker; `applyMode: "auto"` skips the confirmation), `apply`, `cancel`,
+  `status`, `acknowledge`. The worker reports progress through `status.json`;
+  the browser polls `GET /api/app-update`.
+- Stages are `preparing → building → ready → stopping → installing → restarting
+  → finalizing`. **Only `stopping` onwards is downtime.** `building` and `ready`
+  exist for git checkouts, where the new build is produced with the current
+  server still serving, and the restart waits for the browser to confirm it
+  (30 minutes, then the staged build is discarded). A package install (`npm` /
+  `bun`) replaces the directory the server runs from and cannot be staged, so it
+  keeps the old stop-then-install order and skips both stages —
+  `getAppUpdateSteps()` hides them.
+- The git build happens in a **detached worktree** (`~/.cache/ompweb/build-<checkout>`,
+  or a sibling of the checkout when the cache dir is on another filesystem —
+  `rename()` must not cross devices). `node_modules` is symlinked to the live
+  checkout unless the update changes `package.json`/`package-lock.json`, in
+  which case the staging tree runs its own `npm ci` and the two directories are
+  swapped during the restart. Nothing skips `npm ci` that needs it, and nothing
+  runs it when it is not needed — that is where the old flow lost minutes.
+- Applying is a fast-forward plus renames: `git merge --ff-only <target>`, then
+  `.next` and (if installed) `node_modules` are renamed into place; the previous
+  ones are deleted only after the server answers again. The fast-forward is
+  verified with `merge-base --is-ancestor` **before** the build, so it can never
+  be the step that fails with the service already down.
+- The staging tree is removed after every update, so no build tree of ours
+  stays registered in the repository. `OMP_WEB_UPDATE_KEEP_BUILD_TREE=1` keeps
+  it instead: `.next/cache` then survives (moved aside before the swap) and the
+  next build is incremental, at the cost of a lingering worktree.
+- A failure or a cancel before `stopping` leaves the checkout, `node_modules`
+  and the running build untouched — cancellation reports `state: "cancelled"`,
+  not `"failed"`, so saying "not yet" never looks like a broken update.
+- Under systemd the worker runs in its own transient unit (it stops the service
+  that spawned it) and needs the unit name: `OMP_WEB_SERVICE` when the unit file
+  sets it, otherwise derived from the process's own cgroup
+  (`parseServiceUnitFromCgroup`). Without either, self-update reports itself
+  unsupported rather than guessing.
+- The worker renews the lease while it builds; `LEASE_MS` is 30 minutes and a
+  build plus a confirmation wait can outlast it, which would otherwise let a
+  second attempt start.
+
 ### Auth and model config
 - Auth flows go through RPC commands (`get_login_providers`, `login`) against the omp child process; credentials live in omp's `agent.db` (SQLite) which omp-web never touches directly.
 - The Models panel reads and writes `models.yml` in the omp agent directory (`~/.omp/agent/models.yml`, `.yaml` fallback).

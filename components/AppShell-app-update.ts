@@ -1,11 +1,17 @@
-import type { AppUpdateInfo } from "./AppUpdateDialog";
+import type { AppUpdateInfo, AppUpdatePhase, AppUpdateStage } from "./AppUpdateDialog";
 
 export const DISMISSED_APP_UPDATE_KEY = "omp-web:dismissed-app-update";
 export const DISMISSED_OMP_UPDATE_KEY = "omp-web:dismissed-omp-update";
 export const COMPLETED_APP_UPDATE_KEY = "omp-web:completed-app-update";
 export const APP_UPDATE_POLL_MS = 500;
 export const APP_UPDATE_STOPPING_POLL_MS = 200;
+/** Building and waiting for confirmation happen with the server up, so they
+ * poll lazily instead of hammering the status endpoint for minutes. */
+export const APP_UPDATE_STAGED_POLL_MS = 2_000;
 export const APP_UPDATE_TIMEOUT_MS = 15 * 60 * 1_000;
+export const APP_UPDATE_BUILD_TIMEOUT_MS = 40 * 60 * 1_000;
+/** Matches the worker's own wait for a confirmation, plus slack for polling. */
+export const APP_UPDATE_CONFIRM_TIMEOUT_MS = 31 * 60 * 1_000;
 export const APP_UPDATE_PREPARING_MIN_MS = 1_000;
 export const APP_UPDATE_VISIBLE_STAGE_MIN_MS = 1_000;
 export const APP_UPDATE_COMPLETED_RELOAD_MS = 3_000;
@@ -30,6 +36,27 @@ export function rememberDismissedVersion(key: string, version: string): void {
   } catch {
     // Dismissal is best-effort: the toast stays closed for this page anyway.
   }
+}
+
+/** How long a stage may run before the browser gives up on it. The stages that
+ * keep serving traffic get the long budgets; only the restart window is held
+ * to the short one. */
+export function getAppUpdateStageTimeoutMs(stage: AppUpdateStage | undefined): number {
+  if (stage === "building") return APP_UPDATE_BUILD_TIMEOUT_MS;
+  if (stage === "ready") return APP_UPDATE_CONFIRM_TIMEOUT_MS;
+  return APP_UPDATE_TIMEOUT_MS;
+}
+
+/** The dialog only claims the server is going away once a stage says so. */
+export function getAppUpdatePhaseForStage(stage: AppUpdateStage): AppUpdatePhase {
+  if (stage === "ready") return "ready";
+  return stage === "preparing" || stage === "building" ? "preparing" : "restarting";
+}
+
+export function getAppUpdatePollMs(stage: AppUpdateStage | undefined): number {
+  if (stage === "stopping") return APP_UPDATE_STOPPING_POLL_MS;
+  if (stage === "building" || stage === "ready") return APP_UPDATE_STAGED_POLL_MS;
+  return APP_UPDATE_POLL_MS;
 }
 
 export async function waitForAppUpdateDwell(startedAt: number | null, minimumMs: number): Promise<void> {
