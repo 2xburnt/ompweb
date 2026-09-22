@@ -2498,7 +2498,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     runHadContentRef.current = false;
     lastQuotaErrorRef.current = null;
     lastRunErrorRef.current = null;
-    runPreviousEntryIdsRef.current = sessionIdRef.current ? null : [];
+    runPreviousEntryIdsRef.current = isNew ? [] : (sessionIdRef.current ? null : []);
     agentRunningRef.current = true;
     slashCommandRunRef.current = isSlashCommandPrompt;
     // A new run starts fresh: drop any rescued in-flight reconcile state from
@@ -2545,9 +2545,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             await ensureEventsConnected(sid);
             void refreshSubagentRoster(sid);
           }
-          if (existingSid) {
-            const previousEntryIds = await snapshotRunEntries(sid);
-            if (promptRunIdRef.current === promptRunId) runPreviousEntryIdsRef.current = previousEntryIds;
+          if (promptRunIdRef.current === promptRunId) {
+            // ensure_session creates the RPC wrapper before omp persists the session
+            // header. A brand-new session has no prior entries by definition.
+            runPreviousEntryIdsRef.current = [];
           }
           await sendAgentCommand(sid, {
             type: "prompt",
