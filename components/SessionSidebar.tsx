@@ -2311,81 +2311,77 @@ function ProjectRow({
           </button>
         )}
         <div style={{ flex: 1 }} />
-        <button
-          type="button"
-          className="sidebar-project-action"
-          onClick={(event) => { event.stopPropagation(); onNewSession(project.path); }}
-          aria-label={t("projects.newSessionHere", { name: label })}
-          title={t("projects.newSessionHere", { name: label })}
-          style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 24, height: 24, padding: 0, flexShrink: 0, border: "none", borderRadius: "var(--radius-control)", background: "transparent", color: hovered ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
+        <span
+          className="sidebar-project-activity"
+          data-running={(activity?.running ?? 0) > 0 ? "true" : "false"}
+          style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 11, height: 11, margin: "0 2px 0 0", flexShrink: 0, lineHeight: 0 }}
         >
-          <Plus size={14} strokeWidth={2} aria-hidden="true" />
-        </button>
-        {hasActivity && (
-          <span
-            aria-label={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0 })}
-            title={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0 })}
-            className="sidebar-project-activity"
-            data-running={(activity?.running ?? 0) > 0 ? "true" : "false"}
-            role="status"
-            aria-live="polite"
-            style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: 11, height: 11, margin: "0 2px 0 0", flexShrink: 0, lineHeight: 0 }}
-          >
+          {hasActivity && (
             <span
-              aria-hidden="true"
-              className="sidebar-project-activity-dot"
-              style={{
-                width: 7,
-                height: 7,
-                borderRadius: "50%",
-                background: "var(--accent)",
-              }}
-            />
-          </span>
-        )}
-        <div
-          style={{
-            flexShrink: 0,
-            visibility: showActions ? "visible" : "hidden",
-          }}
-        >
+              aria-label={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0 })}
+              title={t("projects.activity", { running: activity?.running ?? 0, unread: activity?.unread ?? 0 })}
+              role="status"
+              aria-live="polite"
+              style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", width: "100%", height: "100%" }}
+            >
+              <span
+                aria-hidden="true"
+                className="sidebar-project-activity-dot"
+                style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--accent)" }}
+              />
+            </span>
+          )}
+        </span>
+        <div className="sidebar-project-actions" style={{ flexShrink: 0 }}>
           <button
             type="button"
-            ref={actionButtonRef}
             className="sidebar-project-action"
-            onClick={() => setActionMenuOpen((open) => !open)}
-            disabled={removeBusy}
-            aria-label={t("commandPalette.actions")}
-            title={t("commandPalette.actions")}
-            aria-expanded={actionMenuOpen}
-            aria-haspopup="menu"
-            style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 24, height: 24, padding: 0, border: "none", borderRadius: "var(--radius-control)", background: actionMenuOpen ? "var(--bg-selected)" : "transparent", color: "var(--text-dim)", cursor: removeBusy ? "default" : "pointer", opacity: removeBusy ? 0.5 : 1, lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
+            onClick={(event) => { event.stopPropagation(); onNewSession(project.path); }}
+            aria-label={t("projects.newSessionHere", { name: label })}
+            title={t("projects.newSessionHere", { name: label })}
+            style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 24, height: 24, padding: 0, flexShrink: 0, border: "none", borderRadius: "var(--radius-control)", background: "transparent", color: hovered ? "var(--accent)" : "var(--text-dim)", cursor: "pointer", lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
           >
-            <MoreHorizontal size={13} strokeWidth={2} aria-hidden="true" />
+            <Plus size={14} strokeWidth={2} aria-hidden="true" />
           </button>
-          <SidebarPortalMenu
-            anchor={actionButtonRef}
-            open={actionMenuOpen}
-            onClose={() => setActionMenuOpen(false)}
-            placement="below"
-            minWidth={136}
-          >
-            <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { startAliasEdit(); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
-              {project.alias ? t("projects.editAlias") : t("projects.nameAlias")}
+          <div style={{ visibility: showActions ? "visible" : "hidden" }}>
+            <button
+              type="button"
+              ref={actionButtonRef}
+              className="sidebar-project-action"
+              onClick={() => setActionMenuOpen((open) => !open)}
+              disabled={removeBusy}
+              aria-label={t("commandPalette.actions")}
+              title={t("commandPalette.actions")}
+              aria-expanded={actionMenuOpen}
+              aria-haspopup="menu"
+              style={{ display: "flex", alignItems: "center", justifyContent: "center", width: 24, height: 24, padding: 0, border: "none", borderRadius: "var(--radius-control)", background: actionMenuOpen ? "var(--bg-selected)" : "transparent", color: "var(--text-dim)", cursor: removeBusy ? "default" : "pointer", opacity: removeBusy ? 0.5 : 1, lineHeight: 0, transition: SIDEBAR_BUTTON_TRANSITION }}
+            >
+              <MoreHorizontal size={13} strokeWidth={2} aria-hidden="true" />
             </button>
-            <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { onEditLaunchConfig(project); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
-              {project.launchConfig ? t("sessionSidebar.editLaunchConfig") : t("sessionSidebar.configureLaunchConfig")}
-            </button>
-            <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { setActionMenuOpen(false); void onMoveProject(project.path, -1); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
-              {t("projects.moveUp")}
-            </button>
-            <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { setActionMenuOpen(false); void onMoveProject(project.path, 1); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
-              {t("projects.moveDown")}
-            </button>
-            <button type="button" role="menuitem" className="sidebar-menu-item" disabled={removeBusy} onClick={() => { setActionMenuOpen(false); void onRemoveProject(project.path); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--status-error)", cursor: removeBusy ? "default" : "pointer", textAlign: "left", fontSize: 11 }}>
-              {t("projects.remove", { name: label })}
-            </button>
-          </SidebarPortalMenu>
+            <SidebarPortalMenu
+              anchor={actionButtonRef}
+              open={actionMenuOpen}
+              onClose={() => setActionMenuOpen(false)}
+              placement="below"
+              minWidth={136}
+            >
+              <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { startAliasEdit(); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
+                {project.alias ? t("projects.editAlias") : t("projects.nameAlias")}
+              </button>
+              <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { onEditLaunchConfig(project); setActionMenuOpen(false); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
+                {project.launchConfig ? t("sessionSidebar.editLaunchConfig") : t("sessionSidebar.configureLaunchConfig")}
+              </button>
+              <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { setActionMenuOpen(false); void onMoveProject(project.path, -1); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
+                {t("projects.moveUp")}
+              </button>
+              <button type="button" role="menuitem" className="sidebar-menu-item" onClick={() => { setActionMenuOpen(false); void onMoveProject(project.path, 1); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--text)", cursor: "pointer", textAlign: "left", fontSize: 11 }}>
+                {t("projects.moveDown")}
+              </button>
+              <button type="button" role="menuitem" className="sidebar-menu-item" disabled={removeBusy} onClick={() => { setActionMenuOpen(false); void onRemoveProject(project.path); }} style={{ display: "block", width: "100%", padding: "6px 9px", border: "none", borderRadius: 6, background: "transparent", color: "var(--status-error)", cursor: removeBusy ? "default" : "pointer", textAlign: "left", fontSize: 11 }}>
+                {t("projects.remove", { name: label })}
+              </button>
+            </SidebarPortalMenu>
+          </div>
         </div>
         <button
           className="sidebar-project-toggle"

@@ -1548,10 +1548,10 @@ pre, code {
   height: 24px;
 }
 .sidebar-project-actions {
-  /* Match the session status column after reserving timestamp + menu space. */
-  width: 46px;
-  display: flex;
-  justify-content: flex-end;
+  /* Two fixed 24px controls: add session and overflow actions. */
+  width: 48px;
+  display: grid;
+  grid-template-columns: 24px 24px;
 }
 
 /* Touch rows keep the compact timestamp immediately beside a full-size menu target. */
