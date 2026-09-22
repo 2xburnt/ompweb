@@ -66,8 +66,6 @@ interface Props {
   onOpenArchive?: () => void;
   /** True when settings full-page view is currently open. */
   settingsOpen?: boolean;
-  /** Whether the containing sidebar is currently visible. */
-  sidebarOpen?: boolean;
 }
 
 
@@ -78,6 +76,7 @@ interface Props {
 
 
 const EXPANDED_PROJECTS_STORAGE_KEY = "omp-web:expanded-projects";
+const EXPANDED_HOSTS_STORAGE_KEY = "omp-web:expanded-hosts";
 
 /** Shared empty set for the no-stored-expansion default (never mutated). */
 const EMPTY_PROJECT_SET: ReadonlySet<string> = new Set();
@@ -110,7 +109,27 @@ function saveExpandedProjects(paths: Set<string>): void {
 
 /** Substitute the home dir prefix with ~ (no path truncation — see PathLabel) */
 
-/** Persisted collapsed machine ids (machines default to expanded). */
+/** Explicit host expansion choices. Hosts absent from this map use the
+ *  current-host-expanded / remote-host-collapsed default. */
+function loadExpandedHosts(): Record<string, boolean> {
+  if (typeof window === "undefined") return {};
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(EXPANDED_HOSTS_STORAGE_KEY) ?? "null") as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, boolean] => entry[0].length > 0 && typeof entry[1] === "boolean"));
+  } catch {
+    return {};
+  }
+}
+
+function saveExpandedHosts(expandedHosts: Record<string, boolean>): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(EXPANDED_HOSTS_STORAGE_KEY, JSON.stringify(expandedHosts));
+  } catch {
+    // The state still applies for this page load.
+  }
+}
 
 
 /** Git-state cache key: the same repository path on two machines is two repos. */
@@ -376,7 +395,7 @@ function OmpWebTitle() {
     </button>
   );
 }
-export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, optimisticSession, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onWorkspaceOptionsChange, addProjectOpen, setAddProjectOpen, usageVisible = true, onOpenSettings, onOpenArchive, updateAvailable, settingsOpen = false, sidebarOpen = true }: Props) {
+export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, optimisticSession, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onWorkspaceOptionsChange, addProjectOpen, setAddProjectOpen, usageVisible = true, onOpenSettings, onOpenArchive, updateAvailable, settingsOpen = false }: Props) {
   const { t } = useI18n();
   // Machines: the selected machine scopes projects, worktrees, the explorer
   // and New Session; sessions from every machine are listed together.
@@ -416,15 +435,26 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         ? t("projects.loadFailed", { detail: selectedHostSummary.lastError ?? t("hosts.status.error") })
         : null)
     : null;
-  // Machine sections. The current machine starts expanded; remote machines
-  // start collapsed. This set holds the hosts whose state is flipped from that
-  // default, so toggling either kind is one uniform action. Expansion is
-  // intentionally ephemeral: reopening the sidebar returns focus to this
-  // machine's workspaces.
-  const [toggledHosts, setToggledHosts] = useState<Set<string>>(() => new Set());
+  // Machine sections. Snapshot each host's initial state when it first appears:
+  // the current machine starts expanded and remotes start collapsed. From then
+  // on the value is explicit, so changing machines cannot reinterpret a missing
+  // entry and reset either section. Choices survive close/reopen and reloads.
+  const [expandedHosts, setExpandedHosts] = useState<Record<string, boolean>>(() => loadExpandedHosts());
   useEffect(() => {
-    if (!sidebarOpen) setToggledHosts(new Set());
-  }, [sidebarOpen]);
+    if (!hostId || enabledHosts.length === 0) return;
+    setExpandedHosts((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const host of enabledHosts) {
+        if (host.id in next) continue;
+        next[host.id] = host.id === hostId;
+        changed = true;
+      }
+      if (!changed) return current;
+      saveExpandedHosts(next);
+      return next;
+    });
+  }, [enabledHosts, hostId]);
   // Machine the selected cwd belongs to. A machine switch from the header
   // resets the selection; selecting a session/project on another machine
   // updates this first so the switch effect leaves the selection alone.
@@ -1938,17 +1968,16 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             const groupHome = homeByHost[group.hostId] ?? "";
             // Every machine gets a collapsible header (a dropdown of its
             // projects) once more than one is enabled; a single machine stays
-            // flat. The current machine defaults to expanded, remotes to
-            // collapsed, and `toggledHosts` records any flip from that default.
+            // flat. The current machine defaults to expanded and remotes to
+            // collapsed until the user has made an explicit choice.
             const defaultExpanded = isCurrentMachine;
-            const isExpanded = hostFilterActive || (toggledHosts.has(group.hostId) ? !defaultExpanded : defaultExpanded);
+            const isExpanded = hostFilterActive || (expandedHosts[group.hostId] ?? defaultExpanded);
             return (
               <div key={group.hostId} className="sidebar-machine" data-current={isCurrentMachine ? "true" : "false"}>
                 {multiHost && (
-                  <button type="button" disabled={hostFilterActive} onClick={hostFilterActive ? undefined : () => setToggledHosts((current) => {
-                    const next = new Set(current);
-                    if (next.has(group.hostId)) next.delete(group.hostId);
-                    else next.add(group.hostId);
+                  <button type="button" disabled={hostFilterActive} onClick={hostFilterActive ? undefined : () => setExpandedHosts((current) => {
+                    const next = { ...current, [group.hostId]: !isExpanded };
+                    saveExpandedHosts(next);
                     return next;
                   })} aria-expanded={isExpanded} aria-label={hostFilterActive ? machineName : isExpanded
                     ? t("hosts.sidebar.collapse", { name: machineName })

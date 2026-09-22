@@ -1718,7 +1718,6 @@ export function AppShell() {
       addProjectOpen={addProjectOpen}
       setAddProjectOpen={setAddProjectOpen}
       usageVisible={providerUsageVisible}
-      sidebarOpen={sidebarOpen}
       settingsOpen={Boolean(settingsTab)}
       onOpenSettings={() => setSettingsTab((prev) => prev ? null : "general")}
       onOpenArchive={() => setArchiveBrowserOpen(true)}
